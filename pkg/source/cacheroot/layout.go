@@ -16,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/opencontainers/go-digest"
 )
 
 // Default returns the on-disk cache root for embedders that don't
@@ -49,7 +51,12 @@ type Layout struct {
 // New cleans root and returns a Layout. Prefer New over Layout{Root:}
 // to ensure Root is canonical; the path methods skip a redundant
 // filepath.Clean pass when Root is already clean.
-func New(root string) Layout { return Layout{Root: filepath.Clean(root)} }
+func New(root string) Layout {
+	if root != "" {
+		root = filepath.Clean(root)
+	}
+	return Layout{Root: root}
+}
 
 // Subdirectory names. Exported so audit tooling can grep for which
 // packages touch a given subtree without chasing raw string literals.
@@ -57,11 +64,7 @@ func New(root string) Layout { return Layout{Root: filepath.Clean(root)} }
 const (
 	SourcesDir    = "sources"
 	BaselinesDir  = "baselines"
-	BlobsDir      = "blobs"
-	BlobsAlgo     = "sha256"
-	RefsDir       = "refs"
 	GitMirrorsDir = "git-mirrors"
-	HelmTmpDir    = "helm-tmp"
 	// RenderHelmCacheDir holds the persisted helm template-output
 	// cache. Entries are sharded `<root>/render/helm/<hex[:2]>/<hex>`
 	// where <hex> is the full sha256 of the template-cache key. Content
@@ -105,13 +108,6 @@ func join(base string, segs ...string) string {
 // GC's age sweep and listing tools.
 func (l Layout) Sources() string { return join(l.Root, SourcesDir) }
 
-// SourceSlot returns the on-disk slot for a given (slug, hash) pair.
-// slug is a human-readable repo name; hash is the content-keyed
-// identifier source.Cache computes from (url, ref, authID).
-func (l Layout) SourceSlot(slug, hash string) string {
-	return join(l.Root, SourcesDir, slug, hash)
-}
-
 // Baselines returns the parent directory of every materialized
 // baseline tree.
 func (l Layout) Baselines() string { return join(l.Root, BaselinesDir) }
@@ -122,41 +118,8 @@ func (l Layout) Baseline(commitSHA string) string {
 	return join(l.Root, BaselinesDir, commitSHA)
 }
 
-// Blobs returns the parent of every content-addressed blob.
-// Always includes the algorithm segment so blobs/sha512/ etc. can land
-// here later without rewriting the GC's walk.
-func (l Layout) Blobs() string { return join(l.Root, BlobsDir, BlobsAlgo) }
-
-// Blob returns the on-disk directory for a single blob keyed by its
-// hex sha256 digest.
-func (l Layout) Blob(digest string) string {
-	return join(l.Root, BlobsDir, BlobsAlgo, digest)
-}
-
-// RefsRoot returns the parent of every refs table. Walked by GC to
-// clean dangling pointers.
-func (l Layout) RefsRoot() string { return join(l.Root, RefsDir) }
-
-// RefsCategory carves out a subdirectory under refs/ for one
-// caller's identity→digest mapping. The first arg is a stable name
-// (e.g. "chart-tarballs", "git-revisions") shared between the writer
-// and any introspection tooling.
-func (l Layout) RefsCategory(name string) string {
-	return join(l.Root, RefsDir, name)
-}
-
 // GitMirrors returns the parent of every bare git mirror.
 func (l Layout) GitMirrors() string { return join(l.Root, GitMirrorsDir) }
-
-// GitMirror returns the on-disk path for a bare mirror keyed by the
-// stable hash of an upstream URL.
-func (l Layout) GitMirror(urlHash string) string {
-	return join(l.Root, GitMirrorsDir, urlHash)
-}
-
-// HelmTmp returns the scratch directory the HelmChart fetcher uses for
-// transient writes (index.yaml downloads, TLS cert materialization).
-func (l Layout) HelmTmp() string { return join(l.Root, HelmTmpDir) }
 
 // RenderHelmCache returns the parent directory of the persisted helm
 // template-output cache. Entries live under sharded subdirs keyed by
@@ -167,3 +130,20 @@ func (l Layout) RenderHelmCache() string { return join(l.Root, RenderHelmCacheDi
 // RenderKustomizeCache is the root of the persisted kustomize render cache; the
 // disk layer in pkg/kustomize owns the sharded layout below it.
 func (l Layout) RenderKustomizeCache() string { return join(l.Root, RenderKustomizeCacheDir) }
+
+// OCI returns the shared OCI content store root.
+func (l Layout) OCI() string { return join(l.Root, "oci") }
+
+// OCILock returns the process ownership lock for the shared store.
+func (l Layout) OCILock() string { return join(l.Root, "oci.lock") }
+
+// OCIBlob returns an OCI blob path. The digest MUST be validated by the caller.
+func (l Layout) OCIBlob(d digest.Digest) string {
+	return join(l.OCI(), "blobs", d.Algorithm().String(), d.Encoded())
+}
+
+// GitObjects returns the sealed object backing for a validated generation ID.
+func (l Layout) GitObjects(id string) string { return join(l.OCI(), "git", id, "objects") }
+
+// GitWorktree returns the recursive worktree for a validated generation ID.
+func (l Layout) GitWorktree(id string) string { return join(l.OCI(), "git", id, "worktree") }

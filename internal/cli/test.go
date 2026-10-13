@@ -2,13 +2,16 @@ package cli
 
 import (
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/home-operations/flate/internal/report"
 	"github.com/home-operations/flate/internal/style"
 	"github.com/home-operations/flate/internal/testrunner"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/orchestrator"
 )
 
 // `test` emits a single human-readable, pytest-style reconcile report and
@@ -16,10 +19,11 @@ import (
 // formats). When adding json/yaml here later, pass them to bindCommon.
 
 func newTestCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "test",
-		Short: "Report Kustomization + HelmRelease reconcile status",
-	}
+	// Include source kinds so soft-skipped sources appear in the report.
+	kinds := []string{manifest.KindKustomization, manifest.KindHelmRelease,
+		manifest.KindGitRepository, manifest.KindOCIRepository,
+		manifest.KindHelmRepository, manifest.KindBucket}
+	cmd := testCmd("test", nil, "Report Kustomization + HelmRelease reconcile status (defaults to all)", cobra.NoArgs, kinds...)
 	cmd.AddCommand(
 		testCmd("ks [name]", []string{"kustomization", "kustomizations"},
 			"Validate Kustomizations", cobra.MaximumNArgs(1),
@@ -29,14 +33,7 @@ func newTestCmd() *cobra.Command {
 			manifest.KindHelmRelease),
 		testCmd("all", nil,
 			"Validate every Kustomization, HelmRelease, and Flux source CR", cobra.NoArgs,
-			// Source kinds are included so a soft-skipped source (e.g.
-			// --allow-missing-secrets on an OCIRepository whose auth Secret
-			// is materialized live via ExternalSecret) shows up on its own
-			// line as SKIPPED instead of only as a parenthetical reason
-			// on its downstream KS/HR.
-			manifest.KindKustomization, manifest.KindHelmRelease,
-			manifest.KindGitRepository, manifest.KindOCIRepository,
-			manifest.KindHelmRepository, manifest.KindBucket),
+			kinds...),
 	)
 	return cmd
 }
@@ -61,39 +58,40 @@ func testCmd(use string, aliases []string, short string, args cobra.PositionalAr
 				return runErr
 			}
 			elapsed := time.Since(start)
-			// testrunner.Report.AnyFailed already covers per-resource
-			// reconcile failures, so the runErr is informational here —
-			// the structured report is what the user reads. We still
-			// surface a non-zero exit on any failure.
 			name := firstArg(argv)
-			report := testrunner.Run(testrunner.Job{
-				Store: o.Store(),
-				Kinds: kinds,
-				Name:  name,
-				Include: func(id manifest.NamedResource) bool {
-					return c.includeNamespace(o.Filter(), id.Namespace)
-				},
-			})
-			runErr = scopedRunError(o, res, c, runErr)
-			if name != "" && report.Matched == 0 {
+			selected, runErr, remainder := orchestrator.Select([]orchestrator.Rendered{{Orchestrator: o, Result: res, Err: runErr}}, runErr,
+				c.roots(name, kinds...), nil)
+			if len(selected) == 0 {
+				return runErr
+			}
+			res = selected[0]
+			roster := testrunner.Run(res)
+			if name != "" && roster.Matched == 0 {
 				return errors.Join(noNamedError(testKindName(kinds), name), runErr)
 			}
 			// Colorize only when stdout can show it — style.ColorEnabled
 			// (colorprofile) honors NO_COLOR / CLICOLOR / TTY-ness; piped or
 			// redirected output stays plain.
 			color := style.ColorEnabled(cmd.OutOrStdout())
-			// One consolidated report on stdout: the per-resource roster (failures
+			// One consolidated report on stdout: the per-resource report (failures
 			// already appear inline on their rows), then render advisories
-			// (warnings) and deferred logs (notes), then a single verdict. No
-			// separate stderr failure block — that double-printed every failure and
-			// a second, differently-counted verdict.
-			warnings := scopedWarnings(o, res, c)
+			// (warnings) and deferred logs (notes), then a single verdict.
+			// Dependency failures outside the selected roster need a separate
+			// diagnostic so a passing selected row cannot hide a fatal cause.
+			warnings := slices.Concat(res.Warnings, res.Unrelated)
 			notes := drainLogNotes()
-			if err := report.Write(cmd.OutOrStdout(), warnings, notes, color, elapsed); err != nil {
+			if err := roster.Write(cmd.OutOrStdout(), warnings, notes, color, elapsed); err != nil {
 				return errors.Join(err, runErr)
 			}
+			if name != "" && runErr != nil {
+				diagnostics := report.Build(res)
+				diagnostics.Warnings = nil
+				if err := reportFailures(cmd.ErrOrStderr(), diagnostics, true, reportErrors{selected: runErr, remainder: remainder}); err != nil {
+					return err
+				}
+			}
 			final := runErr
-			if report.AnyFailed() {
+			if roster.AnyFailed() {
 				final = errors.Join(errors.New("test failures detected"), runErr)
 			}
 			// The report is rendered; wrap so run's top-level printer doesn't

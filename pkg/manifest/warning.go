@@ -34,9 +34,15 @@ type Warning struct {
 
 // Warning category codes. Stable identifiers a consumer filters on.
 const (
+	// WarnMissingCRD: an absent CRD dependency was accepted for a final Ready
+	// ResourceSet with an artifact. Message names its distinct dependents.
+	WarnMissingCRD = "MissingCRD"
 	// WarnStaleValues: a HelmRelease sets top-level values no chart template
 	// references (#744). Detail = the unused keys.
 	WarnStaleValues = "StaleValues"
+	// WarnOmittedValues: a required HelmRelease valuesFrom reference was
+	// unavailable offline, so the release rendered with the remaining values.
+	WarnOmittedValues = "OmittedValues"
 	// WarnEmptyScan: no Flux Kustomization/HelmRelease objects were found under
 	// --path (likely a wrong path). Render-global.
 	WarnEmptyScan = "EmptyScan"

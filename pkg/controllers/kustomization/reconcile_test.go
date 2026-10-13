@@ -2,13 +2,12 @@ package kustomization
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/kustomize"
@@ -49,7 +48,7 @@ data: {greeting: hi}
 	tasks := task.NewBounded(0)
 	c := New(s, tasks, cache, true)
 	c.Configure(Options{})
-	c.Start(context.Background())
+	c.StartLifecycle()
 	t.Cleanup(func() {
 		c.Close()
 		tasks.BlockTillDone()
@@ -64,7 +63,7 @@ data: {greeting: hi}
 // AddObject→listener→status-poll dispatch in unit tests.
 func dispatchToFixpoint(t *testing.T, c *Controller, st *store.Store, id manifest.NamedResource) store.StatusInfo {
 	t.Helper()
-	for _, drain := range []int{0, 1, 2} {
+	for _, drain := range []manifest.DrainLevel{manifest.DrainNone, manifest.DrainCascade, manifest.DrainForce} {
 		if blocked := c.ReconcileNode(context.Background(), id, drain); len(blocked) == 0 {
 			break
 		}
@@ -108,6 +107,100 @@ func TestReconcile_HappyPath(t *testing.T) {
 	}
 	if filepath.Dir(art.Path) == "/" {
 		t.Errorf("unexpected artifact path: %q (root=%s)", art.Path, root)
+	}
+}
+
+func TestReconcile_EmptyPostBuildRespectsSubstituteStrategy(t *testing.T) {
+	cases := []struct {
+		name      string
+		strategy  kustomizev1.SubstituteStrategy
+		postBuild map[string]any
+		disabled  string
+		input     string
+		want      string
+	}{
+		{name: "no postBuild", want: "${VAR:=default}"},
+		{name: "unset", postBuild: map[string]any{}, want: "${VAR:=default}"},
+		{name: "WithVariables", strategy: kustomizev1.SubstituteStrategyWithVariables, postBuild: map[string]any{}, want: "${VAR:=default}"},
+		{name: "Always", strategy: kustomizev1.SubstituteStrategyAlways, postBuild: map[string]any{}, want: "default"},
+		{name: "empty substitute", postBuild: map[string]any{"substitute": map[string]any{}}, want: "${VAR:=default}"},
+		{
+			name: "missing optional ConfigMap",
+			postBuild: map[string]any{"substituteFrom": []any{
+				map[string]any{"kind": "ConfigMap", "name": "missing", "optional": true},
+			}},
+			want: "${VAR:=default}",
+		},
+		{
+			name: "missing Secret",
+			postBuild: map[string]any{"substituteFrom": []any{
+				map[string]any{"kind": "Secret", "name": "missing"},
+			}},
+			want: "${VAR:=default}",
+		},
+		{
+			name:      "inline substitute",
+			postBuild: map[string]any{"substitute": map[string]any{"VAR": "configured"}},
+			want:      "configured",
+		},
+		{name: "disabled label", strategy: kustomizev1.SubstituteStrategyAlways, postBuild: map[string]any{}, disabled: "labels", want: "${VAR:=default}"},
+		{name: "disabled annotation", strategy: kustomizev1.SubstituteStrategyAlways, postBuild: map[string]any{}, disabled: "annotations", want: "${VAR:=default}"},
+		{name: "double dollar without variables", input: "echo $$PID", want: "echo $$PID"},
+		{name: "double dollar Always", input: "echo $$PID", strategy: kustomizev1.SubstituteStrategyAlways, postBuild: map[string]any{}, want: "echo $PID"},
+		{name: "double dollar with variables", input: "echo $$PID", postBuild: map[string]any{"substitute": map[string]any{"VAR": "configured"}}, want: "echo $PID"},
+		{name: "double dollar disabled label", input: "echo $$PID", postBuild: map[string]any{"substitute": map[string]any{"VAR": "configured"}}, disabled: "labels", want: "echo $$PID"},
+		{name: "double dollar disabled annotation", input: "echo $$PID", postBuild: map[string]any{"substitute": map[string]any{"VAR": "configured"}}, disabled: "annotations", want: "echo $$PID"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, s, root := newControllerWithFixture(t)
+			input := tc.input
+			if input == "" {
+				input = "${VAR:=default}"
+			}
+			optOut := ""
+			if tc.disabled != "" {
+				optOut = fmt.Sprintf(", %s: {kustomize.toolkit.fluxcd.io/substitute: disabled}", tc.disabled)
+			}
+			testutil.WriteFileAt(t, filepath.Join(root, "apps", "cm.yaml"), fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata: {name: hello, namespace: default%s}
+data: {greeting: '%s'}
+`, optOut, input))
+
+			spec := map[string]any{
+				"path":      "./apps",
+				"sourceRef": map[string]any{"kind": "GitRepository", "name": "flux-system"},
+			}
+			if tc.postBuild != nil {
+				if tc.strategy != "" {
+					tc.postBuild["substituteStrategy"] = string(tc.strategy)
+				}
+				spec["postBuild"] = tc.postBuild
+			}
+			obj, _, _, err := manifest.ParseDoc(map[string]any{
+				"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+				"kind":       "Kustomization",
+				"metadata":   map[string]any{"name": "apps", "namespace": "flux-system"},
+				"spec":       spec,
+			}, manifest.ParseDocOptions{})
+			if err != nil {
+				t.Fatalf("ParseDoc: %v", err)
+			}
+			ks := obj.(*manifest.Kustomization)
+			s.AddObject(ks)
+			if info := dispatchToFixpoint(t, c, s, ks.Named()); info.Status != store.StatusReady {
+				t.Fatalf("status = %+v, want StatusReady", info)
+			}
+			art, _ := s.GetArtifact(ks.Named()).(*store.KustomizationArtifact)
+			if art == nil || len(art.Manifests) != 1 {
+				t.Fatalf("expected one rendered manifest, got %+v", art)
+			}
+			data := art.Manifests[0]["data"].(map[string]any)
+			if got := data["greeting"]; got != tc.want {
+				t.Errorf("greeting = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -335,7 +428,6 @@ func TestReconcile_DependsOnFailed(t *testing.T) {
 		SourceRef: kustomizev1.CrossNamespaceSourceReference{
 			Kind: manifest.KindGitRepository, Name: "flux-system", Namespace: "flux-system",
 		},
-		Timeout:    &metav1.Duration{Duration: 100 * time.Millisecond},
 		SourceKind: manifest.KindGitRepository, SourceName: "flux-system", SourceNamespace: "flux-system",
 		DependsOn: []manifest.DependencyRef{
 			{NamedResource: dep.Named()},

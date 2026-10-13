@@ -1,6 +1,7 @@
 package kustomization
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/home-operations/flate/internal/testutil"
@@ -43,75 +44,40 @@ func TestCollectDeps_NoParentNoExtraDep(t *testing.T) {
 	}
 }
 
-// TestCollectDeps_AppendsSubstituteFromConfigMap locks the
-// substituteFrom→ConfigMap depwait edge: every non-Optional ref
-// becomes a real dependency. Without this, KS-A would race the CM
-// that KS-B's render emits, and Prepare would silently expand with
-// empty values for any var that should have come from KS-B's CM.
-func TestCollectDeps_AppendsSubstituteFromConfigMap(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindConfigMap, Name: "cluster-settings"},
-			{Kind: manifest.KindConfigMap, Name: "maybe-missing", Optional: true},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	deps := c.collectDeps(ks)
-
-	wantID := manifest.NamedResource{
-		Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings",
-	}
-	var found bool
-	for _, d := range deps {
-		if d.NamedResource == wantID {
-			found = true
-		}
-		if d.Kind == manifest.KindConfigMap && d.Name == "maybe-missing" {
-			t.Errorf("Optional substituteFrom ref must not gate reconcile; got %+v", d)
-		}
-	}
-	if !found {
-		t.Errorf("expected substituteFrom dep %+v in deps %+v", wantID, deps)
-	}
-}
-
-// TestCollectDeps_SubstituteFromSkipsSecrets locks the
-// SOPS/ExternalSecret carve-out: substituteFrom Secret refs are
-// resolved by values.ExpandPostBuildSubstituteReference at Prepare
-// time and gracefully degrade on missing entries. Adding a depwait
-// edge for them would regress every offline render against a Flux
-// repo using secret-substitute patterns (e.g. cnpg-objectstore,
-// cloudflare-tunnel-substitute) because those Secrets live in
-// cluster state flate cannot materialize.
-func TestCollectDeps_SubstituteFromSkipsSecrets(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindSecret, Name: "cluster-secrets"},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	if deps := c.collectDeps(ks); len(deps) != 0 {
-		t.Errorf("Secret substituteFrom refs must NOT gate reconcile; got %+v", deps)
-	}
-}
-
-// TestCollectDeps_SubstituteFromIgnoresMalformedRefs covers the
-// defensive branches in collectDeps: refs with an unknown Kind or
-// empty Name must be skipped rather than producing meaningless
-// depwait edges that would never resolve.
-func TestCollectDeps_SubstituteFromIgnoresMalformedRefs(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: "Junk", Name: "x"},
-			{Kind: manifest.KindConfigMap, Name: ""},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	if deps := c.collectDeps(ks); len(deps) != 0 {
-		t.Errorf("expected no deps from malformed substituteFrom refs; got %+v", deps)
+func TestCollectDeps_SubstitutionProducers(t *testing.T) {
+	consumer := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: "consumer"}
+	producer := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: "producer"}
+	cm := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "apps", Name: "settings"}
+	for _, tc := range []struct {
+		name                    string
+		ref                     manifest.SubstituteReference
+		producers, owners, want []manifest.NamedResource
+	}{
+		{name: "required ConfigMap", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap, Name: "settings"}, producers: []manifest.NamedResource{producer}, want: []manifest.NamedResource{cm, producer}},
+		{name: "Owners-only ConfigMap in full mode", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap, Name: "settings"}, owners: []manifest.NamedResource{producer}, want: []manifest.NamedResource{cm, producer}},
+		{name: "optional ConfigMap", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap, Name: "settings", Optional: true}, producers: []manifest.NamedResource{producer}},
+		{name: "required Secret", ref: manifest.SubstituteReference{Kind: manifest.KindSecret, Name: "settings"}, producers: []manifest.NamedResource{producer}, want: []manifest.NamedResource{producer}},
+		{name: "optional Secret", ref: manifest.SubstituteReference{Kind: manifest.KindSecret, Name: "settings", Optional: true}, producers: []manifest.NamedResource{producer}},
+		{name: "unknown Secret", ref: manifest.SubstituteReference{Kind: manifest.KindSecret, Name: "settings"}},
+		{name: "missing ConfigMap", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap, Name: "settings"}, want: []manifest.NamedResource{cm}},
+		{name: "self producer", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap, Name: "settings"}, producers: []manifest.NamedResource{consumer}},
+		{name: "empty name", ref: manifest.SubstituteReference{Kind: manifest.KindConfigMap}, producers: []manifest.NamedResource{producer}},
+		{name: "unknown kind", ref: manifest.SubstituteReference{Kind: "Junk", Name: "settings"}, producers: []manifest.NamedResource{producer}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := manifest.NamedResource{Kind: tc.ref.Kind, Namespace: consumer.Namespace, Name: tc.ref.Name}
+			index := &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{id: {Renderers: tc.producers, Owners: tc.owners}}}
+			c := New(store.New(), nil, nil, false)
+			c.Configure(Options{Index: index})
+			ks := &manifest.Kustomization{Name: consumer.Name, Namespace: consumer.Namespace, PostBuildSubstituteFrom: []manifest.SubstituteReference{tc.ref}}
+			var got []manifest.NamedResource
+			for _, dep := range c.collectDeps(ks) {
+				got = append(got, dep.NamedResource)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("dependencies = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -139,19 +105,11 @@ func TestCollectDeps_AppendsSubstituteFromConfigMapAndProducer(t *testing.T) {
 	cmObj := &manifest.ConfigMap{Name: "cluster-settings", Namespace: ""}
 	cmID := cmObj.Named()
 
-	f := change.NewFilter(
-		change.NewSet([]string{"kubernetes/apps/changed.yaml"}),
-		map[manifest.NamedResource]string{
-			consumer: "kubernetes/flux/cluster-apps.yaml",
-			producer: "kubernetes/flux/cluster-vars.yaml",
-			cmID:     "kubernetes/flux/vars/cluster-settings.yaml",
-		},
-		"",
-		testutil.MapLister{consumer: consumerObj, producer: producerObj, cmID: cmObj},
-	)
+	index := &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{consumer: {File: "kubernetes/flux/cluster-apps.yaml"}, producer: {File: "kubernetes/flux/cluster-vars.yaml"}, cmID: {File: "kubernetes/flux/vars/cluster-settings.yaml", Owners: []manifest.NamedResource{producer}}}, Claims: map[string][]manifest.NamedResource{"kubernetes/apps/": {consumer}, "kubernetes/flux/vars/": {producer}}}
+	f := change.NewFilter(change.NewSet([]string{"kubernetes/apps/changed.yaml"}), index, testutil.MapLister{consumer: consumerObj, producer: producerObj, cmID: cmObj})
 
 	c := New(store.New(), nil, nil, false)
-	c.Configure(Options{Filter: f})
+	c.Configure(Options{Filter: f, Index: index})
 	deps := c.collectDeps(consumerObj)
 
 	wantCM := manifest.NamedResource{
@@ -192,18 +150,11 @@ func TestCollectDeps_SkipsSelfProducer(t *testing.T) {
 	cmObj := &manifest.ConfigMap{Name: "settings", Namespace: ""}
 	cmID := cmObj.Named()
 
-	f := change.NewFilter(
-		change.NewSet([]string{"kubernetes/foo/app/changed.yaml"}),
-		map[manifest.NamedResource]string{
-			self: "kubernetes/foo/app/ks.yaml",
-			cmID: "kubernetes/foo/app/settings.yaml",
-		},
-		"",
-		testutil.MapLister{self: selfObj, cmID: cmObj},
-	)
+	index := &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{self: {File: "kubernetes/foo/app/ks.yaml"}, cmID: {File: "kubernetes/foo/app/settings.yaml", Owners: []manifest.NamedResource{self}}}, Claims: map[string][]manifest.NamedResource{"kubernetes/foo/app/": {self}}}
+	f := change.NewFilter(change.NewSet([]string{"kubernetes/foo/app/changed.yaml"}), index, testutil.MapLister{self: selfObj, cmID: cmObj})
 
 	c := New(store.New(), nil, nil, false)
-	c.Configure(Options{Filter: f})
+	c.Configure(Options{Filter: f, Index: index})
 	deps := c.collectDeps(selfObj)
 
 	for _, d := range deps {
@@ -216,7 +167,7 @@ func TestCollectDeps_SkipsSelfProducer(t *testing.T) {
 // mapResolver wraps a static parent map into the func resolver shape
 // the controllers consume. Used by tests that want to verify
 // behavior on a known parent index without standing up the full
-// orchestrator wiring (which combines this with the renderedSet).
+// orchestrator wiring (which combines this with the Store render ownership).
 func mapResolver(m map[manifest.NamedResource]manifest.NamedResource) func(manifest.NamedResource) (manifest.NamedResource, bool) {
 	return func(id manifest.NamedResource) (manifest.NamedResource, bool) {
 		parent, ok := m[id]

@@ -8,7 +8,6 @@ import (
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
-	"github.com/home-operations/flate/pkg/values"
 )
 
 // ResolveDependsOnSubstitutions resolves bare ${VAR} references in
@@ -17,12 +16,12 @@ import (
 // substitutes a child KS's text (via its parent's postBuild) before the
 // dependency is ever matched. flate builds its dependency graph from the
 // raw file-parsed KS — where `dependsOn: 0-${CLUSTER_NAME}-config` (no
-// default) survives ResolveEnvsubstDefaults and never matches the real
+// default) survives the parse-time default collapse and never matches the real
 // `0-biohazard-config` — so without this pass the dependency is reported
 // "not found".
 //
 // ${VAR:=default} forms are already collapsed at parse time
-// (ResolveEnvsubstDefaults), so this pass only ever resolves *bare* vars,
+// (the parse-time default collapse), so this pass only ever resolves *bare* vars,
 // drawing values from the union of every discovered KS's
 // spec.postBuild.substitute map. Two guards keep it from manufacturing a
 // false dependency match:
@@ -68,7 +67,7 @@ func substituteUnion(s *store.Store) map[string]string {
 	union := map[string]string{}
 	conflicting := map[string]struct{}{}
 	for _, ks := range s.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
-		for k, v := range values.VarsMap(ks.PostBuildSubstitute) {
+		for k, v := range manifest.VarsMap(ks.PostBuildSubstitute) {
 			if _, bad := conflicting[k]; bad {
 				continue
 			}

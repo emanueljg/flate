@@ -37,12 +37,50 @@ data:
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out, err := RenderFlux(ctx, cache, src, false, ".", rawSpec)
+		out, err := RenderFlux(ctx, cache, RenderRequest{Label: src, ApplyIgnore: false, SubPath: ".", Spec: rawSpec})
 		if err != nil {
 			b.Fatalf("RenderFlux: %v", err)
 		}
 		if len(out) == 0 {
 			b.Fatalf("empty render")
+		}
+	}
+}
+
+// BenchmarkRenderFlux_CacheHit measures read-set replay on a warm disk render cache.
+func BenchmarkRenderFlux_CacheHit(b *testing.B) {
+	src := b.TempDir()
+	resources := make([]string, 0, 20)
+	for i := range 20 {
+		name := fmt.Sprintf("cm-%d", i)
+		resources = append(resources, name+".yaml")
+		testutil.WriteFile(b, src, "app/"+name+".yaml", cmYAML(name))
+	}
+	testutil.WriteFile(b, src, "app/kustomization.yaml", existingKustomization(resources...))
+	cache := NewTreeCache()
+	cache.SetRenderCache(b.TempDir(), 1<<30)
+	req := RenderRequest{
+		Label:   src,
+		SubPath: "app",
+		Spec: map[string]any{
+			"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+			"kind":       "Kustomization",
+			"metadata":   map[string]any{"name": "cached", "namespace": "ns"},
+			"spec":       map[string]any{"path": "./app"},
+		},
+	}
+	ctx := b.Context()
+	if _, err := RenderFlux(ctx, cache, req); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := RenderFlux(ctx, cache, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(out) == 0 {
+			b.Fatal("empty render")
 		}
 	}
 }
@@ -98,7 +136,7 @@ data:
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out, err := RenderFlux(ctx, cache, src, false, ".", rawSpec)
+		out, err := RenderFlux(ctx, cache, RenderRequest{Label: src, ApplyIgnore: false, SubPath: ".", Spec: rawSpec})
 		if err != nil {
 			b.Fatalf("RenderFlux: %v", err)
 		}
@@ -110,8 +148,7 @@ data:
 
 // BenchmarkRenderFlux_MultiKSPerRoot measures concurrent renders of distinct
 // subPaths under the SAME source root — the bulk of a single-cluster repo,
-// where the memory-over-disk overlay lets every render run in parallel against
-// the shared read-only source with no staging lock.
+// with private construction overlays over a shared read-only source.
 func BenchmarkRenderFlux_MultiKSPerRoot(b *testing.B) {
 	src := b.TempDir()
 	const apps = 40
@@ -137,7 +174,7 @@ func BenchmarkRenderFlux_MultiKSPerRoot(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			sub := fmt.Sprintf("apps/app-%d", int(ctr.Add(1))%apps)
-			out, err := RenderFlux(ctx, cache, src, false, sub, rawSpec)
+			out, err := RenderFlux(ctx, cache, RenderRequest{Label: src, ApplyIgnore: false, SubPath: sub, Spec: rawSpec})
 			if err != nil {
 				b.Fatalf("RenderFlux: %v", err)
 			}

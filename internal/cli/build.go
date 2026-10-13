@@ -10,31 +10,25 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/home-operations/flate/internal/format"
+	"github.com/home-operations/flate/internal/report"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/orchestrator"
-	"github.com/home-operations/flate/pkg/store"
 )
 
 // buildFlags holds flags shared across `build ks`, `build hr`, and
 // `build all` that aren't part of commonFlags.
 type buildFlags struct {
 	onlyCRDs bool
-	stream   bool
 }
 
 func bindBuildFlags(fs *pflag.FlagSet, b *buildFlags) {
 	fs.BoolVar(&b.onlyCRDs, "only-crds", false,
 		"emit only CustomResourceDefinition resources (implies --skip-crds=false)")
-	fs.BoolVar(&b.stream, "stream", false,
-		"emit each resource's YAML the moment it finishes reconciling (completion order, "+
-			"same doc set as the default buffered output; YAML only)")
 }
 
 func newBuildCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "build",
-		Short: "Render Flux objects to YAML",
-	}
+	kinds := []string{manifest.KindKustomization, manifest.KindHelmRelease}
+	cmd := buildCmd("build", nil, "Render Flux objects to YAML (defaults to all)", cobra.NoArgs, kinds...)
 	cmd.AddCommand(
 		buildCmd("ks [name]", []string{"kustomization", "kustomizations"},
 			"Render Kustomizations", cobra.MaximumNArgs(1),
@@ -43,8 +37,7 @@ func newBuildCmd() *cobra.Command {
 			"Render HelmReleases", cobra.MaximumNArgs(1),
 			manifest.KindHelmRelease),
 		buildCmd("all", nil,
-			"Render all Kustomization and HelmRelease objects", cobra.NoArgs,
-			manifest.KindKustomization, manifest.KindHelmRelease),
+			"Render all Kustomization and HelmRelease objects", cobra.NoArgs, kinds...),
 	)
 	return cmd
 }
@@ -60,53 +53,27 @@ func buildCmd(use string, aliases []string, short string, args cobra.PositionalA
 		Args:    args,
 		RunE: func(cmd *cobra.Command, argv []string) error {
 			applyBuildFlags(c, b)
-			if b.stream && format.Output(c.output) == format.OutputJSON {
-				return errors.New("--stream requires YAML output (a JSON array cannot stream)")
-			}
 			stopProfile, err := startProfile(c.profileMode, c.profileOut)
 			if err != nil {
 				return err
 			}
 			defer stopProfile()
 			name := firstArg(argv)
-			// --stream: attach the live emitter before Render so each
-			// resource's docs hit stdout the moment it is known-done.
-			var se *streamEmitter
-			var pre []func(*orchestrator.Orchestrator) store.Unsubscribe
-			if b.stream {
-				pre = append(pre, func(o *orchestrator.Orchestrator) store.Unsubscribe {
-					se = newStreamEmitter(cmd.OutOrStdout(), cmd.ErrOrStderr(), o, kinds, name, c, b)
-					return se.attach(o.Store())
-				})
-			}
-			o, res, runErr := runOrchestrator(cmdContext(cmd), *c, *h, pre...)
-			if o == nil {
+			o, res, runErr := runOrchestrator(cmdContext(cmd), *c, *h)
+			selected, runErr, remainder := orchestrator.Select([]orchestrator.Rendered{{Orchestrator: o, Result: res, Err: runErr}}, runErr, c.roots(name, kinds...), nil)
+			if len(selected) == 0 {
 				return runErr
 			}
+			res = selected[0]
 			var emitErr error
-			if se != nil {
-				emitErr = se.finish(res)
+			if name != "" && res.Counts[kinds[0]] == 0 {
+				emitErr = noNamedError(kinds[0], name)
 			} else {
-				docs := []map[string]any{}
-				for _, kind := range kinds {
-					rendered, err := collectRendered(o, res, kind, name, c, b)
-					if err != nil {
-						emitErr = err
-						break
-					}
-					docs = append(docs, rendered...)
-				}
-				if emitErr == nil {
-					emitErr = emitDocs(cmd.OutOrStdout(), docs, format.Output(c.output))
-				}
+				emitErr = emitDocs(cmd.OutOrStdout(), collectRendered(res, b), format.Output(c.output))
 			}
-			// Per-resource Run failures: emit whatever we rendered, then
-			// flip the exit code so CI pipelines piping `flate build` into
-			// kubectl apply don't silently apply a half-rendered tree.
-			// emitResult surfaces both an emit-time IO failure AND the
-			// partial-failure list — previously the emit error masked
-			// the run failures, so CI fixed the wrong thing.
-			return reportFailures(cmd.ErrOrStderr(), o, res, c, emitResult(emitErr, o, res, c, runErr), 0)
+			return reportFailures(cmd.ErrOrStderr(), report.Build(res), name != "", reportErrors{
+				selected: errors.Join(emitErr, runErr), remainder: errors.Join(emitErr, remainder),
+			})
 		},
 	}
 	bindCommon(cmd.Flags(), c, format.OutputYAML, format.OutputJSON)
@@ -121,68 +88,24 @@ func applyBuildFlags(c *commonFlags, b *buildFlags) {
 	}
 }
 
-func collectRendered(o *orchestrator.Orchestrator, res *orchestrator.Result, kind, name string, c *commonFlags, b *buildFlags) ([]map[string]any, error) {
-	// Walk every loaded object of this kind so an explicit name positional
-	// that didn't render (failed reconcile, suspended, no docs) still
-	// counts as a match — without this the typo-detection error below
-	// would also fire for failed-but-existing resources.
-	// Store.ListObjects(kind) already returns results sorted by
-	// (namespace, name) (store.go), so single-kind output is deterministic
-	// across runs without a re-sort here.
-	objs := o.Store().ListObjects(kind)
-	skipKinds := c.skipResourceKinds()
-	matched := 0
-	var out []map[string]any
-	for _, obj := range objs {
-		id := obj.Named()
-		if name != "" && id.Name != name {
-			continue
-		}
-		if !c.includeNamespace(o.Filter(), id.Namespace) {
-			continue
-		}
-		matched++
-		// A missing entry means the resource didn't render
-		// (failed, suspended, or produced zero docs).
-		mans, ok := res.Manifests[id]
-		if !ok {
-			continue
-		}
-		docs := emissionDocs(mans, b, skipKinds)
-		if len(docs) == 0 {
-			continue
-		}
-		out = append(out, docs...)
+func collectRendered(res *orchestrator.Result, b *buildFlags) []map[string]any {
+	out := []map[string]any{}
+	for _, obj := range res.Objects {
+		out = append(out, emissionDocs(res.Manifests[obj.Named()], b)...)
 	}
-	// An explicit name positional that matches nothing in the store
-	// should error rather than silently emit an empty render — a typo
-	// shouldn't look like a successful build of a nonexistent resource.
-	if name != "" && matched == 0 {
-		return nil, noNamedError(kind, name)
-	}
-	return out, nil
+	return out
 }
 
-// emissionDocs turns one resource's rendered manifests into its
-// emission-ready doc batch: clone-and-sort so output is byte-stable across
-// runs even when a Helm chart uses `range $name, $svc := .Values` (Go map
-// iteration is randomized — the chart still emits the same set but in
-// arbitrary order; sort by kind/ns/name), then apply --only-crds or the
-// skip-kinds drop. Shared by the buffered collect and the --stream emitter
-// so the two paths cannot drift. May return an empty slice.
-func emissionDocs(mans []map[string]any, b *buildFlags, skipKinds []string) []map[string]any {
-	if len(mans) == 0 {
-		return nil
-	}
+// emissionDocs sorts a cloned batch without changing the selected snapshot.
+func emissionDocs(mans []map[string]any, b *buildFlags) []map[string]any {
 	docs := slices.Clone(mans)
 	slices.SortStableFunc(docs, compareDocs)
 	if b.onlyCRDs {
-		return filterCRDsOnly(docs)
+		return slices.DeleteFunc(docs, func(doc map[string]any) bool {
+			return manifest.DocKind(doc) != manifest.KindCustomResourceDefinition
+		})
 	}
-	// Defensive re-drop. Orchestrator.Render already filters
-	// Result.Manifests at the embed boundary using the same kind set, so
-	// this is a no-op for the normal CLI path.
-	return manifest.DropKinds(docs, skipKinds)
+	return docs
 }
 
 // emitDocs writes a sequence of rendered docs as either multi-doc YAML
@@ -206,19 +129,4 @@ func compareDocs(a, b map[string]any) int {
 		cmp.Compare(ans, bns),
 		cmp.Compare(an, bn),
 	)
-}
-
-// filterCRDsOnly returns the subset of docs whose `kind` is
-// CustomResourceDefinition. Inlined here (rather than via
-// manifest.DropKinds) to skip the slice-copy when nothing matches:
-// most rendered artifacts contain zero CRDs, so the common case is to
-// return a length-0 slice without allocation.
-func filterCRDsOnly(docs []map[string]any) []map[string]any {
-	var out []map[string]any
-	for _, doc := range docs {
-		if manifest.DocKind(doc) == manifest.KindCustomResourceDefinition {
-			out = append(out, doc)
-		}
-	}
-	return out
 }

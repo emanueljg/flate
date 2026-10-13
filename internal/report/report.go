@@ -5,7 +5,7 @@
 // with a list of what it blocked — not a wall of nested, repeated
 // "dependencies failed: A: dependencies failed: B: …" chains.
 //
-// The model is built from orchestrator data (Result.Failed + Result.Blocked) and
+// The model is built from selected orchestrator causes and status data and
 // is pure/deterministic; rendering is gated on a color bool so it is plain and
 // testable off a TTY. Styling reuses internal/style, the vocabulary the live
 // status bar and `flate test` report already speak.
@@ -19,9 +19,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/home-operations/flate/internal/selection"
 	"github.com/home-operations/flate/internal/style"
 	"github.com/home-operations/flate/pkg/manifest"
-	"github.com/home-operations/flate/pkg/store"
+	"github.com/home-operations/flate/pkg/orchestrator"
 )
 
 // blockedSample bounds how many blocked/requiring ids are named inline per root
@@ -56,11 +57,8 @@ type Note struct {
 type Model struct {
 	Primary []Primary
 	Missing []Missing
-	// Warnings are non-fatal render advisories (Result.Warnings) — rendered in
-	// their own footer section above operational Notes. Distinct from failures
-	// (the render succeeded) and from Notes (operational slog lines).
+	// Warnings are selected unrelated-failure advisories (Result.Unrelated).
 	Warnings []manifest.Warning
-	Notes    []Note
 	// Blocked is the count of distinct derived (cascaded) failures. It is the
 	// verdict's "N blocked" figure — distinct resources, not the sum of the
 	// per-root Blocks/RequiredBy lists, which can overlap when one resource
@@ -70,97 +68,42 @@ type Model struct {
 
 // Empty reports whether there is nothing to render.
 func (m Model) Empty() bool {
-	return len(m.Primary) == 0 && len(m.Missing) == 0 && len(m.Warnings) == 0 && len(m.Notes) == 0
+	return len(m.Primary) == 0 && len(m.Missing) == 0 && len(m.Warnings) == 0
 }
 
-// Build partitions failures into primary errors and root-grouped cascades.
-// failed is Result.Failed (sentinel-trimmed messages); blocked is Result.Blocked
-// (a failed id → the immediate deps that blocked it, empty for primaries); notes
-// are the deferred log lines for the footer.
-//
-// A blocked resource is folded into the root(s) it traces to: walking its
-// blockers until reaching a primary failure (a failed id that is not itself
-// blocked) or a missing id (absent from failed). Cascaded resources never get
-// their own line — they appear only in a root's Blocks / RequiredBy list.
-func Build(failed map[manifest.NamedResource]store.StatusInfo, blocked map[manifest.NamedResource][]manifest.NamedResource, warnings []manifest.Warning, notes []Note) Model {
-	byRoot := Roots(blocked)
-
+// Build prepares rows from a selected result's classified failure causes.
+func Build(result *orchestrator.Result) Model {
 	var primary []Primary
 	var missing []Missing
-	for id, info := range failed {
-		if _, derived := blocked[id]; derived {
-			continue // cascaded — surfaced under its root, not on its own
+	blocked := selection.BlockedCount(result.Failed, result.Blocked, result.Causes)
+	for root, victims := range result.Causes {
+		if info, isFailed := result.Failed[root]; isFailed {
+			primary = append(primary, Primary{ID: root, Msg: info.Message, Blocks: victims})
+		} else {
+			missing = append(missing, Missing{ID: root, RequiredBy: victims})
 		}
-		primary = append(primary, Primary{ID: id, Msg: info.Message, Blocks: sortedIDs(byRoot[id])})
-	}
-	for root, reqs := range byRoot {
-		if _, isFailed := failed[root]; isFailed {
-			continue // root is a primary failure, already listed above
-		}
-		missing = append(missing, Missing{ID: root, RequiredBy: sortedIDs(reqs)})
 	}
 
 	slices.SortFunc(primary, func(a, b Primary) int { return a.ID.Compare(b.ID) })
 	slices.SortFunc(missing, func(a, b Missing) int { return a.ID.Compare(b.ID) })
-	return Model{Primary: primary, Missing: missing, Warnings: warnings, Notes: notes, Blocked: len(blocked)}
+	return Model{Primary: primary, Missing: missing, Warnings: result.Unrelated, Blocked: blocked}
 }
 
-// Roots inverts a blocked graph into root cause → the resources that trace to
-// it. blocked maps each derived failure to the immediate dependencies that
-// blocked it; a root is any id reached by walking those blockers that is not
-// itself blocked (a primary failure, or a dependency missing from the graph).
-// Shared by Build and the test runner so both fold a cascade under the same
-// root with identical walk semantics.
-func Roots(blocked map[manifest.NamedResource][]manifest.NamedResource) map[manifest.NamedResource][]manifest.NamedResource {
-	byRoot := map[manifest.NamedResource][]manifest.NamedResource{}
-	for id := range blocked {
-		for _, r := range RootsOf(id, blocked) {
-			byRoot[r] = append(byRoot[r], id)
-		}
+// WriteErrors prints the non-resource remainder returned by selection.
+func WriteErrors(w io.Writer, err error) error {
+	if err != nil {
+		_, err := fmt.Fprintln(w, "flate error:", err)
+		return err
 	}
-	return byRoot
+	return nil
 }
 
-// RootsOf resolves the root cause(s) of a blocked id by walking its blockers to
-// a primary failure or a missing id, returning a fresh slice. Cycle-safe via a
-// visited set: a victim whose blockers form a closed cycle (no escape to a
-// primary/missing root) yields nil — callers that must account for every victim
-// fall back to its immediate blockers.
-func RootsOf(id manifest.NamedResource, blocked map[manifest.NamedResource][]manifest.NamedResource) []manifest.NamedResource {
-	var out []manifest.NamedResource
-	seen := map[manifest.NamedResource]bool{id: true}
-	var walk func(manifest.NamedResource)
-	walk = func(n manifest.NamedResource) {
-		for _, dep := range blocked[n] {
-			if seen[dep] {
-				continue
-			}
-			seen[dep] = true
-			if _, derived := blocked[dep]; derived {
-				walk(dep) // dep is itself cascaded — keep climbing
-			} else {
-				out = append(out, dep) // primary failure or missing id — a root
-			}
-		}
-	}
-	walk(id)
-	return out
-}
-
-func sortedIDs(ids []manifest.NamedResource) []manifest.NamedResource {
-	out := slices.Clone(ids)
-	slices.SortFunc(out, manifest.NamedResource.Compare)
-	return slices.Compact(out) // NamedResource is a comparable struct; sorted ⇒ dups adjacent
-}
-
-// Write renders the model to w. color gates ANSI styling; elapsed, when > 0,
-// closes the verdict line.
-func (m Model) Write(w io.Writer, color bool, elapsed time.Duration) error {
+// Write renders the model to w. color gates ANSI styling.
+func (m Model) Write(w io.Writer, color bool) error {
 	doc := Document(
 		m.failuresBlock(color),
 		WarningsBlock(m.Warnings, color),
-		NotesBlock(m.Notes, color),
-		m.verdictBlock(color, elapsed),
+		m.verdictBlock(color),
 	)
 	if doc == "" {
 		return nil
@@ -219,26 +162,28 @@ func WarningsBlock(warnings []manifest.Warning, color bool) string {
 // when there are none. Shared by every footer-bearing surface.
 func NotesBlock(notes []Note, color bool) string {
 	items := make([]string, 0, len(notes))
+	var total int
 	for _, n := range notes {
+		total += cmp.Or(n.Count, 1)
 		line := n.Text
 		if n.Count > 1 {
 			line = fmt.Sprintf("%s (×%d)", line, n.Count)
 		}
 		items = append(items, style.Dim(line, color))
 	}
-	return section(style.Dim(fmt.Sprintf("notes (%d)", noteTotal(notes)), color), items)
+	return section(style.Dim(fmt.Sprintf("notes (%d)", total), color), items)
 }
 
-// verdictBlock renders the "✗ N failed · M blocked   elapsed" line, or "" when
+// verdictBlock renders the "✗ N failed · M blocked" line, or "" when
 // nothing failed — a clean run carrying only advisories shows just those, not a
 // misleading red "✗ 0 failed". failed = primary + missing roots; blocked is the
 // distinct cascaded count (m.Blocked, not the sum of per-root lists).
-func (m Model) verdictBlock(color bool, elapsed time.Duration) string {
+func (m Model) verdictBlock(color bool) string {
 	failed := len(m.Primary) + len(m.Missing)
 	if failed == 0 && m.Blocked == 0 {
 		return ""
 	}
-	return Verdict(color, style.GlyphFail, style.Fail, elapsed,
+	return Verdict(color, style.GlyphFail, style.Fail, 0,
 		Count{N: failed, Label: "failed", Paint: style.Fail},
 		Count{N: m.Blocked, Label: "blocked", Paint: style.Dim},
 	)
@@ -258,17 +203,6 @@ func section(header string, items []string) string {
 	return b.String()
 }
 
-// nonEmpty returns the non-empty blocks, in order.
-func nonEmpty(blocks ...string) []string {
-	out := make([]string, 0, len(blocks))
-	for _, b := range blocks {
-		if b != "" {
-			out = append(out, b)
-		}
-	}
-	return out
-}
-
 // Document assembles a footer from section blocks: a leading blank line parts it
 // from preceding output, a single blank line separates each non-empty block, and
 // it ends with a newline. Returns "" when every block is empty, so the caller
@@ -276,7 +210,12 @@ func nonEmpty(blocks ...string) []string {
 // in one place, so there's no per-section newline bookkeeping to drift. Shared
 // by the build/diff failure report and the `flate test` roster.
 func Document(blocks ...string) string {
-	nz := nonEmpty(blocks...)
+	nz := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b != "" {
+			nz = append(nz, b)
+		}
+	}
 	if len(nz) == 0 {
 		return ""
 	}
@@ -319,11 +258,19 @@ func Verdict(color bool, glyph string, paintGlyph func(string, bool) string, ela
 	return b.String()
 }
 
-// summarize renders an id list as "a, b, c +N more", capped at blockedSample.
+// summarize caps an id list at blockedSample and includes kinds for ambiguous names.
 func summarize(ids []manifest.NamedResource) string {
 	names := make([]string, 0, len(ids))
+	counts := make(map[string]int, len(ids))
 	for _, id := range ids {
-		names = append(names, id.NamespacedName())
+		name := id.NamespacedName()
+		names = append(names, name)
+		counts[name]++
+	}
+	for i, name := range names {
+		if counts[name] > 1 {
+			names[i] = ids[i].Kind + " " + name
+		}
 	}
 	if len(names) <= blockedSample {
 		return strings.Join(names, ", ")
@@ -364,12 +311,4 @@ func MessageLines(s string) []string {
 		}
 	}
 	return out
-}
-
-func noteTotal(notes []Note) int {
-	n := 0
-	for _, note := range notes {
-		n += cmp.Or(note.Count, 1)
-	}
-	return n
 }

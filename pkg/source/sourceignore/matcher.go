@@ -1,8 +1,7 @@
 // Package sourceignore builds the file-exclusion matcher Flux's
 // source-controller applies when it packages a GitRepository/OCIRepository
-// artifact: its default patterns (.git/, .github/, *.jpg/png/zip, .sops.yaml,
-// .flux.yaml, .goreleaser.yml, …) plus any in-tree .sourceignore files plus
-// caller-supplied spec.ignore patterns.
+// artifact: VCS exclusions plus any in-tree .sourceignore files and
+// caller-supplied spec.ignore patterns, with defaults selected by [New].
 //
 // It is a leaf package — it depends only on the vendored fluxcd/go-git
 // ignore primitives, never on pkg/source or pkg/kustomize — so BOTH the
@@ -14,16 +13,21 @@ package sourceignore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	flux "github.com/fluxcd/pkg/sourceignore"
-	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
+	"github.com/fluxcd/pkg/sourceignore/gitignore"
 )
+
+// RulesVersion must change when filtering rules change to invalidate source artifact caches.
+const RulesVersion = "sourceignore-v1"
 
 // Matcher reports whether a path within a source tree rooted at a fixed
 // directory is excluded from the artifact. It is safe for concurrent reads.
@@ -34,10 +38,10 @@ type Matcher struct {
 
 // New builds a Matcher for the tree rooted at root.
 //
-// withDefaults adds Flux's default VCS + ExcludeExt/CI/Extra patterns — the
-// GitRepository/OCIRepository behavior; pass false for the Bucket flavor
-// (in-tree .sourceignore + extra only). extra, when non-empty, appends
-// caller patterns (a source's spec.ignore).
+// Flux default exclusions apply when withDefaults is true and no user patterns
+// were parsed from files or extra. withDefaults always adds VCS patterns.
+// Pass false for the Bucket flavor (in-tree .sourceignore + extra only).
+// extra, when non-empty, appends caller patterns (a source's spec.ignore).
 func New(root string, extra *string, withDefaults bool) (*Matcher, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -49,14 +53,91 @@ func New(root string, extra *string, withDefaults bool) (*Matcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sourceignore load: %w", err)
 	}
+	return newMatcher(domain, patterns, extra, withDefaults), nil
+}
+
+// NewFromFiles builds a Matcher from absolute .sourceignore paths collected by
+// an existing tree walk. Rules load in the order of
+// github.com/fluxcd/pkg/sourceignore v0.19.0 LoadIgnorePatterns: each directory's
+// own file before its lexically ordered subdirectories, skipping only .git.
+// Defaults and extra follow the same policy as New.
+func NewFromFiles(root string, files []string, extra *string, withDefaults bool) (*Matcher, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("sourceignore abs: %w", err)
+	}
+	domain := splitPath(abs)
+	files = slices.Clone(files)
+	slices.SortFunc(files, func(a, b string) int {
+		return slices.Compare(splitPath(filepath.Dir(a)), splitPath(filepath.Dir(b)))
+	})
+	var patterns []gitignore.Pattern
+	for _, file := range files {
+		rel, err := filepath.Rel(abs, filepath.Dir(file))
+		if err != nil {
+			return nil, fmt.Errorf("sourceignore relative path: %w", err)
+		}
+		fileDomain := domain
+		if rel != "." {
+			fileDomain = slices.Concat(domain, splitPath(rel))
+		}
+		ps, err := flux.ReadIgnoreFile(file, fileDomain)
+		if err != nil {
+			return nil, fmt.Errorf("sourceignore load: %w", err)
+		}
+		patterns = append(patterns, ps...)
+	}
+	return newMatcher(domain, patterns, extra, withDefaults), nil
+}
+
+// NewFS builds the same Flux policy from a slash-named immutable filesystem.
+func NewFS(input fs.FS, extra string, withDefaults bool) (*Matcher, error) {
+	var patterns []gitignore.Pattern
+	err := fs.WalkDir(input, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == ".git" {
+			return fs.SkipDir
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		data, err := fs.ReadFile(input, path.Join(name, flux.IgnoreFile))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		domain := []string{}
+		if name != "." {
+			domain = strings.Split(name, "/")
+		}
+		patterns = append(patterns, flux.ReadPatterns(strings.NewReader(string(data)), domain)...)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sourceignore load: %w", err)
+	}
+	return newMatcher(nil, patterns, &extra, withDefaults), nil
+}
+
+func newMatcher(domain []string, patterns []gitignore.Pattern, extra *string, withDefaults bool) *Matcher {
 	if extra != nil && strings.TrimSpace(*extra) != "" {
 		patterns = append(patterns, flux.ReadPatterns(strings.NewReader(*extra), domain)...)
 	}
 
-	if withDefaults {
-		return &Matcher{matcher: flux.NewDefaultMatcher(patterns, domain), domain: domain}, nil
+	var matcher gitignore.Matcher
+	if withDefaults && len(patterns) == 0 {
+		matcher = flux.NewDefaultMatcher(patterns, domain)
+	} else {
+		if withDefaults {
+			patterns = append(flux.VCSPatterns(domain), patterns...)
+		}
+		matcher = flux.NewMatcher(patterns)
 	}
-	return &Matcher{matcher: flux.NewMatcher(patterns), domain: domain}, nil
+	return &Matcher{matcher: matcher, domain: domain}
 }
 
 // Match reports whether rel (a path relative to the matcher's root, using the

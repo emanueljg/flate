@@ -8,13 +8,14 @@ import (
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/store"
 )
 
 func ociRepo(url string) *manifest.HelmRepository {
 	return &manifest.HelmRepository{
 		Name: "truecharts", Namespace: "flux-system",
-		URL: url, Type: manifest.RepoTypeOCI,
+		URL: url, Type: sourcev1.HelmRepositoryTypeOCI,
 	}
 }
 
@@ -45,7 +46,7 @@ func TestIsOCIHelmRepo(t *testing.T) {
 		repo *manifest.HelmRepository
 		want bool
 	}{
-		{"type oci", &manifest.HelmRepository{URL: "https://x", Type: manifest.RepoTypeOCI}, true},
+		{"type oci", &manifest.HelmRepository{URL: "https://x", Type: sourcev1.HelmRepositoryTypeOCI}, true},
 		{"oci:// url no type", &manifest.HelmRepository{URL: "oci://reg/x"}, true},
 		{"http default", &manifest.HelmRepository{URL: "https://charts.example"}, false},
 	}
@@ -61,7 +62,7 @@ func TestIsOCIHelmRepo(t *testing.T) {
 func TestSynthesizeOCIRepository(t *testing.T) {
 	r := &manifest.HelmRepository{
 		Name: "truecharts", Namespace: "flux-system",
-		URL: "oci://oci.trueforge.org/truecharts/", Type: manifest.RepoTypeOCI,
+		URL: "oci://oci.trueforge.org/truecharts/", Type: sourcev1.HelmRepositoryTypeOCI,
 	}
 	syn := synthesizeOCIRepository(r, "kromgo", "3.0.0")
 	if syn.URL != "oci://oci.trueforge.org/truecharts/kromgo" {
@@ -160,5 +161,17 @@ func TestFetch_RepoNotFound(t *testing.T) {
 	_, err := f.Fetch(context.Background(), helmChart("missing", "kromgo", "3.0.0"))
 	if !errors.Is(err, manifest.ErrObjectNotFound) {
 		t.Fatalf("err = %v, want ErrObjectNotFound", err)
+	}
+}
+
+func TestFetch_OCIExactVersionForever(t *testing.T) {
+	repo := ociRepo("oci://example.test/charts")
+	stub := &stubOCI{art: &store.SourceArtifact{Kind: manifest.KindOCIRepository}}
+	f := &Fetcher{repos: func(_, _ string) *manifest.HelmRepository { return repo }, oci: stub, disableChartDigestTracking: true}
+	if _, err := f.Fetch(t.Context(), helmChart(repo.Name, "chart", "1.0.0")); err != nil {
+		t.Fatal(err)
+	}
+	if stub.got.Interval.Duration != cache.Forever {
+		t.Fatalf("interval=%v", stub.got.Interval.Duration)
 	}
 }

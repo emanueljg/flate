@@ -2,8 +2,12 @@ package kustomize
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/kustomize/kyaml/filesys"
 
 	"github.com/home-operations/flate/internal/testutil"
 )
@@ -39,7 +43,7 @@ func TestRenderFlux_DuplicateID_NamesProducers(t *testing.T) {
 	cmChild(t, root, "b", "shared", "dup")
 	// No apps/kustomization.yaml → RenderFlux synthesizes one over a + b.
 
-	_, err := RenderFlux(context.Background(), NewTreeCache(), root, false, "apps", fluxKS())
+	_, err := RenderFlux(context.Background(), NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: false, SubPath: "apps", Spec: fluxKS()})
 	if err == nil {
 		t.Fatal("expected a duplicate-id build failure")
 	}
@@ -66,7 +70,7 @@ func TestRenderFlux_DistinctIDs_NoDiagnostic(t *testing.T) {
 	cmChild(t, root, "a", "shared", "a-cm")
 	cmChild(t, root, "b", "shared", "b-cm")
 
-	out, err := RenderFlux(context.Background(), NewTreeCache(), root, false, "apps", fluxKS())
+	out, err := RenderFlux(context.Background(), NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: false, SubPath: "apps", Spec: fluxKS()})
 	if err != nil {
 		t.Fatalf("RenderFlux: %v", err)
 	}
@@ -81,12 +85,26 @@ func TestRenderFlux_NonDuplicateError_Unannotated(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteFile(t, root, "apps/a/kustomization.yaml", "resources:\n- missing.yaml\n")
 
-	_, err := RenderFlux(context.Background(), NewTreeCache(), root, false, "apps", fluxKS())
+	_, err := RenderFlux(context.Background(), NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: false, SubPath: "apps", Spec: fluxKS()})
 	if err == nil {
 		t.Fatal("expected a build failure")
 	}
 	if strings.Contains(err.Error(), "duplicate resource(s) produced") {
 		t.Errorf("a non-duplicate error must not carry the diagnostic:\n%s", err)
+	}
+}
+
+func TestRenderFlux_NonDuplicateError_DuplicatesBehindIt(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteFile(t, root, "apps/a/kustomization.yaml", "resources:\n- missing.yaml\n")
+	cmChild(t, root, "b", "shared", "dup")
+	cmChild(t, root, "c", "shared", "dup")
+	_, err := RenderFlux(t.Context(), NewTreeCache(), RenderRequest{Label: root, SubPath: "apps", Spec: fluxKS()})
+	if err == nil {
+		t.Fatal("expected a build failure")
+	}
+	if strings.Contains(err.Error(), "duplicate resource(s) produced") {
+		t.Errorf("non-duplicate error carries the diagnostic:\n%s", err)
 	}
 }
 
@@ -102,7 +120,7 @@ func TestRenderFlux_DuplicateID_Unattributable_FallsBack(t *testing.T) {
 	testutil.WriteFile(t, root, "apps/two.yaml",
 		"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: dup}\ndata: {k: v}\n")
 
-	_, err := RenderFlux(context.Background(), NewTreeCache(), root, false, "apps", fluxKS())
+	_, err := RenderFlux(context.Background(), NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: false, SubPath: "apps", Spec: fluxKS()})
 	if err == nil {
 		t.Fatal("expected a duplicate-id build failure")
 	}
@@ -112,5 +130,61 @@ func TestRenderFlux_DuplicateID_Unattributable_FallsBack(t *testing.T) {
 	}
 	if strings.Contains(s, "duplicate resource(s) produced") {
 		t.Errorf("a file-level dup is unattributable; diagnostic must stay silent:\n%s", s)
+	}
+}
+
+func TestRenderFlux_DuplicateID_ManyIDsNamesProducers(t *testing.T) {
+	root := t.TempDir()
+	for i := range 80 {
+		var body strings.Builder
+		for j := range 4 {
+			name := fmt.Sprintf("cm-%02d-%d", i, j)
+			if i == 70 && j == 0 {
+				name = "cm-03-0"
+			}
+			body.WriteString(cmYAML(name) + "---\n")
+		}
+		dir := fmt.Sprintf("apps/k%02d/", i)
+		testutil.WriteFile(t, root, dir+"kustomization.yaml", existingKustomization("cm.yaml"))
+		testutil.WriteFile(t, root, dir+"cm.yaml", body.String())
+	}
+	_, err := RenderFlux(t.Context(), NewTreeCache(), RenderRequest{Label: root, SubPath: "apps", Spec: fluxKS()})
+	if err == nil {
+		t.Fatal("expected duplicate-id failure")
+	}
+	for _, producer := range []string{"./apps/k03", "./apps/k70"} {
+		if !strings.Contains(err.Error(), producer) {
+			t.Errorf("missing producer %s: %v", producer, err)
+		}
+	}
+}
+
+type diagnosticFS struct {
+	filesys.FileSystem
+	children map[string]bool
+}
+
+func (f diagnosticFS) ReadFile(path string) ([]byte, error) {
+	if filepath.Base(path) == "kustomization.yaml" {
+		f.children[filepath.Dir(path)] = true
+	}
+	return f.FileSystem.ReadFile(path)
+}
+
+func TestDuplicateID_BoundedRebuilds(t *testing.T) {
+	fsys := filesys.MakeFsInMemory()
+	var data strings.Builder
+	data.WriteString("resources:\n")
+	for i := range 300 {
+		dir := fmt.Sprintf("/apps/k%03d", i)
+		if err := fsys.WriteFile(dir+"/kustomization.yaml", []byte("resources: [missing.yaml]\n")); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&data, "- k%03d\n", i)
+	}
+	counting := diagnosticFS{FileSystem: fsys, children: make(map[string]bool)}
+	duplicateProducers(counting, "/apps", "apps", []byte(data.String()))
+	if got := len(counting.children); got != dupDiagBuildLimit {
+		t.Fatalf("rebuilt %d children, want %d", got, dupDiagBuildLimit)
 	}
 }

@@ -140,3 +140,86 @@ func BenchmarkSetArtifact_DistinctDedup(b *testing.B) {
 		s.SetArtifact(id, twin)
 	}
 }
+
+func BenchmarkUpdateFailure_Write(b *testing.B) {
+	id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "consumer"}
+	dep := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "dep"}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"Primary", manifest.ErrInput},
+		{"Dependency", &manifest.DependencyFailedError{Parent: id, Failed: []manifest.NamedResource{dep}}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			st := New()
+			st.UpdateFailure(id, tc.err)
+			b.ReportAllocs()
+			for b.Loop() {
+				st.UpdateStatus(id, StatusPending, "retrying")
+				st.UpdateFailure(id, tc.err)
+			}
+		})
+	}
+}
+
+func BenchmarkStatusInfo_Read(b *testing.B) {
+	id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "consumer"}
+	dep := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "dep"}
+	for _, tc := range []struct {
+		name  string
+		write func(*Store)
+	}{
+		{"Ready", func(st *Store) { st.UpdateStatus(id, StatusReady, "done") }},
+		{"Primary", func(st *Store) { st.UpdateFailure(id, manifest.ErrInput) }},
+		{"Dependency", func(st *Store) {
+			st.UpdateFailure(id, &manifest.DependencyFailedError{Parent: id, Failed: []manifest.NamedResource{dep}})
+		}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			st := New()
+			tc.write(st)
+			b.ReportAllocs()
+			for b.Loop() {
+				info, _ := st.GetStatus(id)
+				_ = info.IsDependencyFailure()
+			}
+		})
+	}
+}
+
+func BenchmarkStatusFlip(b *testing.B) {
+	for _, withListener := range []bool{false, true} {
+		name := "NoListener"
+		if withListener {
+			name = "OneListener"
+		}
+		b.Run(name, func(b *testing.B) {
+			st := New()
+			id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "a", Name: "b"}
+			st.AddObject(&manifest.HelmRelease{Name: id.Name, Namespace: id.Namespace})
+			if withListener {
+				st.AddListener(EventStatusUpdated, func(manifest.NamedResource, any) {}, false)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				st.UpdateStatus(id, StatusPending, "x")
+				st.UpdateStatus(id, StatusReady, "y")
+			}
+		})
+	}
+}
+
+func BenchmarkGetStatus(b *testing.B) {
+	st := New()
+	id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "a", Name: "b"}
+	st.AddObject(&manifest.HelmRelease{Name: id.Name, Namespace: id.Namespace})
+	st.UpdateStatus(id, StatusReady, "y")
+	b.ReportAllocs()
+	for b.Loop() {
+		info, _ := st.GetStatus(id)
+		if info.Status != StatusReady {
+			b.Fatal("expected ready status")
+		}
+	}
+}

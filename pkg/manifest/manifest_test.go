@@ -206,7 +206,10 @@ func TestParseHelmRelease_CRDsPolicy(t *testing.T) {
 		want     string
 	}{
 		{"install only", "  install: {crds: Create}", "Create"},
+		{"empty upgrade uses install", "  install: {crds: Create}\n  upgrade: {}", "Create"},
 		{"upgrade wins over install", "  install: {crds: Create}\n  upgrade: {crds: CreateReplace}", "CreateReplace"},
+		{"upgrade only", "  upgrade: {crds: CreateReplace}", "CreateReplace"},
+		{"empty upgrade preserves install", "  install: {crds: Create}\n  upgrade: {}", "Create"},
 		{"skip suppresses", "  upgrade: {crds: Skip}", "Skip"},
 		{"empty when neither set", "", ""},
 	}
@@ -931,16 +934,24 @@ spec:
 }
 
 func TestKustomization_UpdatePostBuildSubstitutions(t *testing.T) {
-	k := &Kustomization{Contents: map[string]any{"spec": map[string]any{}}}
-	k.UpdatePostBuildSubstitutions(map[string]any{"K": "v"})
-
-	if k.PostBuildSubstitute["K"] != "v" {
-		t.Fatalf("substitute map not updated: %+v", k.PostBuildSubstitute)
+	for _, tc := range []struct {
+		name string
+		vars map[string]any
+		want map[string]any
+	}{
+		{name: "empty", want: map[string]any{"K": "v"}},
+		{name: "existing", vars: map[string]any{"K": "old", "KEEP": "kept"}, want: map[string]any{"K": "v", "KEEP": "kept"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &Kustomization{PostBuildSubstitute: tc.vars, Contents: map[string]any{"spec": map[string]any{}}}
+			k.UpdatePostBuildSubstitutions(map[string]any{"K": "v"})
+			assert.Diff(t, k.PostBuildSubstitute, tc.want)
+			spec := k.Contents["spec"].(map[string]any)
+			post := spec["postBuild"].(map[string]any)
+			sub := post["substitute"].(map[string]any)
+			assert.Diff(t, sub, map[string]any{"K": "v"})
+		})
 	}
-	spec := k.Contents["spec"].(map[string]any)
-	post := spec["postBuild"].(map[string]any)
-	sub := post["substitute"].(map[string]any)
-	assert.Diff(t, sub, map[string]any{"K": "v"})
 }
 
 func TestParseConfigMap(t *testing.T) {
@@ -953,7 +964,8 @@ metadata:
 data:
   DOMAIN: example.com
 `)
-	cm, err := parseConfigMap(doc, true)
+	cmobj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true})
+	cm := cmobj.(*ConfigMap)
 	if err != nil {
 		t.Fatalf("parseConfigMap: %v", err)
 	}
@@ -980,7 +992,8 @@ data:
   PLAINTEXT: keep-me
 `
 	t.Run("wiped", func(t *testing.T) {
-		cm, err := parseConfigMap(mustYAML(t, src), true)
+		cmobj, _, _, err := ParseDoc(mustYAML(t, src), ParseDocOptions{WipeSecrets: true})
+		cm := cmobj.(*ConfigMap)
 		if err != nil {
 			t.Fatalf("parseConfigMap: %v", err)
 		}
@@ -990,7 +1003,8 @@ data:
 		})
 	})
 	t.Run("preserved when wipeSecrets=false", func(t *testing.T) {
-		cm, err := parseConfigMap(mustYAML(t, src), false)
+		cmobj, _, _, err := ParseDoc(mustYAML(t, src), ParseDocOptions{WipeSecrets: false})
+		cm := cmobj.(*ConfigMap)
 		if err != nil {
 			t.Fatalf("parseConfigMap: %v", err)
 		}
@@ -1020,7 +1034,8 @@ stringData:
   enc-key: ` + sops + `
 `
 	t.Run("sops wiped, plaintext preserved", func(t *testing.T) {
-		s, err := parseSecret(mustYAML(t, yamlDoc), true)
+		sobj, _, _, err := ParseDoc(mustYAML(t, yamlDoc), ParseDocOptions{WipeSecrets: true})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
@@ -1046,7 +1061,8 @@ stringData:
 	})
 
 	t.Run("preserved with wipeSecrets=false", func(t *testing.T) {
-		s, err := parseSecret(mustYAML(t, yamlDoc), false)
+		sobj, _, _, err := ParseDoc(mustYAML(t, yamlDoc), ParseDocOptions{WipeSecrets: false})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
@@ -1070,7 +1086,8 @@ metadata: {name: wordpress-values, namespace: default}
 data:
   values.yaml: `+base64.StdEncoding.EncodeToString([]byte(valuesYAML))+`
 `)
-		s, err := parseSecret(doc, true)
+		sobj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
@@ -1101,11 +1118,13 @@ stringData:
 `
 	doc := mustYAML(t, yamlDoc)
 
-	s1, err := parseSecret(doc, true)
+	s1obj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true})
+	s1 := s1obj.(*Secret)
 	if err != nil {
 		t.Fatalf("first parse: %v", err)
 	}
-	s2, err := parseSecret(doc, true)
+	s2obj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true})
+	s2 := s2obj.(*Secret)
 	if err != nil {
 		t.Fatalf("second parse: %v", err)
 	}
@@ -1179,7 +1198,7 @@ metadata: {name: x}`, "Foo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			obj, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
+			obj, _, _, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
 			if err != nil {
 				t.Fatalf("ParseDoc: %v", err)
 			}
@@ -1235,6 +1254,16 @@ kind: ConfigMap
 metadata: {name: c, namespace: default}`},
 		// The group is compared exactly, so a group that merely starts
 		// with one of ours is foreign too.
+		{"group with kustomize prefix", `
+apiVersion: kustomize.config.k8s.io.example.com/v1
+kind: Kustomization
+metadata: {name: custom, namespace: default}
+spec: {value: keep}`},
+		{"component with kustomize prefix", `
+apiVersion: kustomize.config.k8s.io.example.com/v1
+kind: Component
+metadata: {name: custom, namespace: default}
+spec: {value: keep}`},
 		{"group with flux prefix", `
 apiVersion: source.toolkit.fluxcd.io.example.com/v1
 kind: Bucket
@@ -1243,7 +1272,7 @@ spec: {name: b}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			obj, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
+			obj, _, _, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
 			if err != nil {
 				t.Fatalf("ParseDoc: %v", err)
 			}
@@ -1459,12 +1488,12 @@ func TestRawObject_DoesNotAliasParsedDoc(t *testing.T) {
 }
 
 func TestParseDoc_MissingFields(t *testing.T) {
-	if _, err := ParseDoc(map[string]any{"kind": "Foo"}, defaultParseDocOptions()); err == nil || !strings.Contains(err.Error(), "apiVersion") {
+	if _, _, _, err := ParseDoc(map[string]any{"kind": "Foo"}, defaultParseDocOptions()); err == nil || !strings.Contains(err.Error(), "apiVersion") {
 		t.Errorf("expected apiVersion error, got %v", err)
 	}
 	// Bare data files (no kind:) are silently dropped as RawObjects —
 	// helm values, config blobs, etc. that aren't k8s resources.
-	obj, err := ParseDoc(map[string]any{"apiVersion": "v1"}, defaultParseDocOptions())
+	obj, _, _, err := ParseDoc(map[string]any{"apiVersion": "v1"}, defaultParseDocOptions())
 	if err != nil {
 		t.Errorf("missing-kind docs should not error, got %v", err)
 	}
@@ -1697,7 +1726,7 @@ data:
 		if err != nil {
 			t.Fatalf("HR iter %d DecodeDocs: %v", i, err)
 		}
-		obj, err := ParseDoc(docs[0], opts)
+		obj, _, _, err := ParseDoc(docs[0], opts)
 		if err != nil {
 			t.Fatalf("HR iter %d ParseDoc: %v", i, err)
 		}
@@ -1718,7 +1747,7 @@ data:
 		if err != nil {
 			t.Fatalf("KS iter %d DecodeDocs: %v", i, err)
 		}
-		kobj, err := ParseDoc(ksDocs[0], opts)
+		kobj, _, _, err := ParseDoc(ksDocs[0], opts)
 		if err != nil {
 			t.Fatalf("KS iter %d ParseDoc: %v", i, err)
 		}
@@ -1741,7 +1770,7 @@ data:
 		if err != nil {
 			t.Fatalf("CM iter %d DecodeDocs: %v", i, err)
 		}
-		cobj, err := ParseDoc(cmDocs[0], opts)
+		cobj, _, _, err := ParseDoc(cmDocs[0], opts)
 		if err != nil {
 			t.Fatalf("CM iter %d ParseDoc: %v", i, err)
 		}
@@ -1801,6 +1830,8 @@ func TestIsKustomizeBuildDirective(t *testing.T) {
 	}{
 		{"kustomize-config Kustomization", &RawObject{Kind: "Kustomization", APIVersion: "kustomize.config.k8s.io/v1beta1"}, true},
 		{"kustomize-config Component", &RawObject{Kind: "Component", APIVersion: "kustomize.config.k8s.io/v1alpha1"}, true},
+		{"foreign Kustomization", &RawObject{Kind: "Kustomization", APIVersion: "kustomize.config.k8s.io.example.com/v1"}, false},
+		{"foreign Component", &RawObject{Kind: "Component", APIVersion: "kustomize.config.k8s.io.example.com/v1"}, false},
 		{"flux Kustomization (typed)", &Kustomization{}, false},
 		{"unknown resource RawObject", &RawObject{Kind: "Widget", APIVersion: "example.com/v1"}, false},
 		{"helmrelease (typed)", &HelmRelease{}, false},
@@ -1810,6 +1841,57 @@ func TestIsKustomizeBuildDirective(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsKustomizeBuildDirective(tc.obj); got != tc.want {
 				t.Errorf("IsKustomizeBuildDirective = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseHelmRelease_DisableValidationCombinations(t *testing.T) {
+	for _, flags := range []struct {
+		name            string
+		schema, openAPI bool
+	}{
+		{name: "neither"},
+		{name: "schema", schema: true},
+		{name: "openapi", openAPI: true},
+		{name: "both", schema: true, openAPI: true},
+	} {
+		for _, stage := range []string{"neither", "install", "upgrade", "both"} {
+			t.Run(flags.name+"/"+stage, func(t *testing.T) {
+				enabled := fmt.Sprintf("{disableSchemaValidation: %t, disableOpenAPIValidation: %t}", flags.schema, flags.openAPI)
+				var spec string
+				if stage == "install" || stage == "both" {
+					spec += "  install: " + enabled + "\n"
+				}
+				if stage == "upgrade" || stage == "both" {
+					spec += "  upgrade: " + enabled + "\n"
+				}
+				hr, err := parseHelmRelease(helmReleaseDoc(t, spec))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantSchema := stage != "neither" && flags.schema
+				wantOpenAPI := stage != "neither" && flags.openAPI
+				if hr.DisableSchemaValidation != wantSchema || hr.DisableOpenAPIValidation != wantOpenAPI {
+					t.Errorf("validation flags = (%t, %t), want (%t, %t)", hr.DisableSchemaValidation, hr.DisableOpenAPIValidation, wantSchema, wantOpenAPI)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckAPIVersion_ExactGroup(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		wantErr error
+	}{
+		{version: SourceDomain + "/v1"},
+		{version: SourceDomain + ".example.com/v1", wantErr: ErrInput},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			err := checkAPIVersion(map[string]any{"apiVersion": tc.version}, SourceDomain)
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("error = %v, want %v", err, tc.wantErr)
 			}
 		})
 	}

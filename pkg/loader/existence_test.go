@@ -2,6 +2,7 @@ package loader
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,9 +55,8 @@ data:
 `)
 
 	st := store.New()
-	l := New(st)
+	l := loaderFixture(st, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -70,7 +70,7 @@ data:
 	if st.GetObject(hrID) != nil {
 		t.Errorf("HelmRelease should NOT be in Store under DiscoveryOnly; should be in Existence")
 	}
-	if _, ok := l.Existence.Get(hrID); !ok {
+	if _, ok := l.Index.Lookup(hrID); !ok {
 		t.Errorf("HelmRelease must be recorded in Existence index")
 	}
 
@@ -78,7 +78,7 @@ data:
 	if st.GetObject(cmID) != nil {
 		t.Errorf("ConfigMap should NOT be in Store under DiscoveryOnly; should be in Existence")
 	}
-	if _, ok := l.Existence.Get(cmID); !ok {
+	if _, ok := l.Index.Lookup(cmID); !ok {
 		t.Errorf("ConfigMap must be recorded in Existence index")
 	}
 }
@@ -100,9 +100,8 @@ data:
 `)
 
 	st := store.New()
-	l := New(st)
+	l := loaderFixture(st, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -111,7 +110,7 @@ data:
 	if st.GetObject(id) != nil {
 		t.Fatalf("precondition: CM should not be in store yet")
 	}
-	if !l.Existence.Promote(st, id, true) {
+	if !Promote(l.Store, id, l.Index.Records[id].Path, PromoteOptions{WipeSecrets: true, Admit: func(manifest.BaseManifest) bool { return true }}) {
 		t.Fatalf("Promote should return true on a known id")
 	}
 	if st.GetObject(id) == nil {
@@ -119,39 +118,26 @@ data:
 	}
 }
 
-// TestExistenceIndex_PromoteNilReceiverSafe confirms the defensive
-// nil-receiver guard: a nil index promoted against any id should be
-// a no-op false return, not a panic. The orchestrator's
-// resolveMissing closure relies on this when DiscoveryOnly is off
-// and Existence was never initialized.
-func TestExistenceIndex_PromoteNilReceiverSafe(t *testing.T) {
-	var idx *ExistenceIndex
-	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "default", Name: "x"}
-	if got := idx.Promote(store.New(), id, true); got {
-		t.Errorf("nil index Promote should return false, got true")
-	}
-}
-
-// TestExistenceIndex_PromoteUnknownIDReturnsFalse covers the path
+// TestPromote_UnknownIDReturnsFalse covers the path
 // where depwait's missing-dep fallback asks for a CM that never
 // reached file-load: existence index has no entry, so Promote bails
 // out cleanly and the depwait surfaces "dependency not found" as
 // intended.
-func TestExistenceIndex_PromoteUnknownIDReturnsFalse(t *testing.T) {
-	idx := NewExistenceIndex()
+func TestPromote_UnknownIDReturnsFalse(t *testing.T) {
+	idx := loaderFixture(store.New(), nil)
 	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "default", Name: "ghost"}
-	if got := idx.Promote(store.New(), id, true); got {
+	if got := Promote(idx.Store, id, idx.Index.Records[id].Path, PromoteOptions{WipeSecrets: true, Admit: func(manifest.BaseManifest) bool { return true }}); got {
 		t.Errorf("Promote on unknown id should return false, got true")
 	}
 }
 
-// TestExistenceIndex_PromoteFileRemovedBetweenRecordAndPromote
+// TestPromote_FileRemovedBetweenRecordAndPromote
 // exercises the race where the indexed file was deleted (or
 // permission-stripped) between the file walk and the lazy lookup.
 // Promote should fail gracefully (return false), not panic, so the
 // depwait surfaces "dependency not found" instead of crashing the
 // orchestrator.
-func TestExistenceIndex_PromoteFileRemovedBetweenRecordAndPromote(t *testing.T) {
+func TestPromote_FileRemovedBetweenRecordAndPromote(t *testing.T) {
 	dir := t.TempDir()
 	testutil.WriteFile(t, dir, "cm.yaml", `
 apiVersion: v1
@@ -163,9 +149,8 @@ data:
   KEY: value
 `)
 	st := store.New()
-	l := New(st)
+	l := loaderFixture(st, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -174,7 +159,7 @@ data:
 		t.Fatalf("remove: %v", err)
 	}
 	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "default", Name: "ephemeral"}
-	if got := l.Existence.Promote(st, id, true); got {
+	if got := Promote(l.Store, id, l.Index.Records[id].Path, PromoteOptions{WipeSecrets: true, Admit: func(manifest.BaseManifest) bool { return true }}); got {
 		t.Errorf("Promote on a removed file should return false, got true")
 	}
 	if st.GetObject(id) != nil {
@@ -182,12 +167,12 @@ data:
 	}
 }
 
-// TestExistenceIndex_PromoteMultiDocLoadsSiblings pins the
+// TestPromote_MultiDocLoadsSiblings pins the
 // "whole-file parse" contract documented on Promote: a YAML file
 // packing CM + Secret + HR together promotes ALL three when ANY one
 // is requested. This is what allows depwait to avoid re-opening the
 // same file once per dep in the common multi-doc fixture pattern.
-func TestExistenceIndex_PromoteMultiDocLoadsSiblings(t *testing.T) {
+func TestPromote_MultiDocLoadsSiblings(t *testing.T) {
 	dir := t.TempDir()
 	testutil.WriteFile(t, dir, "bundle.yaml", `
 apiVersion: v1
@@ -208,15 +193,14 @@ data:
   TOKEN: dG9rZW4=
 `)
 	st := store.New()
-	l := New(st)
+	l := loaderFixture(st, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "default", Name: "app-config"}
 	secretID := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "default", Name: "app-secret"}
-	if !l.Existence.Promote(st, cmID, true) {
+	if !Promote(l.Store, cmID, l.Index.Records[cmID].Path, PromoteOptions{WipeSecrets: true, Admit: func(manifest.BaseManifest) bool { return true }}) {
 		t.Fatalf("Promote(cm) should succeed")
 	}
 	if st.GetObject(cmID) == nil {
@@ -224,6 +208,56 @@ data:
 	}
 	if st.GetObject(secretID) == nil {
 		t.Errorf("sibling Secret should have been promoted alongside the CM (whole-file parse contract)")
+	}
+}
+
+func TestPromote_AdmissionAndPreferExisting(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		secret   bool
+		existing bool
+	}{
+		{name: "admitted request"},
+		{name: "rejected request", secret: true},
+		{name: "rendered object retained", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			testutil.WriteFile(t, dir, "bundle.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: selected, namespace: apps}
+data: {source: raw}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: excluded, namespace: apps}
+stringData: {value: fixture}
+`)
+			cm := &manifest.ConfigMap{Name: "selected", Namespace: "apps", Data: map[string]any{"source": "rendered"}}
+			secret := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "apps", Name: "excluded"}
+			st := store.New()
+			if tc.existing {
+				st.AddObject(cm)
+			}
+			idx := loaderFixture(st, nil)
+			for _, id := range []manifest.NamedResource{cm.Named(), secret} {
+				idx.Index.Records[id] = manifest.DiscoveryRecord{Path: filepath.Join(dir, "bundle.yaml")}
+			}
+			id := cm.Named()
+			if tc.secret {
+				id = secret
+			}
+			admit := func(obj manifest.BaseManifest) bool { return obj.Named() == cm.Named() }
+			if got := Promote(idx.Store, id, idx.Index.Records[id].Path, PromoteOptions{WipeSecrets: true, Admit: admit}); got == tc.secret {
+				t.Errorf("Promote returned %v, want %v", got, !tc.secret)
+			}
+			if st.GetObject(cm.Named()) == nil || st.GetObject(secret) != nil {
+				t.Error("admission must apply separately to requested and sibling objects")
+			}
+			if tc.existing && st.GetObject(cm.Named()) != cm {
+				t.Error("existing rendered object must take precedence")
+			}
+		})
 	}
 }
 
@@ -262,9 +296,8 @@ spec:
 `)
 
 	st := store.New()
-	l := New(st)
+	l := loaderFixture(st, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -277,5 +310,33 @@ spec:
 		if st.GetObject(want) == nil {
 			t.Errorf("source %s must stay in Store under DiscoveryOnly; got nil", want.String())
 		}
+	}
+}
+
+func TestPromote_BareDocumentProjection(t *testing.T) {
+	const doc = `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata: {name: podinfo%s}
+spec:
+  interval: 1h
+  chart: {spec: {chart: podinfo, version: %s, sourceRef: {kind: HelmRepository, name: podinfo}}}
+`
+	dir := t.TempDir()
+	testutil.WriteFile(t, dir, "bundle.yaml", fmt.Sprintf(doc, "", "1.0.0")+"---\n"+fmt.Sprintf(doc, ", namespace: other", "2.0.0")+"---\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: note}\n")
+	for _, tc := range []struct{ namespace, version string }{{"apps", "1.0.0"}, {"other", "2.0.0"}} {
+		t.Run(tc.namespace, func(t *testing.T) {
+			st := store.New()
+			id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: tc.namespace, Name: "podinfo"}
+			admit := func(manifest.BaseManifest) bool { return true }
+			if !Promote(st, id, filepath.Join(dir, "bundle.yaml"), PromoteOptions{Admit: admit}) {
+				t.Fatalf("Promote(%s) = false", id)
+			}
+			if got := st.GetObject(id).(*manifest.HelmRelease).Chart.Version; got != tc.version {
+				t.Errorf("%s chart version = %s, want %s", id, got, tc.version)
+			}
+			if sibling := (manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: tc.namespace, Name: "note"}); st.GetObject(sibling) != nil {
+				t.Errorf("sibling %s must keep its own identity", sibling)
+			}
+		})
 	}
 }

@@ -13,6 +13,32 @@ import (
 	"github.com/home-operations/flate/pkg/store"
 )
 
+func TestFinalizeIndex_ExcludesWorkingTreeGeneratorsUnderPinnedClaim(t *testing.T) {
+	root, artifactDir := t.TempDir(), t.TempDir()
+	s := store.New()
+	sourceID := manifest.NamedResource{Kind: manifest.KindGitRepository, Namespace: "flux-system", Name: "cluster"}
+	s.AddObject(&manifest.Kustomization{
+		Name: "pinned", Namespace: "flux-system", TargetNamespace: "apps", Path: "./apps",
+		SourceKind: sourceID.Kind, SourceName: sourceID.Name, SourceNamespace: sourceID.Namespace,
+	})
+	s.SetArtifact(sourceID, &store.SourceArtifact{LocalRoot: root, LocalPath: artifactDir})
+	l := loaderFixture(s, nil)
+	l.SourceRoot = root
+	testutil.WriteFile(t, root, "apps/kustomization.yaml", "configMapGenerator:\n- name: dirty\n  literals: [value=dirty]\n")
+	testutil.WriteFile(t, artifactDir, "apps/kustomization.yaml", "configMapGenerator:\n- name: pinned\n  literals: [value=pinned]\n")
+	l.documents.read(filepath.Join(root, "apps"))
+	l.documents.read(filepath.Join(artifactDir, "apps"))
+	l.FinalizeIndex(root, nil)
+	objects := s.ListAs[*manifest.ConfigMap](manifest.KindConfigMap)
+	if len(objects) != 1 || objects[0].Name != "pinned" || objects[0].Namespace != "apps" || objects[0].Data["value"] != "pinned" {
+		t.Fatalf("expected only the artifact generator: %+v", objects)
+	}
+	want, err := filepath.Rel(root, filepath.Join(artifactDir, "apps/kustomization.yaml"))
+	if got := filesForTest(l.Index)[objects[0].Named()]; err != nil || got != filepath.ToSlash(want) {
+		t.Fatalf("artifact generator source = %q, want %q: %v", got, want, err)
+	}
+}
+
 // TestLoader_DiscoveryOnlyBootstrapScanSkipsCoveredDir pins the coverage guard
 // on the bootstrap-sibling scan: a Flux Kustomization authored as a sibling of
 // a kustomization.yaml but excluded from its `resources:` is a bootstrap entry
@@ -57,10 +83,8 @@ spec:
 		Path:      "apps/test",
 	})
 
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), filepath.Join(dir, "apps/test")); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -115,10 +139,8 @@ spec:
 `)
 
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -156,7 +178,7 @@ data:
 	testutil.WriteFile(t, dir, "README.md", "ignored")
 
 	s := store.New()
-	n, err := New(s).Load(t.Context(), dir)
+	n, err := loaderFixture(s, nil).Load(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -195,7 +217,7 @@ spec:
 `)
 
 	s := store.New()
-	if _, err := New(s).Load(t.Context(), filepath.Join(root, "entry")); err != nil {
+	if _, err := loaderFixture(s, nil).Load(t.Context(), filepath.Join(root, "entry")); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "crds"}) == nil {
@@ -224,7 +246,7 @@ spec:
 `)
 
 	s := store.New()
-	if _, err := New(s).Load(t.Context(), filepath.Join(root, "entry")); err != nil {
+	if _, err := loaderFixture(s, nil).Load(t.Context(), filepath.Join(root, "entry")); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "escaped"}) != nil {
@@ -251,6 +273,34 @@ metadata: {name: a, namespace: ns}
 	}
 }
 
+func TestLoader_SkipsDotDirs(t *testing.T) {
+	for _, name := range []string{".git", ".cache", ".hidden"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			testutil.WriteFile(t, dir, filepath.Join(name, "hidden.yaml"), `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: hidden, namespace: ns}
+spec: {path: ./hidden, sourceRef: {kind: GitRepository, name: flux-system}}
+`)
+			testutil.WriteFile(t, dir, "visible.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: visible, namespace: ns}
+spec: {path: ./visible, sourceRef: {kind: GitRepository, name: flux-system}}
+`)
+			s := store.New()
+			if _, err := New(s).Load(t.Context(), dir); err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "hidden"}) != nil {
+				t.Error("dot-directory manifest was loaded")
+			}
+			if s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "visible"}) == nil {
+				t.Error("root manifest was skipped")
+			}
+		})
+	}
+}
+
 // A directory whose kustomization.yaml declares `kind: Component` is
 // a template fragment — parents reference it via spec.components and
 // kustomize materializes it at parent-render time. flate's standalone
@@ -273,7 +323,7 @@ kind: ConfigMap
 metadata: {name: real, namespace: ns}
 `)
 	s := store.New()
-	n, err := New(s).Load(context.Background(), dir)
+	n, err := loaderFixture(s, nil).Load(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -285,13 +335,9 @@ metadata: {name: real, namespace: ns}
 	}
 }
 
-// isKustomizeComponent must catch the JSON form too — a substring
-// check on "kind: Component" against the file's first 256 bytes missed
-// `kustomization.json` outright (the JSON form is "kind":"Component"
-// without the YAML separator pattern).
 func TestLoader_SkipsKustomizeComponent_JSONForm(t *testing.T) {
 	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "components/foo/kustomization.json",
+	testutil.WriteFile(t, dir, "components/foo/Kustomization",
 		`{"apiVersion":"kustomize.config.k8s.io/v1alpha1","kind":"Component"}`)
 	testutil.WriteFile(t, dir, "components/foo/leak.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -302,7 +348,7 @@ spec:
   interval: 1h
 `)
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	got := s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "${APP}-leak"})
@@ -337,7 +383,7 @@ spec:
   interval: 1h
 `)
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	got := s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "addons"})
@@ -383,7 +429,7 @@ spec:
 `)
 
 	s := store.New()
-	n, err := New(s).Load(context.Background(), dir)
+	n, err := loaderFixture(s, nil).Load(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -429,7 +475,7 @@ secretGenerator:
 `)
 
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 }
@@ -452,7 +498,7 @@ configMapGenerator:
 	testutil.WriteFile(t, dir, "data/unkeyed.yaml", "- another: top\n- level: seq\n")
 
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	// No objects added — both files excluded. The test passes as long
@@ -479,7 +525,7 @@ kind: ConfigMap
 metadata: {name: shared, namespace: ns}
 `)
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if got := s.GetObject(manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "ns", Name: "shared"}); got == nil {
@@ -514,7 +560,7 @@ kind: ConfigMap
 metadata: {name: real, namespace: ns}
 `)
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if s.GetObject(manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "ns", Name: "real"}) == nil {
@@ -569,7 +615,7 @@ spec:
 	// Entry the loader at `default/` so its kustomization.yaml is the
 	// graph root. The orphan-tree skip only applies under graph-walk;
 	// see Loader.Load doc-comment.
-	if _, err := New(s).Load(context.Background(), filepath.Join(dir, "default")); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), filepath.Join(dir, "default")); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	// Valheim (claimed) MUST be present.
@@ -640,7 +686,7 @@ spec:
     namespace: flux-system
 `)
 	s := store.New()
-	if _, err := New(s).Load(context.Background(), dir); err != nil {
+	if _, err := loaderFixture(s, nil).Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	// valheim is referenced — must load. Kustomization namespace
@@ -690,20 +736,18 @@ spec:
   interval: 1h
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
 	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings"}
-	if _, ok := l.Existence.Get(cmID); !ok {
+	if _, ok := l.Index.Lookup(cmID); !ok {
 		t.Errorf("Component-housed CM must be recorded in Existence under DiscoveryOnly")
 	}
-	if _, ok := l.SourceFiles[cmID]; !ok {
+	if _, ok := filesForTest(l.Index)[cmID]; !ok {
 		t.Errorf("Component-housed CM must be recorded in SourceFiles under DiscoveryOnly")
 	}
 	if s.GetObject(cmID) != nil {
@@ -739,11 +783,8 @@ spec:
     namespace: flux-system
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
-	l.SourceRefs = map[manifest.NamedResource][]manifest.NamedResource{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -753,9 +794,9 @@ spec:
 	if s.GetObject(hrID) != nil {
 		t.Fatalf("HR must NOT be in Store under DiscoveryOnly (existence-only)")
 	}
-	refs, ok := l.SourceRefs[hrID]
+	refs, ok := refsForTest(l.Index)[hrID]
 	if !ok {
-		t.Fatalf("HR chart source ref must be captured in SourceRefs; got %v", l.SourceRefs)
+		t.Fatalf("HR chart source ref must be captured in SourceRefs; got %v", refsForTest(l.Index))
 	}
 	want := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "envoy-gateway"}
 	if len(refs) != 1 || refs[0] != want {
@@ -793,10 +834,8 @@ data:
   KEY: value
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	// Drive the loader at the outer Component directly — same shape
 	// as TestLoader_SkipsKustomizeComponentSubtree's entry pattern.
@@ -805,10 +844,10 @@ data:
 	}
 
 	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "shared-cm"}
-	if _, ok := l.Existence.Get(id); !ok {
+	if _, ok := l.Index.Lookup(id); !ok {
 		t.Errorf("inner Component CM reached via Component-of-Component must be recorded in Existence")
 	}
-	if _, ok := l.SourceFiles[id]; !ok {
+	if _, ok := filesForTest(l.Index)[id]; !ok {
 		t.Errorf("inner Component CM must be recorded in SourceFiles")
 	}
 }
@@ -831,9 +870,8 @@ components:
   - ../a
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	// No timeout context: if cycle protection fails, the test hangs
 	// and the test framework's overall timeout surfaces the bug.
 	if _, err := l.Load(context.Background(), filepath.Join(dir, "components/a")); err != nil {
@@ -863,20 +901,18 @@ data:
   FOO: bar
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	// DiscoveryOnly intentionally OFF.
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
 	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings"}
-	if _, ok := l.Existence.Get(cmID); ok {
+	if _, ok := l.Index.Lookup(cmID); ok {
 		t.Errorf("non-DiscoveryOnly walk must not record Component-housed CMs in Existence")
 	}
-	if _, ok := l.SourceFiles[cmID]; ok {
+	if _, ok := filesForTest(l.Index)[cmID]; ok {
 		t.Errorf("non-DiscoveryOnly walk must not record Component-housed CMs in SourceFiles")
 	}
 	if s.GetObject(cmID) != nil {
@@ -940,10 +976,8 @@ spec:
 `)
 
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -953,7 +987,7 @@ spec:
 	if s.GetObject(ksID) == nil {
 		t.Errorf("bootstrap-sibling Flux KS must reach the Store under DiscoveryOnly")
 	}
-	if got, want := l.SourceFiles[ksID], "repositories/flux-entry.yaml"; got != want {
+	if got, want := filesForTest(l.Index)[ksID], "repositories/flux-entry.yaml"; got != want {
 		t.Errorf("SourceFiles[KS] = %q; want %q", got, want)
 	}
 
@@ -961,7 +995,7 @@ spec:
 	if s.GetObject(hrID) != nil {
 		t.Errorf("sibling HR must NOT be picked up by the bootstrap scan (scope is Flux KS only)")
 	}
-	if _, ok := l.Existence.Get(hrID); ok {
+	if _, ok := l.Index.Lookup(hrID); ok {
 		t.Errorf("sibling HR must NOT be recorded in Existence either — it's not in the kustomize graph")
 	}
 }
@@ -990,10 +1024,8 @@ spec:
   interval: 10m
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
-	l.SourceFiles = map[manifest.NamedResource]string{}
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -1027,7 +1059,7 @@ spec:
   interval: 10m
 `)
 	s := store.New()
-	l := New(s) // DiscoveryOnly intentionally OFF.
+	l := loaderFixture(s, nil) // DiscoveryOnly intentionally OFF.
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1061,9 +1093,8 @@ spec:
   interval: 10m
 `)
 	s := store.New()
-	l := New(s)
+	l := loaderFixture(s, nil)
 	l.Options.DiscoveryOnly = true
-	l.Existence = NewExistenceIndex()
 	l.SourceRoot = dir
 	if _, err := l.Load(context.Background(), dir); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -1091,13 +1122,6 @@ metadata: {name: a, namespace: ns}
 	}
 }
 
-// TestLoader_MalformedManifestFails pins that a file the walk opens which
-// isn't valid YAML fails Load instead of being logged and skipped. Both walk
-// modes must agree: the kustomize graph (the file is listed under
-// `resources:`) and the ad-hoc tree walk (no kustomization.yaml). Skipping
-// the file would silently drop any Flux Kustomization it declares from the
-// run, and when the parent that renders the directory sits outside the scan
-// root nothing else ever reports the syntax error.
 func TestLoader_MalformedManifestFails(t *testing.T) {
 	const broken = `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -1128,17 +1152,34 @@ brokenPointer: [ unclosed
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := filepath.Join(t.TempDir(), "app")
 			testutil.WriteFile(t, dir, "blackbox-exporter.yaml", broken)
 			for name, body := range tc.files {
 				testutil.WriteFile(t, dir, name, body)
 			}
-			_, err := New(store.New()).Load(t.Context(), dir)
+			l := New(store.New())
+			_, err := l.Load(t.Context(), dir)
 			if !errors.Is(err, manifest.ErrInput) {
 				t.Fatalf("Load error = %v, want one wrapping manifest.ErrInput", err)
 			}
 			if !strings.Contains(err.Error(), "blackbox-exporter.yaml") {
 				t.Errorf("Load error must name the malformed file; got: %v", err)
+			}
+			l.Index = &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}}
+			l.SourceRoot = dir
+			if _, err := l.Load(t.Context(), dir); err != nil {
+				t.Fatalf("indexed discovery aborted before ownership was known: %v", err)
+			}
+			if err := l.Index.Errors["blackbox-exporter.yaml"]; !errors.Is(err, manifest.ErrInput) {
+				t.Fatalf("deferred decode error = %v, want manifest.ErrInput", err)
+			}
+			first := l.Index.Errors["blackbox-exporter.yaml"]
+			parent := filepath.Dir(dir)
+			if _, err := l.Load(t.Context(), parent); err != nil {
+				t.Fatal(err)
+			}
+			if got := l.Index.Errors["blackbox-exporter.yaml"]; got != first {
+				t.Fatalf("second walk replaced the first decode failure: first=%+v got=%+v", first, got)
 			}
 		})
 	}

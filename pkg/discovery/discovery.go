@@ -1,23 +1,14 @@
-// Package discovery owns flate's filesystem-to-store hydration phase:
-// walking the user's working tree, expanding spec.path references,
-// aliasing in-cluster-bootstrapped sources, rendering ResourceSets, and
-// computing the structural-parent index. The output is everything the
-// reconcile phase needs to start firing controllers — repo root,
-// per-object source files, and the parent index.
-//
-// Splitting this out of the orchestrator turns a 750-line god-object
-// into two ~350-line files with one clean interface between them. The
-// load phase is independently testable (no controller wiring or
-// task service required) and the orchestrator now reads as pure
-// reconcile orchestration.
+// Package discovery hydrates the store, resolves local source identities, and
+// publishes immutable discovery records, ownership claims and resource-graph readers.
+// Source aliasing uses authored URL/ref values before parent rendering.
 package discovery
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 
@@ -31,36 +22,8 @@ type Result struct {
 	// RepoRoot is the resolved working-tree anchor (with .git ancestor
 	// walk + symlink resolution applied).
 	RepoRoot string
-	// SourceFiles maps each loaded resource to the repo-relative path
-	// it was parsed from. Consumed by the change filter.
-	SourceFiles map[manifest.NamedResource]string
-	// SourceRefs maps each loaded consumer (HelmRelease / Kustomization)
-	// to the source resources it references. Consumed by the change
-	// filter's reverse edge so a changed source re-renders the
-	// HelmReleases that chartRef it even when the source lives in a
-	// separate Kustomization tree (and the HR never reached the Store
-	// under DiscoveryOnly).
-	SourceRefs map[manifest.NamedResource][]manifest.NamedResource
-	// ParentOf maps each reconcilable resource (Kustomization or
-	// HelmRelease) to its structural-parent Kustomization — the KS
-	// whose spec.path is the deepest strict ancestor of the child's
-	// source file. KS children honor it as a depwait dep so any
-	// parent-render-time spec mutations (replacements: injecting
-	// targetNamespace) are visible before the child renders;
-	// HR children honor it so the first render reads the post-patch
-	// spec (driftDetection / upgrade strategy / CRD policy overrides
-	// applied at the cluster-KS level) instead of the pre-patch
-	// file-loaded copy. Keyed by NamedResource so KS and HR entries
-	// never collide. Empty when no parent enforcement applies.
-	ParentOf map[manifest.NamedResource]manifest.NamedResource
-	// SelfProduce attributes each ConfigMap to the Kustomization(s)
-	// whose own render subtree emits it (bare-dir → subdir-base →
-	// component graph, with namespace propagation). collectDeps uses it
-	// to drop a self-produced postBuild.substituteFrom ConfigMap from
-	// the dependency set — a KS can't wait on a CM only its own render
-	// produces. Available in full mode, unlike the changed-only
-	// producer index.
-	SelfProduce *loader.SelfProduceIndex
+	// Index contains the immutable static discovery facts consumed by rendering.
+	Index *manifest.DiscoveryIndex
 	// Producers maps a target Secret to the in-repo ExternalSecret /
 	// SealedSecret that declares it, seeded by the same self-produce walk.
 	// The source + HR controllers consult it to skip a missing auth /
@@ -68,17 +31,13 @@ type Result struct {
 	// --allow-missing-secrets. Augmented at render time by the HR
 	// controller's EventObjectAdded listener. See manifest.ProducerIndex.
 	Producers *manifest.ProducerIndex
-	// Existence holds every file-loaded object the DiscoveryOnly
-	// loader kept out of the Store: HRs, sources, CMs, Secrets, and
-	// raw manifests. depwait's missing-dep fallback consults it to
-	// resolve sibling-rendered substituteFrom CMs without
-	// deadlocking the parent KS. The orchestrator passes a closure
-	// over this index into the controllers' Waiter wiring.
-	Existence *loader.ExistenceIndex
 	// WipeSecrets reflects the loader's WipeSecrets setting. The
 	// orchestrator forwards it to lazy-promotion so SOPS Secrets
 	// stay wiped on demand the same way they were at file-load.
 	WipeSecrets bool
+	// DisableChartDigestTracking reflects inline instance patches in file-parsed
+	// HelmReleases, including releases kept out of the store by DiscoveryOnly.
+	DisableChartDigestTracking bool
 }
 
 // Config is the input contract for Run. Store is mandatory.
@@ -94,12 +53,11 @@ type Config struct {
 	// behavior. Path must sit at or under RepoRoot.
 	RepoRoot string
 	// SelfURLs are the remote URL(s) this tree represents. A user-authored
-	// GitRepository whose spec.url matches one of these is the cluster
-	// pulling itself; its artifact is aliased to the local tree
-	// (overrideSelfReferentialGitRepositories) so the offline render
-	// resolves it. Supplied explicitly by SDK consumers rendering
-	// extracted trees (no .git/config to read); empty ⇒ fall back to the
-	// working tree's .git remotes, preserving local behavior.
+	// GitRepository matching one is the cluster pulling itself: no ref or
+	// HEAD uses the working tree, another local ref uses a cached committed
+	// artifact, and unavailable refs or non-HEAD sparse/submodule options
+	// warn and fetch normally. SDK consumers supply these for extracted
+	// trees with no .git/config; empty uses the working tree's git remotes.
 	SelfURLs []string
 	// KRMIgnoreFile, when non-empty, is read in place of <Path>/.krmignore
 	// for the initial scan; spec.path targets followed afterwards keep
@@ -109,15 +67,6 @@ type Config struct {
 	KRMIgnoreFile string
 	Store         *store.Store
 	WipeSecrets   bool
-	// ComponentCache, when non-nil, memoizes
-	// manifest.ReadKustomizeComponents reads across discovery's
-	// internal passes (parent-index build, orphan promotion, the
-	// loader's FinalizeGenerators KSPathPrefixes) and any later
-	// consumer that shares the same pointer (change.Filter,
-	// finalize.detectOrphans). The orchestrator wires one cache per
-	// Bootstrap; pass nil for standalone discovery callers (tests,
-	// embedders) that don't need cross-consumer sharing.
-	ComponentCache *manifest.ComponentCache
 }
 
 // Run performs the full discovery phase against cfg and writes results
@@ -128,6 +77,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		return nil, errors.New("discovery: Store is required")
 	}
 	l := loader.New(cfg.Store)
+	l.Index = &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}}
 	l.Options.WipeSecrets = cfg.WipeSecrets
 	// Render-driven discovery: only Kustomizations and the discovery-
 	// meta pair (ResourceSet, RSIP) reach the Store from the file
@@ -136,19 +86,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	// emitRenderedChildren, the orchestrator's orphan-promotion
 	// sweep, or depwait's lazy-promotion fallback.
 	l.Options.DiscoveryOnly = true
-	l.Existence = loader.NewExistenceIndex()
-	// Thread the shared component cache through to the loader so
-	// FinalizeGenerators' KSPathPrefixes reads come from cache (and
-	// land cache entries for the subsequent parent-index +
-	// orphan-promotion passes below). nil is fine here — the loader
-	// falls back to a per-call cache.
-	l.ComponentCache = cfg.ComponentCache
-	d := &discoverer{
-		cfg:         cfg,
-		loader:      l,
-		sourceFiles: map[manifest.NamedResource]string{},
-		sourceRefs:  map[manifest.NamedResource][]manifest.NamedResource{},
-	}
+	d := &discoverer{cfg: cfg, loader: l}
 	repoRoot, err := d.seedBootstrapSource()
 	if err != nil {
 		return nil, err
@@ -156,8 +94,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	if err := d.loadManifests(ctx, repoRoot); err != nil {
 		return nil, err
 	}
-	d.aliasBootstrapSources(repoRoot)
-	d.applyNamespaces(repoRoot)
+	d.loader.ApplyNamespaces(repoRoot)
 	// Resolve bare ${VAR} in Kustomization dependsOn against the
 	// cluster's postBuild substitute values, now that the full KS set is
 	// discovered (so the substitute union is complete and its conflict
@@ -165,90 +102,33 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	// `dependsOn: 0-${CLUSTER_NAME}-config` never matches the real
 	// 0-biohazard-config the parent's render would have substituted.
 	loader.ResolveDependsOnSubstitutions(d.cfg.Store)
-	// Materialize configMapGenerator / secretGenerator entries the
-	// file walker collected. The effective namespace comes from the
-	// enclosing Flux Kustomization, which is only known now that
-	// the full KS tree is loaded. Resolves the depwait gap where a
-	// substituteFrom references a CM produced by a Component's
-	// generator (issue #396).
-	l.FinalizeGenerators(repoRoot)
-	// Unified parent index over every reconcilable kind that uses a
-	// parent gate. KS, HR and RS keys never collide because NamedResource
-	// includes Kind; downstream controllers look up by their own id
-	// and naturally filter to their own kind. Pass repoRoot — the
-	// helpers read each KS's spec.path joined under this root to
-	// follow `components:` entries; cfg.Path would misread when the
-	// user pointed --path at a subdir below the actual repo root.
-	// Compute the KS spec.path prefix list ONCE and reuse it across the
-	// KS-parent index, the HR-parent index, and orphan promotion. Each
-	// previously rebuilt the identical list (an O(KS) walk + sort +
-	// component reads); the shared ComponentCache deduped the file reads
-	// but not the iteration/sort/list construction.
-	//
-	// ResourceSet is included so a file-loaded RS knows its structural
-	// parent KS at reconcile time — the RS controller gates on the parent
-	// (parent-render-time spec mutations) and attributes its RawObject
-	// children to that parent for `flate build` output. Without the
-	// file-path entry the RS would only learn its parent once the parent
-	// re-emitted it, racing the RS's own first render.
-	prefixes := loader.KSPathPrefixesLocalOnly(d.cfg.Store, repoRoot, cfg.ComponentCache)
-	parentOf := loader.BuildParentIndexFromPrefixes(prefixes, d.cfg.Store, d.sourceFiles, manifest.KindKustomization)
-	maps.Copy(parentOf, loader.BuildParentIndexFromPrefixes(prefixes, d.cfg.Store, d.sourceFiles, manifest.KindHelmRelease))
-	maps.Copy(parentOf, loader.BuildParentIndexFromPrefixes(prefixes, d.cfg.Store, d.sourceFiles, manifest.KindResourceSet))
-	// Orphan promotion: every Existence entry whose file path is NOT
-	// under any KS spec.path will never reach the Store through KS
-	// render emission. Promote it now so standalone CRs (loose HR
-	// at repo root, sources next to flux-system/kustomization.yaml,
-	// etc.) keep working in DiscoveryOnly mode.
-	d.promoteOrphans(prefixes)
-
-	producers := &manifest.ProducerIndex{}
-	selfProduce := loader.BuildSelfProduceIndex(d.cfg.Store, repoRoot, producers, cfg.WipeSecrets)
-	// Gate cross-tree base Kustomizations (#777) on their emitting parent. Such a
-	// base sits under no KS spec.path, so BuildParentIndexFromPrefixes gave it no
-	// gate — it would reconcile the raw UNSUBSTITUTED copy and race the parent's
-	// substituted emission. Wiring its emitter into ParentOf makes its first
-	// render wait, exactly like the spec.path-prefix gate (see
-	// EmissionParentByFile). A KS already gated by spec.path, and self-emits
-	// (parent == id), are left alone.
-	for id, file := range d.sourceFiles {
-		if id.Kind != manifest.KindKustomization {
-			continue
-		}
-		if _, gated := parentOf[id]; gated {
-			continue
-		}
-		if parent, ok := selfProduce.EmissionParentByFile(file); ok && parent != id {
-			parentOf[id] = parent
+	var standaloneSecrets []manifest.NamedResource
+	if cfg.WipeSecrets {
+		for id := range l.Index.Files() {
+			if id.Kind == manifest.KindSecret && d.cfg.Store.GetObject(id) == nil {
+				standaloneSecrets = append(standaloneSecrets, id)
+			}
 		}
 	}
+	producers := &manifest.ProducerIndex{}
+	l.FinalizeIndex(repoRoot, producers)
+	d.promoteOrphans(standaloneSecrets)
 	return &Result{
-		RepoRoot:    repoRoot,
-		SourceFiles: d.sourceFiles,
-		SourceRefs:  d.sourceRefs,
-		ParentOf:    parentOf,
-		SelfProduce: selfProduce,
-		Producers:   producers,
-		Existence:   l.Existence,
-		WipeSecrets: cfg.WipeSecrets,
+		RepoRoot:                   repoRoot,
+		Index:                      l.Index,
+		Producers:                  producers,
+		WipeSecrets:                cfg.WipeSecrets,
+		DisableChartDigestTracking: l.DisableChartDigestTracking,
 	}, nil
 }
 
-func (d *discoverer) applyNamespaces(repoRoot string) {
-	// Stamp NamespaceTransformer-injected targetNamespace onto Flux KSes
-	// first so ApplyNamespaceInheritance's projection sees a populated
-	// targetNamespace and the leaf KS renders into the right namespace on
-	// its first pass (issue #528).
-	loader.StampTransformerTargetNamespaces(d.cfg.Store, d.sourceFiles, repoRoot)
-	loader.ApplyNamespaceInheritanceWithRefs(d.cfg.Store, d.sourceFiles, d.sourceRefs, repoRoot)
-	loader.ApplyDefaultNamespaces(d.cfg.Store, d.sourceFiles)
-}
-
 type discoverer struct {
-	cfg         Config
-	loader      *loader.Loader
-	sourceFiles map[manifest.NamedResource]string
-	sourceRefs  map[manifest.NamedResource][]manifest.NamedResource
+	cfg             Config
+	loader          *loader.Loader
+	resolvedSources map[manifest.NamedResource]*manifest.GitRepository
+	remotes         map[string]struct{}
+	remotesLoaded   bool
+	hasPins         bool
 }
 
 // loadManifests scans cfg.Path, then iteratively follows each loaded
@@ -259,8 +139,6 @@ type discoverer struct {
 func (d *discoverer) loadManifests(ctx context.Context, repoRoot string) error {
 	l := d.loader
 	l.SourceRoot = repoRoot
-	l.SourceFiles = d.sourceFiles
-	l.SourceRefs = d.sourceRefs
 
 	scanRoot := repoRoot
 	if d.cfg.Path != "" {
@@ -280,18 +158,16 @@ func (d *discoverer) loadManifests(ctx context.Context, repoRoot string) error {
 		return err
 	}
 	l.IgnoreFile = ""
-	// Apply namespaces once over the initially-scanned set so the
-	// bootstrap-source alias and the first expansion pass see populated
-	// namespaces. The fixed-point loop below intentionally does NOT
-	// re-run applyNamespaces per discovered spec.path — that was an
-	// O(N²) full-store rebuild on every newly-loaded KS. Namespace
-	// inheritance is idempotent and order-independent, so the single
-	// post-loop pass in Run (after the complete KS set is discovered)
-	// stamps every loop-discovered object correctly in one walk.
-	d.applyNamespaces(repoRoot)
+	// Pins resolve on final namespace ids. Extra inheritance passes are needed
+	// only when both an authored ref and a self-matching URL make a pin possible;
+	// unpinned followed paths must wait for the complete Kustomization set in Run.
+	d.loader.ApplyNamespaces(repoRoot)
+	namespaced := total
 
-	// Fixed-point expansion: each pass renders Kustomizations the prior
-	// pass discovered. PreferExisting lets repeated AddObject re-emission
+	// Pins must be resolved before any spec.path is followed so a pinned
+	// Kustomization's subtree comes from its committed artifact, never the
+	// working tree. Sources found through followed paths resolve on the next pass.
+	// PreferExisting lets repeated AddObject re-emission
 	// be a no-op so the loop terminates on convergence (no new objects
 	// added). ResourceSets that emit child Kustomizations referencing new
 	// spec.paths are handled at run time — the RS controller emits the
@@ -299,18 +175,56 @@ func (d *discoverer) loadManifests(ctx context.Context, repoRoot string) error {
 	// discovery no longer pre-expands RSes.
 	l.PreferExisting = true
 	ksExpanded := map[manifest.NamedResource]struct{}{}
+	var aliased []manifest.NamedResource
 	for {
+		if total != namespaced {
+			for id := range d.loader.Index.Records {
+				if id.Kind != manifest.KindGitRepository {
+					continue
+				}
+				repo, ok := d.cfg.Store.Get[*manifest.GitRepository](id)
+				if ok && repo.Reference != nil && manifest.GitRefString(*repo.Reference) != "" {
+					if _, match := d.selfRemotes(repoRoot)[normalizeGitURL(repo.URL)]; match {
+						d.loader.ApplyNamespaces(repoRoot)
+						break
+					}
+				}
+			}
+			namespaced = total
+		}
+		overridden, err := d.overrideSelfReferentialGitRepositories(ctx, repoRoot)
+		if err != nil {
+			return err
+		}
+		aliased = append(aliased, overridden...)
+		if d.hasPins {
+			d.discardPinnedWorkingTreeFiles(repoRoot)
+		}
+		kustomizations := d.cfg.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization)
+		if d.hasPins {
+			// A source discovered through a followed path can pin an expanded consumer.
+			for _, ks := range kustomizations {
+				if _, pinned, _ := loader.SourceView(d.cfg.Store, ks, repoRoot); pinned {
+					delete(ksExpanded, ks.Named())
+				}
+			}
+		}
 		added := 0
-		for _, ks := range d.cfg.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
+		for _, ks := range kustomizations {
 			id := ks.Named()
 			if _, seen := ksExpanded[id]; seen {
 				continue
 			}
 			ksExpanded[id] = struct{}{}
-			if ks.Path == "" {
+			if ks.Path == "" && ks.SourceName == "" {
 				continue
 			}
-			target := filepath.Join(repoRoot, filepath.FromSlash(stripDotSlash(ks.Path)))
+			sourceRoot, _, external := loader.SourceView(d.cfg.Store, ks, repoRoot)
+			ref := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
+			if external && ks.SourceKind == manifest.KindOCIRepository && d.cfg.Store.GetObject(ref) == nil && d.cfg.Store.GetArtifact(ref) == nil {
+				continue
+			}
+			target := filepath.Join(sourceRoot, filepath.FromSlash(stripDotSlash(ks.Path)))
 			// Canonicalize via EvalSymlinks so two spec.paths that
 			// resolve to the same on-disk directory (one direct, one
 			// through a symlink) share a scanned-set key. Without
@@ -324,7 +238,7 @@ func (d *discoverer) loadManifests(ctx context.Context, repoRoot string) error {
 			if _, seen := scanned[target]; seen {
 				continue
 			}
-			if !pathUnderRoot(target, repoRoot) {
+			if !pathUnderRoot(target, sourceRoot) {
 				continue
 			}
 			if err := d.loadAt(ctx, target, scanned, &total); err != nil {
@@ -337,8 +251,53 @@ func (d *discoverer) loadManifests(ctx context.Context, repoRoot string) error {
 		}
 	}
 	l.PreferExisting = false
+	aliased = append(d.aliasMissingKustomizationSources(repoRoot), aliased...)
+	warnIfMultipleBootstrapAliases(aliased, repoRoot)
 	slog.Debug("discovery: loaded objects", "count", total, "scan_root", scanRoot, "source_root", repoRoot)
 	return nil
+}
+
+// A broad --path scan can overlap a pinned subtree. Its working-tree objects
+// must be discarded before the committed subtree supplies discovery metadata.
+// Resolved sources must retain their objects and artifacts so a pinned root
+// claim cannot replace its own source with a working-tree alias.
+func (d *discoverer) discardPinnedWorkingTreeFiles(repoRoot string) {
+	pinnedSources := make(map[manifest.NamedResource]struct{})
+	pinnedKS := make(map[manifest.NamedResource]struct{})
+	for _, ks := range d.cfg.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
+		ref := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
+		if _, pinned, _ := loader.SourceView(d.cfg.Store, ks, repoRoot); pinned {
+			pinnedSources[ref] = struct{}{}
+			pinnedKS[ks.Named()] = struct{}{}
+		}
+	}
+	var prefixes []manifest.KSClaim
+	for _, c := range d.loader.Claims(repoRoot) {
+		if _, pinned := pinnedKS[c.ID]; pinned {
+			prefixes = append(prefixes, c)
+		}
+	}
+	if len(prefixes) == 0 {
+		return
+	}
+	for id, record := range d.loader.Index.Files() {
+		file := record.File
+		if _, resolved := d.resolvedSources[id]; resolved {
+			continue
+		}
+		if _, pinned := pinnedSources[id]; pinned {
+			continue
+		}
+		if !pathUnderRoot(filepath.Join(repoRoot, filepath.FromSlash(file)), repoRoot) {
+			continue
+		}
+		_, owned := manifest.StrictParent(prefixes, file, id, nil)
+		if !owned {
+			continue
+		}
+		d.cfg.Store.DeleteObject(id)
+		delete(d.loader.Index.Records, id)
+	}
 }
 
 // loadAt scans dir if not already scanned, marks it, and accumulates
@@ -348,10 +307,10 @@ func (d *discoverer) loadAt(ctx context.Context, dir string, scanned map[string]
 		return nil
 	}
 	scanned[dir] = struct{}{}
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+	n, err := d.loader.Load(ctx, dir)
+	if d.loader.IgnoreFile == "" && errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	n, err := d.loader.Load(ctx, dir)
 	if err != nil {
 		return err
 	}

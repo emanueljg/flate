@@ -1,7 +1,7 @@
 // Package base provides the shared lifecycle harness every flate
 // controller wraps around its per-resource reconcile body.
 //
-// Each concrete controller (source, kustomization, helmrelease)
+// Each concrete controller (source, kustomization, helmrelease, resourceset)
 // embeds *base.Controller and contributes only the controller-specific
 // dependencies (Fetchers, Helm client, Staging cache, ...) plus the
 // reconcile function itself. Lifecycle wiring — the started gate, the
@@ -9,7 +9,7 @@
 // Suspend/Filter pre-gate — lives here exactly once.
 //
 // The package also owns the panic-recovery + status-transition harness
-// (Recover, RunWithStatus) that surrounds individual reconcile bodies.
+// (RunWithStatusOutcome) that surrounds individual reconcile bodies.
 package base
 
 import (
@@ -21,8 +21,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/depwait"
 	"github.com/home-operations/flate/pkg/manifest"
@@ -30,26 +28,12 @@ import (
 	"github.com/home-operations/flate/pkg/task"
 )
 
-// RenderTracker is the seam a controller uses to report
-// "this child id was emitted by THIS parent's render" to the
-// orchestrator. Nil is OK — the controller no-ops.
-//
-// The parent linkage feeds detectOrphans, the structural-parent
-// resolver, and ResourceSet extension attribution for render-emitted
-// resources. Both the KS and HR controllers report through it
-// identically; MarkRenderedBatch records multiple children under a
-// single lock acquisition so a render emitting N children pays one
-// tracker round-trip rather than N.
-type RenderTracker interface {
-	MarkRenderedBatch(parent manifest.NamedResource, children []manifest.NamedResource)
-}
-
 // Controller is the embeddable lifecycle harness. Construct via New,
-// install reconcile-shaping config via SetFilter (panics if called
-// after Start), then Start to register listeners.
+// install reconcile-shaping config via SetFilter, then call StartLifecycle
+// before dispatch or listener registration.
 //
-// All three concrete controllers carry the same lifecycle shape:
-//   - a started gate so Configure-after-Start is a hard error
+// All four concrete controllers carry the same lifecycle shape:
+//   - a started gate so configuration during dispatch is a hard error
 //   - a filter for changed-only mode
 //   - an unsubscriber list cleared by Close
 //
@@ -59,7 +43,7 @@ type RenderTracker interface {
 // The KS and HR controllers additionally share depwait configuration
 // (Existence) and a pre-reconcile preflight check (Preflight,
 // ParentOf). Configure these via SetDepwait / SetPreflight / SetParentOf
-// before Start so reconcile bodies can call NewWaiter, PreflightError,
+// before dispatch so reconcile bodies can call Require, PreflightError,
 // and LookupParent without each controller duplicating the nil-check
 // boilerplate.
 type Controller struct {
@@ -91,22 +75,18 @@ type Controller struct {
 
 	// unsubMu guards unsub so AddListener and Close can be called
 	// concurrently (e.g. shutdown racing a listener-triggered Submit).
-	// The slice is short-lived (registered at Start, drained at Close)
+	// The slice is short-lived (registered via AddListener, drained at Close)
 	// and per-controller, so the lock has near-zero contention.
 	unsubMu sync.Mutex
 	unsub   []store.Unsubscribe
 
 	// Shared KS/HR depwait and preflight state. Set via SetDepwait,
 	// SetPreflight, SetParentOf. The source controller leaves these nil;
-	// KS and HR configure them before Start via their Configure methods.
-	existence depwait.ExistenceLookup
-	preflight func(manifest.NamedResource) (string, bool)
-	parentOf  func(manifest.NamedResource) (manifest.NamedResource, bool)
-
-	// renderTracker receives every reconcilable/source child a render
-	// emits. Set via SetRenderTracker before Start; read-only after.
-	// nil is fine — ReportRendered no-ops.
-	renderTracker RenderTracker
+	// KS and HR configure them before dispatch via their Configure methods.
+	existence        depwait.ExistenceLookup
+	allowMissingCRDs bool
+	preflight        func(manifest.NamedResource) (string, bool)
+	parentOf         func(manifest.NamedResource) (manifest.NamedResource, bool)
 }
 
 // New constructs a base controller with the given stable name (its
@@ -136,49 +116,42 @@ func (c *Controller) Logger() *slog.Logger { return c.log }
 // begins. method is the calling setter's name for the panic message.
 func (c *Controller) requireNotStarted(method string) {
 	if c.started.Load() {
-		panic("controller: " + method + " called after Start")
+		panic("controller: " + method + " called after dispatch begins")
 	}
 }
 
 // SetFilter installs the change filter that gates reconciliation in
-// changed-only mode. Panics if called after Start — the invariant is
+// changed-only mode. Panics once StartLifecycle is called; the invariant is
 // that reconcile-shaping config is frozen once dispatch begins.
 func (c *Controller) SetFilter(f *change.Filter) {
 	c.requireNotStarted("SetFilter")
 	c.filter = f
 }
 
-// Filter returns the configured filter (may be nil-but-non-active).
-func (c *Controller) Filter() *change.Filter { return c.filter }
-
-// SetDepwait installs the depwait resolution wires. Panics after Start.
+// SetDepwait installs the depwait resolution wires.
+// Panics once StartLifecycle is called.
 func (c *Controller) SetDepwait(existence depwait.ExistenceLookup) {
 	c.requireNotStarted("SetDepwait")
 	c.existence = existence
 }
 
-// SetPreflight installs the pre-reconcile failure reporter. Panics after Start.
+// SetPreflight installs the pre-reconcile failure reporter.
+// Panics once StartLifecycle is called.
 func (c *Controller) SetPreflight(f func(manifest.NamedResource) (string, bool)) {
 	c.requireNotStarted("SetPreflight")
 	c.preflight = f
 }
 
-// SetParentOf installs the structural parent resolver. Panics after Start.
+// SetParentOf installs the structural parent resolver.
+// Panics once StartLifecycle is called.
 func (c *Controller) SetParentOf(f func(manifest.NamedResource) (manifest.NamedResource, bool)) {
 	c.requireNotStarted("SetParentOf")
 	c.parentOf = f
 }
 
-// SetRenderTracker installs the render-emission tracker. Panics after
-// Start — reconcile-shaping config is frozen once dispatch begins.
-func (c *Controller) SetRenderTracker(rt RenderTracker) {
-	c.requireNotStarted("SetRenderTracker")
-	c.renderTracker = rt
-}
-
 // Options is the post-bootstrap, reconcile-shaping config common to every
 // render controller (Kustomization, HelmRelease, ResourceSet). The
-// orchestrator wires it once before Start; the source controller is fetch-only
+// orchestrator wires it once before dispatch; the source controller is fetch-only
 // and configures just its filter directly, so it does NOT embed this. A
 // concrete controller embeds Options in its own option struct and forwards it
 // to Configure, then assigns its controller-specific fields.
@@ -191,14 +164,13 @@ type Options struct {
 	// targetNamespace, postBuild substitutions, a re-emitted patched spec) is
 	// then observable. Nil disables parent enforcement.
 	ParentOf func(manifest.NamedResource) (manifest.NamedResource, bool)
-	// RenderTracker receives every reconcilable child a render emits, feeding
-	// the orchestrator's parent-provenance index (orphan detection, parent
-	// resolution, attribution).
-	RenderTracker RenderTracker
 	// Existence is the file-existence lookup depwait uses to lazy-promote
 	// file-indexed deps and to distinguish a render-only dep still in flight
 	// from a typo'd one. See depwait.ExistenceLookup.
 	Existence depwait.ExistenceLookup
+	// AllowMissingCRDs accepts CRD dependencies absent from the offline inputs
+	// because the cluster installs them at runtime.
+	AllowMissingCRDs bool
 	// PreflightFailure reports dependency-graph errors discovered before
 	// reconcile; when set for an id the controller marks it Failed and renders
 	// nothing.
@@ -207,42 +179,41 @@ type Options struct {
 
 // Configure applies the common reconcile-shaping config. A concrete controller
 // calls c.Controller.Configure(opts.Options) before assigning its own fields.
-// The five setters are independent single-field writes, so their order is
-// immaterial; each still panics if called after Start.
+// The setters are independent single-field writes, so their order is
+// immaterial; each panics once StartLifecycle is called.
 func (c *Controller) Configure(opts Options) {
 	c.SetFilter(opts.Filter)
 	c.SetDepwait(opts.Existence)
 	c.SetPreflight(opts.PreflightFailure)
 	c.SetParentOf(opts.ParentOf)
-	c.SetRenderTracker(opts.RenderTracker)
+	c.allowMissingCRDs = opts.AllowMissingCRDs
 }
 
 // KeepEmitted extends the change filter's keep set so render-emitted
-// children pass the changed-only-mode PreGate check. Without this, a
+// children pass the changed-only-mode preGate check. Without this, a
 // parent whose render emits a child that wasn't on disk at filter-build
 // time (kustomize component+replacement KSes, charts that render source
 // CRs) would silently drop that child from the diff comparison. Routed
 // through Filter.AddEmitted so an ancestor-only parent doesn't cascade
 // unrelated file-loaded children into keep (#204/#260/#308).
 //
+// Newly-kept source and Kustomization ids are refired because their listeners
+// preGate-skipped before a consumer joined keep (#260, #418). Other kinds are never
+// refired: nothing moves a refired HelmChart's Pending status back to Ready.
+//
 // MUST be called BEFORE Store.AddObject so the listener that fires
 // synchronously during AddObject sees the extended keep set.
 func (c *Controller) KeepEmitted(parent manifest.NamedResource, child manifest.BaseManifest) {
-	if f := c.Filter(); f != nil {
-		f.AddEmitted(parent, child)
+	if f := c.filter; f != nil {
+		for _, id := range f.AddEmitted(parent, child) {
+			switch id.Kind {
+			case manifest.KindGitRepository, manifest.KindOCIRepository,
+				manifest.KindHelmRepository, manifest.KindBucket,
+				manifest.KindExternalArtifact, manifest.KindKustomization:
+				c.Store.Refire(id)
+			}
+		}
 	}
-}
-
-// ReportRendered reports parent→child render emissions to the
-// configured RenderTracker; no-op when none is wired or there are no
-// children. The emit loop accumulates every child it emits and flushes
-// through this helper exactly once, holding the tracker's lock for one
-// acquisition instead of N.
-func (c *Controller) ReportRendered(parent manifest.NamedResource, children []manifest.NamedResource) {
-	if c.renderTracker == nil || len(children) == 0 {
-		return
-	}
-	c.renderTracker.MarkRenderedBatch(parent, children)
 }
 
 // LookupParent reports the structural parent KS of id via the
@@ -301,8 +272,8 @@ func (c *Controller) SetPendingUnlessReady(id manifest.NamedResource, msg string
 // are byte-identical, so the expensive render (kustomize/helm) is skipped. It
 // still replays the cached docs through emit so the idempotent per-emission
 // side-effects (keep-set extension + parent provenance) fire on every reconcile
-// pass; emit is the controller's emitRenderedChildren(id, docs, publish=false)
-// closure. The replay deliberately does NOT re-publish the children: they were
+// pass; emit is the controller's Emit(id, docs, wipeSecrets, publish=false)
+// replay closure. The replay deliberately does NOT re-publish the children: they were
 // already published byte-identically by the render that set this artifact, so
 // re-AddObject-ing them would only re-fire listeners and re-submit already-
 // settled resources — churn that can transiently un-Ready a parent and race
@@ -324,20 +295,6 @@ func (c *Controller) FingerprintDedup(id manifest.NamedResource, fp string, emit
 	return true, nil
 }
 
-// NewWaiter constructs a depwait.Waiter pre-wired with the
-// controller's Store and Existence lookup, parented to id and budgeted
-// from timeout. HR and KS controllers call this rather than constructing
-// their own Waiter literals so the Existence wiring is set once in
-// Configure and flows through automatically.
-func (c *Controller) NewWaiter(id manifest.NamedResource, timeout *metav1.Duration) *depwait.Waiter {
-	return &depwait.Waiter{
-		Store:     c.Store,
-		Parent:    id,
-		Timeout:   depwait.TimeoutFromSpec(timeout),
-		Existence: c.existence,
-	}
-}
-
 // IsFileIndexed reports whether id is tracked by the file-existence
 // index wired at Configure time. Returns false when no index is
 // configured (offline / unit-test paths), which degrades safely by
@@ -346,9 +303,29 @@ func (c *Controller) IsFileIndexed(id manifest.NamedResource) bool {
 	return c.existence != nil && c.existence.IsFileIndexed(id)
 }
 
+// OrderingDeps clones explicit dependsOn refs and prunes only known unchanged
+// targets. Unknown refs MUST remain available for missing-dependency diagnosis.
+func (c *Controller) OrderingDeps(deps []manifest.DependencyRef) []manifest.DependencyRef {
+	deps = slices.Clone(deps)
+	if c.filterActive() {
+		deps = slices.DeleteFunc(deps, func(d manifest.DependencyRef) bool {
+			return !c.filter.ShouldReconcile(d.NamedResource) &&
+				(c.IsFileIndexed(d.NamedResource) || c.Store.GetObject(d.NamedResource) != nil)
+		})
+	}
+	return deps
+}
+
+// SourceSkipped converts a referenced source's soft skip into the caller's skip.
+func (c *Controller) SourceSkipped(id manifest.NamedResource, label string) error {
+	if info, ok := c.Store.GetStatus(id); ok && store.IsSkipped(info) {
+		return fmt.Errorf("%w: %s %s %s", manifest.ErrSourceSkipped, label, id.String(), info.Message)
+	}
+	return nil
+}
+
 // StartLifecycle flips the started gate, freezing reconcile-shaping
-// config. Concrete controllers call this from their Start(ctx) before
-// installing any listeners via AddListener.
+// config. Call before dispatch or installing listeners via AddListener.
 func (c *Controller) StartLifecycle() {
 	c.started.Store(true)
 }
@@ -400,13 +377,13 @@ func (c *Controller) Close() {
 	}
 }
 
-// PreGate is the canonical Suspend/Filter pre-reconcile check.
+// preGate is the canonical Suspend/Filter pre-reconcile check.
 // Returns true when the resource is gated out — caller MUST bail.
 //
 //   - suspended → marks Ready "suspended", returns true
 //   - filter excludes the id → marks Ready "unchanged", returns true
 //   - otherwise → returns false, caller proceeds to Submit/reconcile
-func (c *Controller) PreGate(id manifest.NamedResource, suspended bool) bool {
+func (c *Controller) preGate(id manifest.NamedResource, suspended bool) bool {
 	if suspended {
 		c.Store.UpdateStatus(id, store.StatusReady, store.MsgSuspended)
 		return true
@@ -418,68 +395,44 @@ func (c *Controller) PreGate(id manifest.NamedResource, suspended bool) bool {
 	return false
 }
 
-// filterActive reports whether a non-nil, enabled change filter is
-// configured. Replaces the previous c.filter.Enabled() call that
-// relied on Filter.Enabled being nil-safe — making every future
-// non-pointer-deref method on *Filter latently NPE-prone. Routing
-// every read through this helper means a future method addition on
-// *Filter doesn't crash PreGate.
+// filterActive reports whether a non-nil, enabled change filter is configured.
 func (c *Controller) filterActive() bool {
 	return c.filter != nil && c.filter.Enabled()
-}
-
-type drainLevelKey struct{}
-
-// WithDrainLevel stamps the dag scheduler's current drain level onto ctx so
-// the body's Require calls reach Classify with it. The orchestrator's
-// Dispatcher sets it per-dispatch; absent ⇒ DrainNone (0).
-func WithDrainLevel(ctx context.Context, level int) context.Context {
-	return context.WithValue(ctx, drainLevelKey{}, level)
-}
-
-func drainLevel(ctx context.Context) int {
-	v, _ := ctx.Value(drainLevelKey{}).(int)
-	return v
 }
 
 // Require gates the caller on deps WITHOUT blocking: it classifies each dep
 // and returns one of:
 //   - nil — every dep satisfied; the body proceeds.
-//   - onFail(sum) (a *manifest.DependencyFailedError) — a dep is terminally
+//   - *manifest.DependencyFailedError — a dep is terminally
 //     Failed and none is still blockable; instant cascade, no grace.
 //   - *depwait.ErrBlocked — at least one dep is absent/Pending/ReadyExpr-pending;
 //     the body returns and the scheduler parks the node on those deps.
 //
 // Blocked WINS over failed: if any dep is still producible (ClassBlocked) we
-// park even when another dep already failed, discarding sum — the re-run
-// re-derives the failure on a later pass once nothing is blocked. A
-// failed-omittable ref is handled by the caller's onFail only once it is the
-// sole remaining signal (see resolvePreRenderValuesFrom).
-//
-// pendingMsg is written as an unconditional Pending status when non-empty
-// (nothing when empty) so a dependent observing this node mid-gate sees a
-// non-terminal status while it parks.
+// park even when another dep already failed. The re-run re-derives failure
+// once nothing is blocked, so values omission cannot discard producible refs.
+// Callers own their progress status writes.
 func (c *Controller) Require(
-	ctx context.Context,
+	_ context.Context,
 	id manifest.NamedResource,
-	timeout *metav1.Duration,
 	deps []manifest.DependencyRef,
-	pendingMsg string,
-	onFail func(depwait.Summary) error,
+	level manifest.DrainLevel,
 ) error {
-	if pendingMsg != "" {
-		c.Store.UpdateStatus(id, store.StatusPending, pendingMsg)
+	w := depwait.Waiter{
+		Store: c.Store, Parent: id,
+		Existence: c.existence, AllowMissingCRDs: c.allowMissingCRDs,
 	}
-	level := drainLevel(ctx)
-	w := c.NewWaiter(id, timeout)
 	var blocked []manifest.NamedResource
-	sum := depwait.Summary{Messages: map[manifest.NamedResource]string{}}
+	var failed *manifest.DependencyFailedError
 	for _, dep := range deps {
 		switch cl := w.Classify(dep, level); cl.Kind {
 		case depwait.ClassReady:
 		case depwait.ClassFailed:
-			sum.Failed = append(sum.Failed, dep.NamedResource)
-			sum.Messages[dep.NamedResource] = cl.Message
+			if failed == nil {
+				failed = &manifest.DependencyFailedError{Parent: id, Reasons: make(map[manifest.NamedResource]string)}
+			}
+			failed.Failed = append(failed.Failed, dep.NamedResource)
+			failed.Reasons[dep.NamedResource] = cl.Message
 		case depwait.ClassBlocked:
 			blocked = append(blocked, dep.NamedResource)
 		}
@@ -487,8 +440,9 @@ func (c *Controller) Require(
 	if len(blocked) > 0 {
 		return &depwait.ErrBlocked{Deps: blocked}
 	}
-	if sum.AnyFailed() {
-		return onFail(sum)
+	if failed != nil {
+		slices.SortFunc(failed.Failed, manifest.NamedResource.Compare)
+		return failed
 	}
 	return nil
 }
@@ -504,12 +458,10 @@ func (c *Controller) Require(
 func (c *Controller) RequireRefresh[T manifest.BaseManifest](
 	ctx context.Context,
 	id manifest.NamedResource,
-	timeout *metav1.Duration,
 	deps []manifest.DependencyRef,
-	pendingMsg string,
-	onFail func(depwait.Summary) error,
+	level manifest.DrainLevel,
 ) (T, bool, error) {
-	if err := c.Require(ctx, id, timeout, deps, pendingMsg, onFail); err != nil {
+	if err := c.Require(ctx, id, deps, level); err != nil {
 		var zero T
 		return zero, false, err
 	}
@@ -517,25 +469,7 @@ func (c *Controller) RequireRefresh[T manifest.BaseManifest](
 	return obj, ok, nil
 }
 
-// DepFailed returns the canonical onFail closure that reports a
-// dependency-wait failure as a *manifest.DependencyFailedError for id.
-// The identical literal was rebuilt at every dependsOn/pre-render wait;
-// single-sourcing it keeps the failure shape consistent across controllers.
-func DepFailed(id manifest.NamedResource) func(depwait.Summary) error {
-	return func(sum depwait.Summary) error {
-		// Sort the failed-dep list so the rendered DependencyFailedError message
-		// lists dependencies in a canonical order — independent of dependsOn
-		// declaration order, and deterministic across runs.
-		slices.SortFunc(sum.Failed, func(a, b manifest.NamedResource) int { return a.Compare(b) })
-		return &manifest.DependencyFailedError{
-			Parent:  id,
-			Failed:  sum.Failed,
-			Reasons: sum.Messages,
-		}
-	}
-}
-
-// Recover catches a panic from the current goroutine and marks id
+// recoverPanic catches a panic from the current goroutine and marks id
 // StatusFailed with a "panic: <r>" message so the orchestrator
 // surfaces it. log is the controller's pre-bound logger (Logger()); the
 // panic is recorded under its controller=<name> attribute.
@@ -545,7 +479,7 @@ func DepFailed(id manifest.NamedResource) func(depwait.Summary) error {
 // reconcile MUST count against the orchestrator's failure gate, not
 // silently masquerade as success when Service.Failures() is consulted
 // for the final exit-code decision.
-func Recover(s *store.Store, id manifest.NamedResource, log *slog.Logger) {
+func recoverPanic(s *store.Store, id manifest.NamedResource, log *slog.Logger) {
 	r := recover()
 	if r == nil {
 		return
@@ -555,38 +489,11 @@ func Recover(s *store.Store, id manifest.NamedResource, log *slog.Logger) {
 	panic(r)
 }
 
-// RunWithStatus is the standard reconcile body for controllers that
-// (a) coalesce concurrent submits per-id and (b) want the recover →
-// re-read → run → mark-Ready/Failed pattern. The re-read lets a
-// coalesced re-run pick up patches a parent KS installed mid-flight
-// rather than the stale payload from the original event. A missing
-// object (deleted between coalescer enqueue and run) is treated as a
-// no-op rather than a failure.
-//
-// On success the terminal status write is conditional: if the
-// current status already carries an informative Ready message (a
-// soft-skip from --allow-missing-secrets, an MsgUnchanged from the
-// change filter, an MsgSuspended from PreGate), the empty-message
-// overwrite is suppressed so the informative message survives a
-// short-circuited coalesced re-run that returns nil. Plain Ready
-// (no message) and any non-Ready status get the standard "" Ready
-// write so the controller's terminal contract is preserved.
-func RunWithStatus[T manifest.BaseManifest](
-	ctx context.Context,
-	s *store.Store,
-	id manifest.NamedResource,
-	log *slog.Logger,
-	fn func(context.Context, T) error,
-) {
-	_ = RunWithStatusOutcome[T](ctx, s, id, log, fn)
-}
-
-// RunWithStatusOutcome is RunWithStatus that additionally reports the dag
-// scheduler's outcome: the blocked dependency set, or nil when the body
-// terminalized (Ready / Skipped / Failed). It intercepts a *depwait.ErrBlocked
-// returned by the body BEFORE the generic Failed-status write, leaving the
-// Pending status the body's Require wrote — so a blocked node stays non-Ready
-// and re-runnable.
+// RunWithStatusOutcome re-reads the stored object, runs its reconcile body,
+// and records a terminal status under panic recovery. Informative Ready
+// messages and externally recorded failures MUST survive a no-op reconcile.
+// A missing object is skipped. A blocked dependency set is returned without
+// marking Failed so the scheduler can park and re-run the node.
 func RunWithStatusOutcome[T manifest.BaseManifest](
 	ctx context.Context,
 	s *store.Store,
@@ -594,7 +501,7 @@ func RunWithStatusOutcome[T manifest.BaseManifest](
 	log *slog.Logger,
 	fn func(context.Context, T) error,
 ) []manifest.NamedResource {
-	defer Recover(s, id, log)
+	defer recoverPanic(s, id, log)
 	obj, ok := s.Get[T](id)
 	if !ok {
 		// Object deleted (or wrong type) between discovery/enqueue and run.
@@ -602,13 +509,13 @@ func RunWithStatusOutcome[T manifest.BaseManifest](
 		// the testrunner reports cleanly — a vanished resource is the same
 		// outcome real Flux sees when the CR is deleted.
 		if info, has := s.GetStatus(id); has && info.Status != store.StatusReady {
-			s.UpdateStatus(id, store.StatusReady, "skipped: object not in store at reconcile time")
+			s.UpdateStatus(id, store.StatusReady, store.SkippedPrefix+" object not in store at reconcile time")
 		}
 		return nil
 	}
 	if err := fn(ctx, obj); err != nil {
 		// A dependency gate is unsatisfied. Surface the blocked deps WITHOUT
-		// writing Failed — the node keeps the Pending status Require wrote and
+		// writing Failed — the node keeps the Pending status the body wrote and
 		// stays parkable + re-runnable.
 		if blocked, ok := errors.AsType[*depwait.ErrBlocked](err); ok {
 			return blocked.Deps
@@ -622,16 +529,7 @@ func RunWithStatusOutcome[T manifest.BaseManifest](
 				store.SkippedPrefix+" "+manifest.TrimSentinelPrefix(err.Error()))
 			return nil
 		}
-		// A DependencyFailedError means the body never ran — the Require gate
-		// failed because a dependency failed or was missing. Record the
-		// structured blockers so the failure report can group this derived
-		// failure under its root cause instead of reprinting the nested chain.
-		// Any other error is a primary failure (its own render/template/build)
-		// and leaves the blocked set empty.
-		if depErr, ok := errors.AsType[*manifest.DependencyFailedError](err); ok {
-			s.SetBlocked(id, depErr.Failed)
-		}
-		s.UpdateStatus(id, store.StatusFailed, err.Error())
+		s.UpdateFailure(id, err)
 		return nil
 	}
 	if existing, ok := s.GetStatus(id); ok {
@@ -648,30 +546,41 @@ func RunWithStatusOutcome[T manifest.BaseManifest](
 	return nil
 }
 
+// Dispatch bundles a controller's suspension check and typed reconcile body.
+type Dispatch[T manifest.BaseManifest] struct {
+	Suspended func(T) bool
+	Reconcile func(context.Context, T, manifest.DrainLevel) error
+}
+
 // DispatchNode runs id's reconcile body under the dag engine and reports the
-// blocked dependency set (nil = terminalized). It performs the PreGate /
-// preflight pre-checks, then RunWithStatusOutcome. drainLevel threads the
-// scheduler's fixpoint level into Require via ctx. The orchestrator's Dispatcher
+// blocked dependency set (nil = terminalized). It performs the preGate /
+// preflight pre-checks, then RunWithStatusOutcome. level threads the
+// scheduler's fixpoint level into Require. The orchestrator's Dispatcher
 // calls this, routing by Kind, so no per-kind match check is needed here.
 func (c *Controller) DispatchNode[T manifest.BaseManifest](
 	ctx context.Context,
 	id manifest.NamedResource,
-	drainLevel int,
-	suspended func(T) bool,
-	reconcile func(context.Context, T) error,
+	level manifest.DrainLevel,
+	dispatch Dispatch[T],
 ) []manifest.NamedResource {
-	ctx = WithDrainLevel(ctx, drainLevel)
+	prior, _ := c.Store.GetStatus(id)
+	reconcile := func(ctx context.Context, obj T) error {
+		return dispatch.Reconcile(ctx, obj, level)
+	}
 	obj, ok := c.Store.Get[T](id)
 	if !ok {
 		// Vanished — RunWithStatusOutcome's vanished branch records a terminal status.
 		return RunWithStatusOutcome[T](ctx, c.Store, id, c.log, reconcile)
 	}
-	if c.PreGate(id, suspended(obj)) {
+	if c.preGate(id, dispatch.Suspended(obj)) {
 		return nil // gated out (suspended/unchanged)
 	}
 	if msg, failed := c.PreflightFailure(id); failed {
 		c.Store.UpdateStatus(id, store.StatusFailed, msg)
 		return nil
+	}
+	if prior.IsDependencyFailure() {
+		c.Store.UpdateStatus(id, store.StatusPending, "")
 	}
 	return RunWithStatusOutcome[T](ctx, c.Store, id, c.log, reconcile)
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,147 @@ import (
 
 func newCM(name, ns string) *manifest.ConfigMap {
 	return &manifest.ConfigMap{Name: name, Namespace: ns}
+}
+
+func TestStore_AddObject_ContentDedup(t *testing.T) {
+	for _, insert := range []struct {
+		name string
+		add  func(*Store, manifest.BaseManifest)
+	}{
+		{"single", (*Store).AddObject},
+		{"batch", func(s *Store, obj manifest.BaseManifest) { s.AddObjects([]manifest.BaseManifest{obj}) }},
+	} {
+		t.Run(insert.name, func(t *testing.T) {
+			for _, distinct := range []bool{false, true} {
+				t.Run(fmt.Sprintf("distinct=%t", distinct), func(t *testing.T) {
+					s := New()
+					obj := &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "app", Namespace: "ns", Spec: map[string]any{"replicas": 1}}
+					seen := 0
+					s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
+						seen++
+						if s.GetObject(id) == nil {
+							t.Error("listener cannot see rendered object")
+						}
+					}, false)
+					insert.add(s, obj)
+					equal := obj
+					if distinct {
+						equal = obj.Clone()
+					}
+					insert.add(s, equal)
+					assert.Equal(t, seen, 1)
+					changed := obj.Clone()
+					changed.Spec["replicas"] = 2
+					insert.add(s, changed)
+					assert.Equal(t, seen, 2)
+					assert.Equal(t, s.GetObject(obj.Named()), manifest.BaseManifest(changed))
+					assert.Equal(t, s.GetObjectByName(obj.Kind, obj.Namespace, obj.Name), manifest.BaseManifest(changed))
+				})
+			}
+		})
+	}
+}
+
+func TestStore_AddObject_ConcurrentDedup(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		newObject func() manifest.BaseManifest
+	}{
+		{"typed", func() manifest.BaseManifest {
+			return &manifest.ConfigMap{Name: "app", Namespace: "ns", Data: map[string]any{"key": "value"}}
+		}},
+		{"raw", func() manifest.BaseManifest {
+			return &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "app", Spec: map[string]any{"replicas": 1}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New()
+			var seen atomic.Int64
+			s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { seen.Add(1) }, false)
+			var wg sync.WaitGroup
+			for range 32 {
+				wg.Go(func() { s.AddObject(tc.newObject()) })
+			}
+			wg.Wait()
+			assert.Equal(t, seen.Load(), int64(1))
+		})
+	}
+}
+
+func TestStore_AddObject_NestedContent(t *testing.T) {
+	cases := []struct {
+		name  string
+		spec  map[string]any
+		equal bool
+	}{
+		{"equal", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "extra": []string{"a"}}, true},
+		{"nested map changed", map[string]any{"items": []any{map[string]any{"value": "changed"}, true, int64(1), 1.5}, "extra": []string{"a"}}, false},
+		{"slice length changed", map[string]any{"items": []any{map[string]any{"value": "same"}}, "extra": []string{"a"}}, false},
+		{"scalar type changed", map[string]any{"items": []any{map[string]any{"value": "same"}, true, 1, 1.5}, "extra": []string{"a"}}, false},
+		{"fallback changed", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "extra": []string{"b"}}, false},
+		{"missing key", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "other": []string{"a"}}, false},
+		{"nil spec", nil, false},
+		{"empty spec", map[string]any{}, false},
+	}
+	base := &manifest.RawObject{APIVersion: "example.test/v1", Kind: "Widget", Name: "app", Spec: cases[0].spec}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New()
+			seen := 0
+			s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { seen++ }, false)
+			s.AddObject(base)
+			clone := *base
+			clone.Spec = tc.spec
+			s.AddObject(&clone)
+			want := 2
+			if tc.equal {
+				want = 1
+			}
+			assert.Equal(t, seen, want)
+		})
+	}
+}
+
+func TestObjectEqual_RawObjectFields(t *testing.T) {
+	rawType := reflect.TypeFor[manifest.RawObject]()
+	fields := make([]string, rawType.NumField())
+	for i := range fields {
+		fields[i] = rawType.Field(i).Name
+	}
+	assert.Diff(t, fields, []string{"Kind", "APIVersion", "Name", "Namespace", "Spec"})
+	base := &manifest.RawObject{
+		Kind: "Widget", APIVersion: "example.test/v1", Name: "app", Namespace: "ns",
+		Spec: map[string]any{"items": []any{map[string]any{"value": "same"}}},
+	}
+	assert.Equal(t, objectEqual(base, base), true)
+	for _, tc := range []struct {
+		name   string
+		change func(*manifest.RawObject)
+		equal  bool
+	}{
+		{name: "equal distinct pointers", equal: true},
+		{name: "kind", change: func(obj *manifest.RawObject) { obj.Kind = "Other" }},
+		{name: "api version", change: func(obj *manifest.RawObject) { obj.APIVersion = "example.test/v2" }},
+		{name: "name", change: func(obj *manifest.RawObject) { obj.Name = "other" }},
+		{name: "namespace", change: func(obj *manifest.RawObject) { obj.Namespace = "other" }},
+		{name: "spec", change: func(obj *manifest.RawObject) { obj.Spec = nil }},
+		{name: "nested spec", change: func(obj *manifest.RawObject) {
+			obj.Spec["items"].([]any)[0].(map[string]any)["value"] = "changed"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := base.Clone()
+			assert.Equal(t, candidate == base, false)
+			if tc.change != nil {
+				tc.change(candidate)
+			}
+			assert.Equal(t, objectEqual(base, candidate), tc.equal)
+			assert.Equal(t, objectEqual(candidate, base), tc.equal)
+		})
+	}
+	assert.Diff(t, base.Spec, map[string]any{"items": []any{map[string]any{"value": "same"}}})
+	// nil and empty maps stay distinct, as under reflect.DeepEqual.
+	assert.Equal(t, objectEqual(&manifest.RawObject{Spec: map[string]any{}}, &manifest.RawObject{}), false)
 }
 
 func TestStore_AddObjectIdempotent(t *testing.T) {
@@ -68,21 +210,25 @@ func TestStore_AddObject_CloneTriggersUpdate(t *testing.T) {
 	}
 }
 
-func TestStore_AddObjectsDispatchesAfterAllWrites(t *testing.T) {
+func TestStore_AddObjects_DispatchesAfterAllWrites(t *testing.T) {
 	s := New()
 	a := newCM("a", "ns")
-	b := newCM("b", "ns")
+	b := &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "b", Namespace: "ns", Spec: map[string]any{"replicas": 1}}
 	idA := a.Named()
 	idB := b.Named()
 
 	var sawBOnA bool
+	var seen int
 	s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
+		seen++
 		if id == idA {
 			sawBOnA = s.GetObject(idB) != nil
 		}
 	}, false)
 
 	s.AddObjects([]manifest.BaseManifest{a, b})
+	s.AddObjects([]manifest.BaseManifest{newCM("a", "ns"), b.Clone()})
+	assert.Equal(t, seen, 2)
 	if !sawBOnA {
 		t.Fatal("listener for first object did not see later batch sibling")
 	}
@@ -434,19 +580,16 @@ func TestStore_Concurrency(_ *testing.T) {
 	const N = 200
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for range N {
 			s.AddObject(newCM("a", "ns"))
 		}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for range N {
 			_ = s.ListObjects("ConfigMap")
 		}
-	}()
+	})
 	wg.Wait()
 }
 
@@ -478,21 +621,18 @@ func TestStore_AddListener_FlushNoDoubleFire(t *testing.T) {
 
 		var startGate, done sync.WaitGroup
 		startGate.Add(1)
-		done.Add(2)
 
-		go func() {
-			defer done.Done()
+		done.Go(func() {
 			startGate.Wait()
 			s.AddObject(racerObj)
-		}()
-		go func() {
-			defer done.Done()
+		})
+		done.Go(func() {
 			startGate.Wait()
 			s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
 				v, _ := counts.LoadOrStore(id, new(atomic.Int64))
 				v.(*atomic.Int64).Add(1)
 			}, true)
-		}()
+		})
 		startGate.Done()
 		done.Wait()
 
@@ -501,22 +641,6 @@ func TestStore_AddListener_FlushNoDoubleFire(t *testing.T) {
 			t.Fatalf("racer fired %d times on iteration; want exactly 1", got)
 		}
 	}
-}
-
-// TestStore_AddRendered_DispatchesListeners pins the listener contract:
-// AddRendered MUST fire EventObjectAdded so callers that listen for
-// kinds promoted via render (e.g. valuesFrom invalidation watching
-// rendered Secret docs) see the event. The original implementation
-// skipped dispatch entirely with a "rendered docs are leaves" comment;
-// adding any new listener for a render-output kind silently broke.
-func TestStore_AddRendered_DispatchesListeners(t *testing.T) {
-	s := New()
-	var seen atomic.Int64
-	s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
-		seen.Add(1)
-	}, false)
-	s.AddRendered(newCM("a", "ns"))
-	assert.Equal(t, seen.Load(), int64(1)) // AddRendered must dispatch
 }
 
 // TestStore_AddListenerNoFlush_NoMissedConcurrentWrites pins that a
@@ -574,49 +698,88 @@ func TestStore_AddListenerNoFlush_NoMissedConcurrentWrites(t *testing.T) {
 	}
 }
 
-// TestStore_ListenerSnapshotPool_NoLostEvents stresses the pooled
-// listener-snapshot path under concurrent fires. With 10 goroutines
-// firing 100 events each against a 50-listener set, every listener
-// must observe every event — losing one means the pool aliasing
-// is wrong (the dispatcher iterated a slice that had already been
-// released and recycled by another fire). Run under -race for the
-// full guarantee.
-func TestStore_ListenerSnapshotPool_NoLostEvents(t *testing.T) {
-	s := New()
-	const (
-		numListeners = 50
-		numFirers    = 10
-		eventsPer    = 100
-	)
-	totalEvents := int64(numFirers * eventsPer)
-	wantPerListener := totalEvents
+func TestStore_ListenerSnapshots(t *testing.T) {
+	t.Run("concurrent delivery", func(t *testing.T) {
+		s := New()
+		const (
+			numListeners = 50
+			numFirers    = 10
+			eventsPer    = 100
+		)
+		totalEvents := int64(numFirers * eventsPer)
+		wantPerListener := totalEvents
 
-	counts := make([]atomic.Int64, numListeners)
-	for i := range numListeners {
-		s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
-			counts[i].Add(1)
-		}, false)
-	}
-
-	var wg sync.WaitGroup
-	for g := range numFirers {
-		wg.Go(func() {
-			for n := range eventsPer {
-				// Distinct names per (goroutine, event) so the
-				// AddObject dedup never short-circuits — each call
-				// must fire EventObjectAdded.
-				name := fmt.Sprintf("g%d-n%d", g, n)
-				s.AddObject(newCM(name, "ns"))
-			}
-		})
-	}
-	wg.Wait()
-
-	for i := range numListeners {
-		if got := counts[i].Load(); got != wantPerListener {
-			t.Errorf("listener[%d] observed %d events, want %d (pool aliasing dropped a fire?)", i, got, wantPerListener)
+		counts := make([]atomic.Int64, numListeners)
+		for i := range numListeners {
+			s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+				counts[i].Add(1)
+			}, false)
 		}
-	}
+
+		var wg sync.WaitGroup
+		for g := range numFirers {
+			wg.Go(func() {
+				for n := range eventsPer {
+					// Distinct names per (goroutine, event) so the
+					// AddObject dedup never short-circuits — each call
+					// must fire EventObjectAdded.
+					name := fmt.Sprintf("g%d-n%d", g, n)
+					s.AddObject(newCM(name, "ns"))
+				}
+			})
+		}
+		wg.Wait()
+
+		for i := range numListeners {
+			if got := counts[i].Load(); got != wantPerListener {
+				t.Errorf("listener[%d] observed %d events, want %d (listener snapshot lost an event?)", i, got, wantPerListener)
+			}
+		}
+	})
+	t.Run("mutation during captured dispatch", func(t *testing.T) {
+		s := New()
+		paused := make(chan struct{})
+		resume := make(chan struct{})
+		var seen []int
+		var first, fifth Unsubscribe
+		first = s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			close(paused)
+			<-resume
+			seen = append(seen, 1)
+			first()
+			fifth = s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+				seen = append(seen, 5)
+			}, false)
+		}, false)
+		second := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 2)
+		}, false)
+		third := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 3)
+		}, false)
+
+		var wg sync.WaitGroup
+		wg.Go(func() { s.AddObject(newCM("captured", "ns")) })
+		<-paused
+		second()
+		second()
+		fourth := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 4)
+		}, false)
+		close(resume)
+		wg.Wait()
+		assert.Diff(t, seen, []int{1, 2, 3})
+
+		seen = nil
+		s.AddObject(newCM("future", "ns"))
+		assert.Diff(t, seen, []int{3, 4, 5})
+		third()
+		fourth()
+		fifth()
+		seen = nil
+		s.AddObject(newCM("empty", "ns"))
+		assert.Equal(t, len(seen), 0)
+	})
 }
 
 // TestStore_SetConditionLocked_StableSliceLength asserts the in-place

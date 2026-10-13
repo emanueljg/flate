@@ -8,6 +8,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,29 @@ func TestE2E_BuildHR(t *testing.T) {
 	}
 }
 
+func TestE2E_MalformedChartCRD(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		skip string
+	}{
+		{"omitted", "true"},
+		{"included", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := copyTree(t, testdataPath(t, "simple"))
+			testutil.WriteFile(t, dir, "charts/mychart/crds/bad.yaml", "apiVersion: [\n")
+			out, code := runCLIExpectErr(t, "build", "all", "--path", dir,
+				"--skip-crds="+tc.skip, "--concurrency", "2", "--no-progress", "--cache-dir", t.TempDir())
+			if code != 1 {
+				t.Fatalf("got exit %d, want 1:\n%s", code, out)
+			}
+			if !strings.Contains(out, "did not find expected node content") {
+				t.Errorf("missing malformed CRD parser error:\n%s", out)
+			}
+		})
+	}
+}
+
 // build hr emits identical bytes on repeated runs against the same
 // tree. Pins the per-artifact sort that's needed because some Helm
 // charts use `range $name, $v := .Values.*` which iterates Go maps
@@ -218,6 +242,49 @@ func TestE2E_DiffNoChange(t *testing.T) {
 	if strings.Contains(out, "---") && strings.Contains(out, "+++") &&
 		strings.Contains(out, "@@") {
 		t.Errorf("unexpected diff content for identical paths:\n%s", out)
+	}
+}
+
+func TestE2E_Diff_OwnershipCycle(t *testing.T) {
+	orig, current := t.TempDir(), t.TempDir()
+	for _, side := range []struct {
+		path  string
+		value string
+	}{
+		{path: orig, value: "before"},
+		{path: current, value: "after"},
+	} {
+		testutil.WriteFile(t, side.path, "flux/source.yaml", `apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata: {name: flux-system, namespace: flux-system}
+spec: {url: https://example.test/cluster.git}
+`)
+		for _, name := range []string{"a", "b"} {
+			testutil.WriteFile(t, side.path, "shared/"+name+".yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: `+name+`, namespace: flux-system}
+spec:
+  interval: 10m
+  path: ./shared
+  sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
+`)
+		}
+		testutil.WriteFile(t, side.path, "shared/kustomization.yaml", "resources: [a.yaml, b.yaml, cm.yaml]\n")
+		testutil.WriteFile(t, side.path, "shared/cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: hello, namespace: apps}
+data:
+  value: `+side.value+`
+`)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { panic("diff ownership walk did not complete") })
+	defer stop()
+	out, stderr := requireCLIOK(t, "diff", "all", "--path", current, "--path-orig", orig,
+		"--concurrency", "2", "--cache-dir", t.TempDir(), "--no-progress", "-o", "diff")
+	if !strings.Contains(out, "-  value: before") || !strings.Contains(out, "+  value: after") {
+		t.Errorf("expected ConfigMap value change:\n%s\nstderr:\n%s", out, stderr)
 	}
 }
 
@@ -301,7 +368,6 @@ kind: GitRepository
 metadata: {name: cluster, namespace: flux-system}
 spec:
   url: ssh://git@github.com/example/cluster.git
-  ref: {branch: main}
   secretRef: {name: deploy-key}
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
@@ -472,6 +538,63 @@ spec:
 	}
 	if !strings.Contains(out, "skipped") {
 		t.Errorf("the external-sourced sync KS (and its source) should skip:\n%s", out)
+	}
+}
+
+func TestE2E_OrphanParentSource(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		external bool
+	}{
+		{name: "local parent"},
+		{name: "deeper external parent", external: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			testutil.WriteFile(t, dir, "kubernetes/flux/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: local-apps, namespace: flux-system}
+spec:
+  path: ./kubernetes/apps
+  sourceRef: {kind: GitRepository, name: flux-system}
+`)
+			resources := "resources: [configmap.yaml]\n"
+			if tc.external {
+				resources = "resources: [configmap.yaml, external.yaml]\n"
+				testutil.WriteFile(t, dir, "kubernetes/apps/external.yaml", `apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata: {name: external, namespace: flux-system}
+spec:
+  url: https://fixture.invalid/external
+  secretRef: {name: missing-auth}
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: external-parent, namespace: flux-system}
+spec:
+  path: ./kubernetes/apps/orphan
+  sourceRef: {kind: GitRepository, name: external}
+`)
+			}
+			testutil.WriteFile(t, dir, "kubernetes/apps/kustomization.yaml", resources)
+			testutil.WriteFile(t, dir, "kubernetes/apps/configmap.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: healthy-output}
+data: {value: rendered}
+`)
+			testutil.WriteFile(t, dir, "kubernetes/apps/orphan/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: orphan, namespace: flux-system}
+spec:
+  path: ./missing
+  sourceRef: {kind: GitRepository, name: flux-system}
+`)
+			stdout, stderr, code := runCLIBuffers("build", "all", "--path", dir,
+				"--allow-missing-secrets", "--no-progress", "--concurrency", "2", "--cache-dir", t.TempDir())
+			if code != 0 || !strings.Contains(stdout, "name: healthy-output") || strings.Contains(stdout, "name: orphan\n") {
+				t.Fatalf("unreferenced child failed a healthy local build: exit=%d\n%s\n%s", code, stdout, stderr)
+			}
+		})
 	}
 }
 
@@ -862,41 +985,206 @@ func copyTree(t *testing.T, src string) string {
 	return dst
 }
 
-// TestE2E_MalformedPointerFailsTest covers the narrow --path shape from
-// #971: a Flux Kustomization "pointer" file listed in a kustomization.yaml
-// has a YAML syntax error, and the parent Kustomization that would render
-// the directory (and so trip kustomize's own error) is outside the scan
-// root. `flate test` must still exit non-zero and name the file, instead of
-// dropping the pointer from the roster and reporting green.
-func TestE2E_MalformedPointerFailsTest(t *testing.T) {
-	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "monitoring/kustomization.yaml", `resources:
-  - blackbox-exporter.yaml
-  - other.yaml
-`)
-	testutil.WriteFile(t, dir, "monitoring/blackbox-exporter.yaml", `---
-apiVersion: kustomize.toolkit.fluxcd.io/v1
+func TestE2E_MalformedManifestScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		graph     bool
+		owned     bool
+		shared    bool
+		wide      bool
+		suspended bool
+		changed   bool
+		generated bool
+		external  bool
+	}{
+		{name: "owned graph", graph: true, owned: true},
+		{name: "shared graph", graph: true, owned: true, shared: true},
+		{name: "owned ad-hoc", owned: true},
+		{name: "owned ad-hoc, wide scan", owned: true, wide: true},
+		{name: "suspended owner", owned: true, wide: true, suspended: true},
+		{name: "changed-only, unselected owner", owned: true, wide: true, changed: true},
+		{name: "ResourceSet-generated owner", owned: true, wide: true, generated: true},
+		{name: "suspended generated owner", owned: true, wide: true, generated: true, suspended: true},
+		{name: "external-source owner", owned: true, wide: true, external: true},
+		{name: "unowned graph", graph: true},
+		{name: "unowned ad-hoc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repo := gitInit(t, dir)
+			testutil.WriteFile(t, dir, "monitoring/blackbox-exporter.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata: {name: blackbox-exporter, namespace: flux-system}
 spec:
   path: ./monitoring/blackbox-exporter/app
-  sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
+  sourceRef: {kind: GitRepository, name: flux-system}
 brokenPointer: [ unclosed
 `)
-	testutil.WriteFile(t, dir, "monitoring/other.yaml", `---
+			if tc.graph {
+				testutil.WriteFile(t, dir, "monitoring/kustomization.yaml", "resources:\n  - blackbox-exporter.yaml\n")
+			}
+			testutil.WriteFile(t, dir, "healthy/kustomization.yaml", "resources:\n  - configmap.yaml\n")
+			testutil.WriteFile(t, dir, "healthy/configmap.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: sibling-output}
+data: {value: rendered}
+`)
+			scan := filepath.Join(dir, "monitoring")
+			if tc.owned {
+				scan = filepath.Join(dir, "flux")
+				testutil.WriteFile(t, dir, "flux/kustomization.yaml", "resources:\n  - ks.yaml\n")
+				owner := `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: owner, namespace: flux-system}
+spec:
+  path: ./monitoring
+  sourceRef: {kind: GitRepository, name: flux-system}
+`
+				if tc.suspended {
+					owner = strings.Replace(owner, "path: ./monitoring", "path: ./monitoring\n  suspend: true", 1)
+				}
+				if tc.generated {
+					owner = `apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSet
+metadata: {name: owners, namespace: flux-system}
+spec:
+  resourcesTemplate: |
+    ` + strings.ReplaceAll(strings.TrimSpace(owner), "\n", "\n    ") + "\n"
+				}
+				if tc.external {
+					owner = strings.Replace(owner, "name: flux-system}", "name: external}", 1) + `---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata: {name: external, namespace: flux-system}
+spec: {url: 'https://fixture.invalid/other'}
+`
+				}
+				testutil.WriteFile(t, dir, "flux/ks.yaml", owner+`---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
-metadata: {name: other, namespace: flux-system}
+metadata: {name: sibling, namespace: flux-system}
 spec:
-  path: ./monitoring/other/app
-  sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
+  path: ./healthy
+  sourceRef: {kind: GitRepository, name: flux-system}
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: dependent, namespace: flux-system}
+spec:
+  path: ./healthy
+  dependsOn: [{name: owner}]
+  sourceRef: {kind: GitRepository, name: flux-system}
 `)
-
-	out, code := runCLIExpectErr(t, "test", "all", "--path", filepath.Join(dir, "monitoring"), "--no-progress")
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for a malformed pointer file; got 0:\n%s", out)
+			}
+			if tc.shared {
+				testutil.WriteFile(t, dir, "flux/peer.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: peer, namespace: flux-system}
+spec:
+  path: ./monitoring
+  sourceRef: {kind: GitRepository, name: flux-system}
+`)
+				testutil.WriteFile(t, dir, "flux/kustomization.yaml", "resources: [ks.yaml, peer.yaml]\n")
+			}
+			if tc.wide {
+				scan = dir
+			}
+			args := []string{"build", "all", "--path", scan, "--no-progress", "--concurrency", "2"}
+			if tc.changed {
+				gitCommitAll(t, repo)
+				original := copyTree(t, dir)
+				mutateFile(t, filepath.Join(dir, "healthy/configmap.yaml"), "value: rendered", "value: changed")
+				args = append(args, "--path-orig", original)
+			}
+			if tc.external {
+				args = []string{"diff", "all", "--path", scan, "--path-orig", copyTree(t, dir), "--no-progress", "--concurrency", "2"}
+			}
+			stdout, stderr, code := runCLIBuffers(args...)
+			if tc.external {
+				if code != 0 || stdout != "" || !strings.Contains(stderr, "outside the local tree; not rendered") || strings.Contains(stderr, "decode") {
+					t.Fatalf("external-source owner failed the diff: exit=%d\n%s\n%s", code, stdout, stderr)
+				}
+				return
+			}
+			if tc.suspended || tc.changed {
+				if code != 0 || !strings.Contains(stdout, "sibling-output") || strings.Contains(stderr, "decode") {
+					t.Fatalf("unreconciled owner failed the run: exit=%d\n%s\n%s", code, stdout, stderr)
+				}
+				if tc.changed && (!strings.Contains(stdout, "value: changed") || strings.Contains(stdout, "name: blackbox-exporter")) {
+					t.Fatalf("changed sibling did not render alone:\n%s", stdout)
+				}
+				return
+			}
+			if code != 1 || !strings.Contains(stderr, "blackbox-exporter.yaml") {
+				t.Fatalf("expected exit 1 naming malformed file; got %d:\n%s", code, stderr)
+			}
+			if tc.owned {
+				wantDecodes := 1
+				if tc.shared {
+					wantDecodes++
+				}
+				if got := strings.Count(stderr, "did not find expected"); got != wantDecodes {
+					t.Fatalf("decode error reported %d times:\n%s", got, stderr)
+				}
+				if strings.Contains(stderr, "flate error: loader: decode") {
+					t.Fatalf("owned decode error escaped resource attribution:\n%s", stderr)
+				}
+				if !strings.Contains(stdout, "sibling-output") || !strings.Contains(stderr, "flux-system/owner") || !strings.Contains(stderr, "flux-system/dependent") {
+					t.Fatalf("expected sibling output and scoped owner/dependent failures:\n%s\n%s", stdout, stderr)
+				}
+				if tc.shared && !strings.Contains(stderr, "flux-system/peer") {
+					t.Fatalf("second owner escaped the malformed file failure:\n%s", stderr)
+				}
+				stdout, stderr, code = runCLIBuffers("build", "ks", "sibling", "--path", scan, "--no-progress", "--concurrency", "2")
+				if code != 0 || !strings.Contains(stdout, "sibling-output") {
+					t.Fatalf("healthy named sibling failed: exit=%d\n%s\n%s", code, stdout, stderr)
+				}
+			} else if !strings.Contains(stderr, "decode") {
+				t.Fatalf("unowned malformed file lost decode error:\n%s", stderr)
+			}
+		})
 	}
-	if !strings.Contains(out, "blackbox-exporter.yaml") {
-		t.Errorf("error must name the malformed file; got:\n%s", out)
+}
+
+func TestE2E_BootstrapGeneratorEnvAndFileSubstitution(t *testing.T) {
+	root := t.TempDir()
+	for _, file := range []struct{ path, body string }{
+		{"kustomization.yaml", "namespace: flux-system\nresources: [bootstrap]\n"},
+		{"bootstrap/kustomization.yaml", "resources: [ks.yaml]\ngeneratorOptions: {disableNameSuffixHash: true}\nconfigMapGenerator:\n- name: bootstrap-values\n  envs: [../settings.env]\n  files: [FROM_FILE=../payload.txt]\n  literals: [FROM_LITERAL=literal-value]\n"},
+		{"settings.env", "FROM_ENV=env-value\n"},
+		{"payload.txt", "file-value"},
+		{"bootstrap/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: apps, namespace: flux-system}
+spec:
+  path: ./apps
+  sourceRef: {kind: GitRepository, name: flux-system}
+  postBuild:
+    substituteFrom: [{kind: ConfigMap, name: bootstrap-values}]
+`},
+		{"apps/kustomization.yaml", "resources: [result.yaml]\n"},
+		{"apps/result.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: result}
+data:
+  env: "${FROM_ENV}"
+  file: "${FROM_FILE}"
+  literal: "${FROM_LITERAL}"
+`},
+	} {
+		testutil.WriteFile(t, root, file.path, file.body)
+	}
+	var previous string
+	for _, concurrency := range []string{"2", "8"} {
+		out := runCLIStdout(t, "build", "all", "--path", root, "--concurrency", concurrency, "--no-progress")
+		for _, want := range []string{"env-value", "file-value", "literal-value"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("missing substituted %q in %s", want, out)
+			}
+		}
+		if previous != "" && out != previous {
+			t.Fatal("generator substitution output differs across concurrency levels")
+		}
+		previous = out
 	}
 }

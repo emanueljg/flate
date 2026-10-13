@@ -7,12 +7,15 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/go-git/go-git/v5"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -20,7 +23,6 @@ import (
 	"github.com/home-operations/flate/internal/report"
 	"github.com/home-operations/flate/internal/style"
 	"github.com/home-operations/flate/pkg/baseline"
-	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/discovery"
 	"github.com/home-operations/flate/pkg/helm"
 	"github.com/home-operations/flate/pkg/manifest"
@@ -33,13 +35,9 @@ import (
 type commonFlags struct {
 	path     string
 	pathOrig string
-	// pathOrigRoot / pathOrigSelfURLs are resolved by resolveBaseline for
-	// the --base flow: the materialized baseline tree carries no .git, so
-	// its repo root (the spec.path anchor + change-detect root) and the
-	// live tree's remote URLs (for self-referential aliasing on the
-	// baseline side) are threaded explicitly rather than re-derived from a
-	// .git. Empty for an explicit --path-orig (the CLI defaults the root
-	// via repoRootOf and lets the side read its own .git remotes).
+	// The materialized --base tree carries no .git, so its source root
+	// is threaded explicitly. Snapshots without .git use the live tree's
+	// remote URLs for self-referential aliasing.
 	pathOrigRoot         string
 	pathOrigSelfURLs     []string
 	krmIgnore            string
@@ -47,7 +45,13 @@ type commonFlags struct {
 	namespace            string
 	skipCRDs             bool
 	skipSecrets          bool
+	substituteFrom       []string
+	substitute           []string
+	strictSubstitutions  bool
+	substitutionSources  []orchestrator.SubstitutionSource
+	substitutionValues   map[string]string
 	allowMissingSecrets  bool
+	allowMissingCRDs     bool
 	forceGenericProvider bool
 	restrictEgress       bool
 	skipKinds            []string
@@ -117,11 +121,19 @@ func bindCommon(fs *pflag.FlagSet, f *commonFlags, outputs ...format.Output) {
 		"limit to this namespace (default: every namespace, or just the changed ones when --path-orig is set)")
 	fs.BoolVar(&f.skipCRDs, "skip-crds", true, "exclude CRD objects from rendered output")
 	fs.BoolVar(&f.skipSecrets, "skip-secrets", true, "exclude Secret objects from rendered output")
+	fs.BoolVar(&f.allowMissingCRDs, "allow-missing-crds", false,
+		"accept CRD dependencies absent from the offline inputs because the cluster installs them at runtime")
+	fs.StringArrayVar(&f.substituteFrom, "substitute-from", nil,
+		"ConfigMap/Secret YAML file for postBuild references (repeatable; later identities replace earlier ones)")
+	fs.StringArrayVar(&f.substitute, "substitute", nil,
+		"postBuild KEY=VALUE override (repeatable; applied after references and inline values)")
+	fs.BoolVar(&f.strictSubstitutions, "strict-substitutions", false,
+		"fail postBuild expansion on undefined variables without defaults")
 	fs.BoolVar(&f.allowMissingSecrets, "allow-missing-secrets", false,
-		"soft-skip ALL source auth Secrets and HelmRelease valuesFrom Secret/ConfigMap refs "+
+		"soft-skip sources with absent or wiped auth/cert/proxy Secrets and HelmRelease valuesFrom Secret/ConfigMap refs "+
 			"that only materialize in the live cluster. Usually unnecessary: a missing Secret "+
 			"declared by an in-repo ExternalSecret/SealedSecret (with a static target name) is "+
-			"auto-skipped without this flag. cert/proxy secretRefs still fail loud.")
+			"auto-skipped without this flag. Malformed real material still fails.")
 	fs.BoolVar(&f.forceGenericProvider, "force-generic-provider", false,
 		"route non-generic spec.provider sources (GitRepository/OCIRepository/Bucket) "+
 			"through the generic credential path instead of failing. With a secretRef, "+
@@ -193,24 +205,6 @@ func bindCommon(fs *pflag.FlagSet, f *commonFlags, outputs ...format.Output) {
 		"size of the persistent on-disk kustomize render cache in megabytes (0 disables)")
 }
 
-// skipResourceKinds delegates to helm.Options.SkipResourceKinds so
-// the CLI write paths (build/diff emit) and the orchestrator's
-// in-controller filtering use one canonical union of canonical
-// kinds (CRDs + Secrets when their flags are set) plus any
-// user-supplied `--skip-kinds` entries. KS-rendered docs reach the
-// Store unfiltered (downstream HRs need them for valuesFrom /
-// substituteFrom resolution); HR-rendered docs are pre-filtered
-// inside the controller via helm.TemplateDocs. The CLI applies
-// this union at emit time so the user sees consistent filtering
-// regardless of which controller produced the resource.
-func (c *commonFlags) skipResourceKinds() []string {
-	return helm.Options{
-		SkipCRDs:    c.skipCRDs,
-		SkipSecrets: c.skipSecrets,
-		SkipKinds:   c.skipKinds,
-	}.SkipResourceKinds()
-}
-
 // listFlags holds flags that are only meaningful for list/get commands.
 // Kept separate from commonFlags so commands that don't filter by labels
 // (build/diff/test) don't carry a dead field.
@@ -246,61 +240,31 @@ func bindBase(fs *pflag.FlagSet, f *commonFlags) {
 	fs.StringVar(&f.base, "base", "",
 		"baseline git rev (e.g. main, origin/main, HEAD~3, SHA) — "+
 			"materializes the rev's tree to a tempdir and runs in changed-only mode. "+
+			"A rev the checkout doesn't hold is fetched from its origin remote. "+
 			"On `diff`, omitting --base auto-detects via merge-base with @{u} / origin/HEAD. "+
 			"On `build`/`get`/`test`, omitting --base keeps the default full-tree behavior. "+
 			"Mutually exclusive with --path-orig.")
 }
 
-// scopedNamespaces returns the namespace filter the command should
-// honor. nil ↦ "no filter" (every namespace).
-//
-//   - An explicit --namespace value always wins.
-//   - In --path-orig mode, the namespaces of the resolved keep-set
-//     are used so commands automatically focus on what actually
-//     changed without the user having to set -n.
-//   - Otherwise every namespace is included.
-func (c *commonFlags) scopedNamespaces(filter *change.Filter) map[string]struct{} {
-	if c.namespace != "" {
-		return map[string]struct{}{c.namespace: {}}
+func (c *commonFlags) roots(name string, kinds ...string) []manifest.NamedResource {
+	roots := make([]manifest.NamedResource, len(kinds))
+	for i, kind := range kinds {
+		roots[i] = manifest.NamedResource{Kind: kind, Namespace: c.namespace, Name: name}
 	}
-	if filter.Enabled() {
-		if ns := filter.KeepNamespaces(); len(ns) > 0 {
-			return ns
-		}
-	}
-	return nil
-}
-
-// includeNamespace reports whether ns passes the effective filter.
-// Empty namespace (cluster-scoped resources) is always included.
-func (c *commonFlags) includeNamespace(filter *change.Filter, ns string) bool {
-	if ns == "" {
-		return true
-	}
-	// Explicit --namespace is a single-element scope: compare directly
-	// rather than letting scopedNamespaces allocate a one-entry map per
-	// resource on this in-loop path.
-	if c.namespace != "" {
-		return ns == c.namespace
-	}
-	scope := c.scopedNamespaces(filter)
-	if scope == nil {
-		return true
-	}
-	_, ok := scope[ns]
-	return ok
+	return roots
 }
 
 // helmFlags collect the helm template options. Mirrors flux-local's
 // --kube-version/--api-versions/--no-hooks/etc.
 type helmFlags struct {
-	kubeVersion          string
-	apiVersions          string
-	isUpgrade            bool
-	noHooks              bool
-	showOnly             []string
-	enableDNS            bool
-	skipSchemaValidation bool
+	kubeVersion                string
+	apiVersions                string
+	isUpgrade                  bool
+	noHooks                    bool
+	showOnly                   []string
+	enableDNS                  bool
+	skipSchemaValidation       bool
+	disableChartDigestTracking *bool
 }
 
 func bindHelmFlags(fs *pflag.FlagSet, h *helmFlags) {
@@ -317,6 +281,16 @@ func bindHelmFlags(fs *pflag.FlagSet, h *helmFlags) {
 	fs.BoolVar(&h.enableDNS, "enable-dns", false, "enable DNS lookups during helm template")
 	fs.BoolVar(&h.skipSchemaValidation, "skip-schema-validation", false,
 		"skip helm values.schema.json validation (dominates allocation churn on big repos)")
+	fs.BoolFunc("disable-chart-digest-tracking",
+		"preserve original OCI chart versions (absent: auto-detect; =false: force digest tracking)",
+		func(text string) error {
+			disabled, err := strconv.ParseBool(text)
+			if err != nil {
+				return err
+			}
+			h.disableChartDigestTracking = &disabled
+			return nil
+		})
 }
 
 func (c commonFlags) helmOptions(h helmFlags) helm.Options {
@@ -360,13 +334,37 @@ func (c commonFlags) helmOptions(h helmFlags) helm.Options {
 //
 // Callers receive a no-op when no materialization happened (no
 // --base / no autoFallback / explicit --path-orig).
-func resolveBaseline(c *commonFlags, autoFallback bool) (func(), error) {
+func resolveBaseline(ctx context.Context, c *commonFlags, autoFallback bool) (func(), error) {
 	noop := func() {}
 	if c.pathOrig != "" && c.base != "" {
 		return noop, errors.New("--path-orig and --base are mutually exclusive")
 	}
 	if c.pathOrig != "" {
-		// Explicit --path-orig — caller already specified the baseline.
+		c.pathOrigSelfURLs = nil
+		root, side := c.baselineRoot(), "baseline tree"
+		if _, err := os.Stat(filepath.Join(root, ".git")); errors.Is(err, os.ErrNotExist) {
+			// Snapshots without git metadata inherit the current source identity.
+			root, side = repoRootOf(c.path), "working tree"
+		} else if err != nil {
+			return noop, fmt.Errorf("baseline: stat baseline tree git metadata: %w", err)
+		}
+		repo, err := git.PlainOpenWithOptions(root, &git.PlainOpenOptions{
+			EnableDotGitCommonDir: true,
+		})
+		if side == "working tree" && errors.Is(err, git.ErrRepositoryNotExists) {
+			return noop, nil
+		}
+		if err != nil {
+			return noop, fmt.Errorf("baseline: open %s: %w", side, err)
+		}
+		cfg, err := repo.Config()
+		if err != nil {
+			return noop, fmt.Errorf("baseline: read %s git config: %w", side, err)
+		}
+		for _, remote := range cfg.Remotes {
+			c.pathOrigSelfURLs = append(c.pathOrigSelfURLs, remote.URLs...)
+		}
+		slices.Sort(c.pathOrigSelfURLs)
 		return noop, nil
 	}
 	if c.base == "" && !autoFallback {
@@ -375,7 +373,7 @@ func resolveBaseline(c *commonFlags, autoFallback bool) (func(), error) {
 		// default).
 		return noop, nil
 	}
-	res, err := baseline.AutoResolve(c.path, c.base, cacheroot.New(c.resolveCacheRoot()))
+	res, err := baseline.AutoResolve(ctx, c.path, c.base, cacheroot.New(c.resolveCacheRoot()))
 	if err != nil {
 		return noop, err
 	}
@@ -427,12 +425,13 @@ func buildOrchCfg(c commonFlags, h helmFlags) orchestrator.Config {
 		// (change.Detect diffs root-to-root): the materialized --base tree
 		// root, or the .git default of an explicit --path-orig. Replaces
 		// the core's old .git "widen" heuristic.
-		PathOrig:       c.baselineRoot(),
-		KRMIgnoreFile:  c.krmIgnore,
-		HelmOptions:    c.helmOptions(h),
-		WipeSecrets:    true,
-		RegistryConfig: c.registryConfig,
-		Concurrency:    c.concurrency,
+		PathOrig:                   c.baselineRoot(),
+		KRMIgnoreFile:              c.krmIgnore,
+		HelmOptions:                c.helmOptions(h),
+		DisableChartDigestTracking: h.disableChartDigestTracking,
+		WipeSecrets:                true,
+		RegistryConfig:             c.registryConfig,
+		Concurrency:                c.concurrency,
 		SourceRetry: source.RetryConfig{
 			Attempts: c.sourceRetryAttempts,
 			MinWait:  c.sourceRetryMinWait,
@@ -440,7 +439,11 @@ func buildOrchCfg(c commonFlags, h helmFlags) orchestrator.Config {
 			Jitter:   c.sourceRetryJitter,
 		},
 		GitDepth:                  c.gitDepth,
+		SubstituteFrom:            c.substitutionSources,
+		Substitute:                c.substitutionValues,
+		StrictSubstitutions:       c.strictSubstitutions,
 		AllowMissingSecrets:       c.allowMissingSecrets,
+		AllowMissingCRDs:          c.allowMissingCRDs,
 		ForceGenericProvider:      c.forceGenericProvider,
 		RestrictEgress:            c.restrictEgress,
 		CacheDir:                  c.resolveCacheRoot(),
@@ -464,7 +467,7 @@ func (c *commonFlags) resolveCacheRoot() string {
 	return resolveCacheRoot(&c.cacheDir)
 }
 
-func runOrchestrator(ctx context.Context, c commonFlags, h helmFlags, pre ...func(*orchestrator.Orchestrator) store.Unsubscribe) (*orchestrator.Orchestrator, *orchestrator.Result, error) {
+func runOrchestrator(ctx context.Context, c commonFlags, h helmFlags) (*orchestrator.Orchestrator, *orchestrator.Result, error) {
 	if c.path == "" {
 		return nil, nil, errors.New("path is required")
 	}
@@ -479,12 +482,15 @@ func runOrchestrator(ctx context.Context, c commonFlags, h helmFlags, pre ...fun
 	// Cleanup is deferred (not bound to ctx) so the tempdir survives
 	// SIGINT until the orchestrator's read paths have actually
 	// unwound.
-	cleanup, err := resolveBaseline(&c, false)
+	if err := c.loadSubstitutions(ctx); err != nil {
+		return nil, nil, err
+	}
+	cleanup, err := resolveBaseline(ctx, &c, false)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer cleanup()
-	return runOrchestratorCfg(ctx, buildOrchCfg(c, h), pre...)
+	return runOrchestratorCfg(ctx, buildOrchCfg(c, h))
 }
 
 // validatePathFlag rejects a flag value that doesn't point at a real
@@ -574,11 +580,7 @@ func (p *profileValue) Set(v string) error {
 // resource failures: the partial output is still usable. A nil
 // orchestrator indicates a fatal init/bootstrap error and callers
 // should bail.
-// pre hooks (optional, variadic so existing call sites are unchanged) run
-// after New and before Render — the seam for attaching store listeners that
-// must observe the run live (the --stream emitter). Each returns its
-// unsubscribe, released once Render finishes.
-func runOrchestratorCfg(ctx context.Context, cfg orchestrator.Config, pre ...func(*orchestrator.Orchestrator) store.Unsubscribe) (*orchestrator.Orchestrator, *orchestrator.Result, error) {
+func runOrchestratorCfg(ctx context.Context, cfg orchestrator.Config) (*orchestrator.Orchestrator, *orchestrator.Result, error) {
 	o, err := orchestrator.New(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -611,8 +613,8 @@ func runOrchestratorCfg(ctx context.Context, cfg orchestrator.Config, pre ...fun
 		// above the frame via barSink, while dependency fd chatter stays off the
 		// clean bar unless --log-level debug asks for it.
 		restoreStderr := captureStderr(func(line string) { slog.Debug(line) })
-		unsub := o.Store().OnStatus(func(id manifest.NamedResource, info store.StatusInfo) {
-			p.Send(statusMsg{id: id, info: info})
+		unsub := o.Store().AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
+			p.Send(statusMsg{id: id, info: payload.(store.StatusInfo)})
 		}, false)
 		defer func() {
 			unsub()
@@ -622,95 +624,14 @@ func runOrchestratorCfg(ctx context.Context, cfg orchestrator.Config, pre ...fun
 			barSink.setProgram(nil)
 		}()
 	}
-	for _, hook := range pre {
-		defer hook(o)()
-	}
 	res, err := o.Render(ctx)
-	// Render nils the result only when Bootstrap fails (Run-time
-	// per-resource failures still produce a non-nil Result). Drop
-	// the partial orchestrator in that case: every CLI verb gates
-	// on `o == nil` to surface the underlying error, but without
-	// this nil-out the verb would proceed to read a Store that's
-	// partially populated by the discovery pre-Bootstrap walk and
-	// produce confusing output — e.g. `flate test all` reporting
-	// every loaded resource as "FAILED (no status reported)"
-	// instead of surfacing the actual Bootstrap error (an
-	// unimplemented ResourceSet inputStrategy, a YAML schema
-	// rejection, etc.). Issue surfaced by tholinka/home-ops where
-	// a Permute ResourceSet drowned the real "not yet implemented"
-	// message under 247 phantom failures.
+	// A Bootstrap failure has no Result. Callers must receive a nil
+	// orchestrator so they surface the error instead of reading a
+	// partially populated Store.
 	if res == nil {
 		return nil, nil, err
 	}
 	return o, res, err
-}
-
-func scopedRunError(o *orchestrator.Orchestrator, res *orchestrator.Result, c *commonFlags, runErr error) error {
-	if runErr == nil {
-		return nil
-	}
-	if o == nil || res == nil {
-		return runErr
-	}
-	extras := nonResourceRunErrors(runErr)
-	failed, blocked := scopedFailures(o, res, c)
-	if len(failed) == 0 {
-		return errors.Join(extras...)
-	}
-	return errors.Join(aggregateScopedFailures(failed, blocked), errors.Join(extras...))
-}
-
-// scopedFailures projects res.Failed (and the matching res.Blocked subset) onto
-// c's namespace scope. Single-sourced so the machine-error builder
-// (aggregateScopedFailures) and the rendered report (reportFailures) can't drift
-// on what counts as in scope. Returns empty (non-nil) maps when there is no
-// orchestrator/result or nothing in scope.
-func scopedFailures(o *orchestrator.Orchestrator, res *orchestrator.Result, c *commonFlags) (
-	map[manifest.NamedResource]store.StatusInfo,
-	map[manifest.NamedResource][]manifest.NamedResource,
-) {
-	failed := map[manifest.NamedResource]store.StatusInfo{}
-	blocked := map[manifest.NamedResource][]manifest.NamedResource{}
-	if o == nil || res == nil {
-		return failed, blocked
-	}
-	for id, info := range res.Failed {
-		if c != nil && !c.includeNamespace(o.Filter(), id.Namespace) {
-			continue
-		}
-		failed[id] = info
-		if b := res.Blocked[id]; len(b) > 0 {
-			blocked[id] = b
-		}
-	}
-	return failed, blocked
-}
-
-// scopedWarnings projects Result.Warnings onto c's namespace filter: a
-// resource-attributed advisory is kept only when its namespace is in scope;
-// render-global advisories (zero Resource) always pass. Mirrors scopedFailures
-// so the footer's warnings section honors --namespace like the failure list.
-func scopedWarnings(o *orchestrator.Orchestrator, res *orchestrator.Result, c *commonFlags) []manifest.Warning {
-	if o == nil || res == nil || len(res.Warnings) == 0 {
-		return nil
-	}
-	out := make([]manifest.Warning, 0, len(res.Warnings))
-	for _, w := range res.Warnings {
-		if w.Resource != (manifest.NamedResource{}) && c != nil &&
-			!c.includeNamespace(o.Filter(), w.Resource.Namespace) {
-			continue
-		}
-		out = append(out, w)
-	}
-	return out
-}
-
-// emitResult joins an emit-time error with the scoped run error so a
-// partial render still surfaces both the IO/format failure and any
-// per-resource reconcile failures. A nil emitErr collapses to just the run
-// error (and both nil to nil) via errors.Join's nil handling.
-func emitResult(emitErr error, o *orchestrator.Orchestrator, res *orchestrator.Result, c *commonFlags, runErr error) error {
-	return errors.Join(emitErr, scopedRunError(o, res, c, runErr))
 }
 
 // logBuffer is the process-wide deferred-log sink installed by setLogLevel; the
@@ -734,86 +655,26 @@ type reportedError struct{ err error }
 func (e reportedError) Error() string { return e.err.Error() }
 func (e reportedError) Unwrap() error { return e.err }
 
-// reportFailures renders the styled root-cause report — real errors shown once,
-// cascaded failures folded under the root that caused them — to w, scoped to c's
-// namespace filter. Advisories (warnings) and deferred operational logs (notes)
-// are deliberately NOT rendered here: they belong to `flate test`, the
-// diagnostic command. A data-producing `flate build` stays quiet but for the
-// failure report it must surface — CI relies on the non-zero exit and the cause.
-// When something rendered and err is non-nil, err is wrapped as reportedError so
-// the caller still exits non-zero while run avoids printing it twice; otherwise
-// err passes through.
-func reportFailures(w io.Writer, o *orchestrator.Orchestrator, res *orchestrator.Result, c *commonFlags, err error, elapsed time.Duration) error {
-	failed, blocked := scopedFailures(o, res, c)
-	m := report.Build(failed, blocked, nil, nil)
+type reportErrors struct {
+	selected  error
+	remainder error
+}
+
+// reportFailures preserves the command's named error-write policy.
+func reportFailures(w io.Writer, m report.Model, named bool, errs reportErrors) error {
 	if m.Empty() {
-		return err
+		return errs.selected
 	}
-	_ = m.Write(w, style.ColorEnabled(w), elapsed)
-	if err == nil {
+	if writeErr := m.Write(w, style.ColorEnabled(w)); writeErr != nil && named {
+		return errors.Join(writeErr, errs.selected)
+	}
+	if writeErr := report.WriteErrors(w, errs.remainder); writeErr != nil {
+		return errors.Join(writeErr, errs.selected)
+	}
+	if errs.selected == nil {
 		return nil
 	}
-	return reportedError{err}
-}
-
-// aggregateScopedFailures is the machine error value for a scoped failure set.
-// It enumerates the PRIMARY failures (root causes) one per line and tallies the
-// derived ones as "(+N blocked …)" rather than listing every cascade victim, so
-// the plain error a verb returns — printed by run() for get/diff, carried for
-// errors.Is / the non-zero exit on every verb — stays a concise root-cause
-// summary. build/test additionally render the styled report (see
-// reportFailures). Typed as *orchestrator.FailuresError so scopedRunError can
-// recognize and re-scope an aggregate that arrives as the run error.
-func aggregateScopedFailures(
-	failed map[manifest.NamedResource]store.StatusInfo,
-	blocked map[manifest.NamedResource][]manifest.NamedResource,
-) error {
-	msgs := make([]string, 0, len(failed))
-	nBlocked := 0
-	for id, info := range failed {
-		if len(blocked[id]) > 0 {
-			nBlocked++
-			continue
-		}
-		msgs = append(msgs, fmt.Sprintf("%s: %s", id, info.Message))
-	}
-	slices.Sort(msgs)
-	msg := fmt.Sprintf("reconcile completed with %d failure(s)", len(msgs))
-	if len(msgs) > 0 {
-		msg += ":\n  " + strings.Join(msgs, "\n  ")
-	}
-	if nBlocked > 0 {
-		msg += fmt.Sprintf("\n  (+%d blocked by failed/missing dependencies)", nBlocked)
-	}
-	return &orchestrator.FailuresError{Message: msg}
-}
-
-func nonResourceRunErrors(err error) []error {
-	var out []error
-	for _, leaf := range flattenErrors(err) {
-		if _, ok := errors.AsType[*orchestrator.FailuresError](leaf); ok {
-			continue // re-scoped + re-rendered from res.Failed, not carried verbatim
-		}
-		out = append(out, leaf)
-	}
-	return out
-}
-
-func flattenErrors(err error) []error {
-	if err == nil {
-		return nil
-	}
-	if uw, ok := err.(interface{ Unwrap() []error }); ok {
-		var out []error
-		for _, child := range uw.Unwrap() {
-			out = append(out, flattenErrors(child)...)
-		}
-		return out
-	}
-	if uw, ok := err.(interface{ Unwrap() error }); ok {
-		return flattenErrors(uw.Unwrap())
-	}
-	return []error{err}
+	return reportedError{errs.selected}
 }
 
 func cmdContext(cmd *cobra.Command) context.Context {

@@ -16,6 +16,16 @@ import (
 	"github.com/home-operations/flate/pkg/store"
 )
 
+func BenchmarkOCIChartVersion_DirectReference(b *testing.B) {
+	const revision = "6.15.0@sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8"
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ociChartVersion("6.15.0", revision); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkTemplate_AppTemplateChart measures helm.Template against
 // the testdata/simple/charts/mychart chart referenced in the plan.
 // Each b.Loop iteration runs one Template — the same shape every HR
@@ -94,6 +104,50 @@ func BenchmarkTemplate_AppTemplateChartUncached(b *testing.B) {
 		}
 		if !strings.Contains(out, "demo-cm") {
 			b.Fatalf("missing rendered name")
+		}
+	}
+}
+
+func BenchmarkTemplate_CRDsValidation(b *testing.B) {
+	const crd = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  names:
+    kind: Widget
+    plural: widgets
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+`
+	for _, count := range []int{1, 10} {
+		for _, policy := range []string{"Create", "Skip"} {
+			b.Run(fmt.Sprintf("%d/%s", count, policy), func(b *testing.B) {
+				dir := stageBenchChartDir(b)
+				for i := range count {
+					testutil.WriteFile(b, dir, fmt.Sprintf("mychart/crds/%d.yaml", i), crd)
+				}
+				cli, err := NewClientWithOptions(cacheroot.New(b.TempDir()), ClientOptions{TemplateCacheBytes: 0})
+				if err != nil {
+					b.Fatal(err)
+				}
+				cli.SetSourceResolver(benchLocalChartResolver(b, "chart-repo", "flux-system", dir))
+				hr := newHR()
+				hr.CRDsPolicy = policy
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, err := cli.Template(b.Context(), hr, nil, Options{SkipCRDs: true}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
 	}
 }

@@ -28,14 +28,12 @@ func parseOCIRef(versioned string) (string, error) {
 	versioned = strings.TrimPrefix(versioned, "oci://")
 	// Strip ":<tag>" or "@<digest>" portion for the reference; oras
 	// takes them separately.
-	if i := strings.LastIndex(versioned, "@"); i > 0 {
-		versioned = versioned[:i]
+	if before, _, found := strings.CutLast(versioned, "@"); found && before != "" {
+		versioned = before
 	}
-	if i := strings.LastIndex(versioned, ":"); i > 0 {
-		// Don't confuse port numbers with tags ("registry:5000/x").
-		if !strings.Contains(versioned[i+1:], "/") {
-			versioned = versioned[:i]
-		}
+	// Don't confuse port numbers with tags ("registry:5000/x").
+	if before, after, found := strings.CutLast(versioned, ":"); found && before != "" && !strings.Contains(after, "/") {
+		versioned = before
 	}
 	if _, err := url.Parse("oci://" + versioned); err != nil {
 		return "", fmt.Errorf("parse OCI ref %q: %w", versioned, err)
@@ -104,19 +102,6 @@ func resolveOCISemver(ctx context.Context, repoClient *remote.Repository, expr, 
 		return "", fmt.Errorf("list tags: %w", err)
 	}
 	return pickSemverTag(collected, expr, filterPattern, mediaType)
-}
-
-// resolveOCIRefDigest returns the concrete digest for a ref: the explicit
-// digest when set, otherwise the registry's resolution of tag.
-func resolveOCIRefDigest(ctx context.Context, repoClient *remote.Repository, ref manifest.OCIRepositoryRef, tag string) (string, error) {
-	if ref.Digest != "" {
-		return ref.Digest, nil
-	}
-	desc, err := repoClient.Resolve(ctx, tag)
-	if err != nil {
-		return "", err
-	}
-	return desc.Digest.String(), nil
 }
 
 // pickSemverTag picks the highest semver-matching tag from a list,

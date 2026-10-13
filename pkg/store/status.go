@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"slices"
 	"strings"
 
@@ -77,6 +78,45 @@ const (
 type StatusInfo struct {
 	Status  Status
 	Message string
+	failure *dependencyFailure
+}
+
+// IsDependencyFailure reports whether the Failed status came from failed dependencies.
+func (i StatusInfo) IsDependencyFailure() bool {
+	return i.failure != nil
+}
+
+// BlockedBy returns a copy of the immediate failed dependencies in this snapshot.
+func (i StatusInfo) BlockedBy() []manifest.NamedResource {
+	if i.failure == nil {
+		return nil
+	}
+	return slices.Clone(i.failure.ids)
+}
+
+// Failure IDs are immutable so StatusInfo can retain them after the shard unlocks.
+type conditionRecord struct {
+	conditions []Condition
+	failure    *dependencyFailure
+}
+
+type dependencyFailure struct {
+	ids []manifest.NamedResource
+}
+
+func newDependencyFailure(err error) *dependencyFailure {
+	dep, ok := errors.AsType[*manifest.DependencyFailedError](err)
+	if !ok || len(dep.Failed) == 0 {
+		return nil
+	}
+	ids := slices.Clone(dep.Failed)
+	slices.SortFunc(ids, manifest.NamedResource.Compare)
+	return &dependencyFailure{ids: ids}
+}
+
+// same reports whether f and o record the same failed dependencies; nil means none.
+func (f *dependencyFailure) same(o *dependencyFailure) bool {
+	return f == o || f != nil && o != nil && slices.Equal(f.ids, o.ids)
 }
 
 // Condition is an alias for k8s metav1.Condition. flate stores
@@ -140,24 +180,23 @@ func readyCondition(status Status, message string) Condition {
 	return c
 }
 
-// statusInfoFromConditions projects the rollup StatusInfo from the
+// statusInfo projects the rollup StatusInfo from the
 // Ready condition. Returns (zero, false) when no Ready condition is
 // present.
-func statusInfoFromConditions(conds []Condition) (StatusInfo, bool) {
-	for _, c := range conds {
+func (r conditionRecord) statusInfo() (StatusInfo, bool) {
+	for i := range r.conditions {
+		c := &r.conditions[i]
 		if c.Type != ConditionReady {
 			continue
 		}
-		info := StatusInfo{Message: c.Message}
 		switch c.Status {
 		case metav1.ConditionTrue:
-			info.Status = StatusReady
+			return StatusInfo{Status: StatusReady, Message: c.Message}, true
 		case metav1.ConditionFalse:
-			info.Status = StatusFailed
+			return StatusInfo{Status: StatusFailed, Message: c.Message, failure: r.failure}, true
 		default:
-			info.Status = StatusPending
+			return StatusInfo{Status: StatusPending, Message: c.Message}, true
 		}
-		return info, true
 	}
 	return StatusInfo{}, false
 }
@@ -169,6 +208,11 @@ func statusInfoFromConditions(conds []Condition) (StatusInfo, bool) {
 // rich state via GetConditions.
 func (s *Store) UpdateStatus(id manifest.NamedResource, status Status, message string) {
 	s.SetCondition(id, readyCondition(status, message))
+}
+
+// UpdateFailure atomically records a terminal error and its immediate failed dependencies.
+func (s *Store) UpdateFailure(id manifest.NamedResource, err error) {
+	s.setCondition(id, readyCondition(StatusFailed, err.Error()), newDependencyFailure(err))
 }
 
 // SetCondition upserts cond into the resource's condition list keyed
@@ -186,68 +230,49 @@ func (s *Store) UpdateStatus(id manifest.NamedResource, status Status, message s
 // lands (e.g. tests). The FailedResources rollup filters phantoms
 // by intersecting against the object map at read time.
 func (s *Store) SetCondition(id manifest.NamedResource, cond Condition) {
+	s.setCondition(id, cond, nil)
+}
+
+func (s *Store) setCondition(id manifest.NamedResource, cond Condition, failure *dependencyFailure) {
 	sh := s.shardFor(id)
 	sh.mu.Lock()
-	updated, changed := sh.setConditionLocked(id, cond)
+	updated, changed := sh.setConditionLocked(id, cond, failure)
 	if !changed {
 		sh.mu.Unlock()
 		return
 	}
-	newInfo, _ := statusInfoFromConditions(updated)
-	dispatch := s.fireUnderLock(EventStatusUpdated, id, newInfo)
+	newInfo, _ := updated.statusInfo()
+	dispatch := fireUnderLock(s, EventStatusUpdated, id, newInfo)
 	sh.mu.Unlock()
 	dispatch()
 }
 
-// setConditionLocked upserts cond into id's condition list and
-// returns the updated list plus whether it actually changed (an
-// identical re-write is a no-op). Caller MUST hold sh.mu — used both
-// by SetCondition (which takes the lock itself) and by Refire (which
-// already holds the lock for an atomic check-and-act).
-//
-// Mutates the existing slice in place when cond.Type already exists.
-// The hot path is "same condition type, new status/message" (every
-// reconcile transition flips the Ready condition); the prior
-// implementation rebuilt the full slice on each hit, allocating an
-// O(len(prev)) backing array per update. In-place overwrite drops
-// that allocation entirely while preserving the no-op fast path
-// (identical re-write returns the original slice with changed=false).
-//
-// Appending a never-seen type still allocates — that's the normal
-// slice-growth path and unavoidable. The Conditions slice is short
-// (Ready + occasional Healthy) so the steady state hits the
-// overwrite branch on every reconcile.
-//
-// The returned slice ALIASES sh.conditions[id] when an existing entry
-// is overwritten (it IS the live backing array). Listeners that read
-// the slice MUST do so before the next write under sh.mu — current
-// callers project a StatusInfo immediately under the same lock, so
-// no aliasing hazard exists today. A future caller that holds onto
-// the returned slice past sh.mu's release would observe further
-// mutations and MUST copy first; statusInfoFromConditions matches
-// this contract by reading values out of the slice in-place.
-func (sh *shard) setConditionLocked(id manifest.NamedResource, cond Condition) (updated []Condition, changed bool) {
-	prev := sh.conditions[id]
-	for i := range prev {
-		if prev[i].Type != cond.Type {
+// Caller MUST hold sh.mu and project conditions before unlocking: the returned
+// record aliases the live condition slice. Failure IDs remain immutable.
+// Existing conditions with unchanged provenance MUST be overwritten in place
+// without reassigning the map entry, preserving the allocation-free hot path.
+func (sh *shard) setConditionLocked(id manifest.NamedResource, cond Condition, failure *dependencyFailure) (conditionRecord, bool) {
+	record := sh.conditions[id]
+	failureChanged := cond.Type == ConditionReady && !record.failure.same(failure)
+	if failureChanged {
+		record.failure = failure
+	}
+	for i := range record.conditions {
+		if record.conditions[i].Type != cond.Type {
 			continue
 		}
-		if conditionEqual(prev[i], cond) {
-			return prev, false
+		changed := !conditionEqual(record.conditions[i], cond)
+		if changed {
+			record.conditions[i] = cond
 		}
-		prev[i] = cond
-		// sh.conditions[id] already references this backing array —
-		// no reassignment needed. Returning prev (now mutated) keeps
-		// the original allocation alive instead of replacing it.
-		return prev, true
+		if failureChanged {
+			sh.conditions[id] = record
+		}
+		return record, changed || failureChanged
 	}
-	// New condition type: extend the slice. This branch is rare
-	// (Ready + Healthy is the only multi-type combination flate
-	// emits today) so the per-call allocation cost is amortized
-	// across the lifetime of the resource.
-	updated = append(prev, cond)
-	sh.conditions[id] = updated
-	return updated, true
+	record.conditions = append(record.conditions, cond)
+	sh.conditions[id] = record
+	return record, true
 }
 
 // GetStatus returns the Ready-derived StatusInfo for id and whether
@@ -256,7 +281,7 @@ func (s *Store) GetStatus(id manifest.NamedResource) (StatusInfo, bool) {
 	sh := s.shardFor(id)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	return statusInfoFromConditions(sh.conditions[id])
+	return sh.conditions[id].statusInfo()
 }
 
 // GetConditions returns a copy of id's condition list. Empty for
@@ -265,7 +290,7 @@ func (s *Store) GetConditions(id manifest.NamedResource) []Condition {
 	sh := s.shardFor(id)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	conds := sh.conditions[id]
+	conds := sh.conditions[id].conditions
 	if len(conds) == 0 {
 		return nil
 	}
@@ -308,35 +333,14 @@ func (s *Store) FailedResources() map[manifest.NamedResource]StatusInfo {
 	defer s.rUnlockAll()
 	out := make(map[manifest.NamedResource]StatusInfo)
 	for _, sh := range s.shards {
-		for id, conds := range sh.conditions {
+		for id, record := range sh.conditions {
 			if _, inStore := sh.objects[id]; !inStore {
 				continue
 			}
-			if info, ok := statusInfoFromConditions(conds); ok && info.Status == StatusFailed {
+			if info, ok := record.statusInfo(); ok && info.Status == StatusFailed {
 				out[id] = info
 			}
 		}
 	}
 	return out
-}
-
-// SetBlocked records that id failed only because the given dependencies failed
-// or were missing — the structured form of a DependencyFailedError, captured at
-// the failure sink. The failure report uses it to group derived failures under
-// their root cause instead of reprinting nested "dependencies failed: …" chains.
-// A defensive copy is stored so the caller's slice can't mutate store state.
-func (s *Store) SetBlocked(id manifest.NamedResource, deps []manifest.NamedResource) {
-	sh := s.shardFor(id)
-	sh.mu.Lock()
-	sh.blocked[id] = slices.Clone(deps)
-	sh.mu.Unlock()
-}
-
-// BlockedBy returns the immediate dependencies that blocked id (set via
-// SetBlocked), or nil when id failed on its own — i.e. a primary failure.
-func (s *Store) BlockedBy(id manifest.NamedResource) []manifest.NamedResource {
-	sh := s.shardFor(id)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	return slices.Clone(sh.blocked[id])
 }

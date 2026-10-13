@@ -1,6 +1,7 @@
 package store
 
 import (
+	"io/fs"
 	"reflect"
 
 	"github.com/home-operations/flate/pkg/manifest"
@@ -45,6 +46,16 @@ type SourceArtifact struct {
 	Digest    string
 	Size      int64
 	Metadata  map[string]string
+
+	// LocalRoot is the working tree whose repository resolved this artifact.
+	// Its Kustomizations retain ownership there even when LocalPath is cached.
+	LocalRoot string
+
+	// Key identifies pinned content, source options, authentication and shaping rules.
+	// A nonempty Key without FS denotes unavailable content, never a disk input.
+	Key string
+	// FS is immutable source content. When set, LocalPath is only an ownership label.
+	FS fs.FS
 }
 
 func (*SourceArtifact) artifact() {}
@@ -131,7 +142,9 @@ func (a *ResourceSetArtifact) RenderedFingerprint() string { return a.Fingerprin
 //     circuit avoids reflection entirely for that case (~3× faster
 //     than the legacy reflect.DeepEqual-on-aliased-pointers fast
 //     path, which still walks struct headers).
-//  2. reflect.DeepEqual fallback for distinct-pointer dedup. Phase 1
+//  2. Source payloads are compared by Key, with remaining metadata compared
+//     by value. Filesystems MUST NOT be traversed under the shard lock.
+//  3. reflect.DeepEqual fallback for distinct-pointer dedup. Phase 1
 //     evaluated hashing here (FNV64a via both json.Marshal and a
 //     hand-rolled walker) and benched it against DeepEqual on the
 //     realistic KS / HR re-emit shape (20-200 docs, fresh maps every
@@ -151,12 +164,12 @@ func (s *Store) SetArtifact(id manifest.NamedResource, artifact Artifact) {
 	// fetcher caches its own SourceArtifact and re-publishes the same
 	// pointer every refresh tick, skipping reflection entirely) before
 	// the reflect.DeepEqual fallback for distinct-pointer equal content.
-	if exists && (prev == artifact || reflect.DeepEqual(prev, artifact)) {
+	if exists && (prev == artifact || sameArtifact(prev, artifact)) {
 		sh.mu.Unlock()
 		return
 	}
 	sh.artifacts[id] = artifact
-	dispatch := s.fireUnderLock(EventArtifactUpdated, id, artifact)
+	dispatch := fireUnderLock(s, EventArtifactUpdated, id, artifact)
 	sh.mu.Unlock()
 	dispatch()
 }
@@ -167,4 +180,19 @@ func (s *Store) GetArtifact(id manifest.NamedResource) Artifact {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	return sh.artifacts[id]
+}
+
+// Payload identity is pinned by Key; never walk a filesystem under the shard lock.
+func sameArtifact(prev, next Artifact) bool {
+	a, aok := prev.(*SourceArtifact)
+	b, bok := next.(*SourceArtifact)
+	if !aok || !bok || (a.FS == nil && b.FS == nil) {
+		return reflect.DeepEqual(prev, next)
+	}
+	if (a.FS == nil) != (b.FS == nil) {
+		return false
+	}
+	ac, bc := *a, *b
+	ac.FS, bc.FS = nil, nil
+	return reflect.DeepEqual(ac, bc)
 }

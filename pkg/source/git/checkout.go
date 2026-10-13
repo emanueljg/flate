@@ -1,6 +1,8 @@
 package git
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -35,14 +37,20 @@ func checkoutRef(repo *git.Repository, ref manifest.GitRepositoryRef, sparse []s
 	// resolved hash. The bool reports whether rev resolved so callers can
 	// fall through to an alternate lookup when it didn't.
 	tryCheckoutRevision := func(rev plumbing.Revision) (bool, error) {
-		h, err := repo.ResolveRevision(rev)
-		if err != nil {
+		h, err := lookupReference(repo, plumbing.ReferenceName(rev))
+		if errors.Is(err, errRefUnavailable) {
 			return false, nil
 		}
-		return true, checkoutHash(*h)
+		if err != nil {
+			return true, err
+		}
+		return true, checkoutHash(h)
 	}
 	switch {
 	case ref.Commit != "":
+		if !plumbing.IsHash(ref.Commit) {
+			return fmt.Errorf("%w: invalid full commit hash %q", manifest.ErrInput, ref.Commit)
+		}
 		hash := plumbing.NewHash(ref.Commit)
 		if err := validateCommitBranch(repo, hash, ref.Branch); err != nil {
 			return err
@@ -92,7 +100,7 @@ func checkoutRef(repo *git.Repository, ref manifest.GitRepositoryRef, sparse []s
 // parent's auth is reused for each submodule's fetch — Flux's
 // behavior assumes a single credential source per GitRepository CR,
 // even when submodules live on different hosts.
-func updateSubmodules(repo *git.Repository, auth transport.AuthMethod) error {
+func updateSubmodules(ctx context.Context, repo *git.Repository, auth transport.AuthMethod) error {
 	wt, err := repo.Worktree()
 	if err != nil {
 		return err
@@ -101,7 +109,7 @@ func updateSubmodules(repo *git.Repository, auth transport.AuthMethod) error {
 	if err != nil {
 		return err
 	}
-	return subs.Update(&git.SubmoduleUpdateOptions{
+	return subs.UpdateContext(ctx, &git.SubmoduleUpdateOptions{
 		Init:              true,
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
 		Auth:              auth,

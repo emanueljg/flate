@@ -1,11 +1,8 @@
 package values
 
 import (
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"maps"
 	"regexp"
@@ -26,6 +23,9 @@ import (
 // ConfigMap key like `my-var` (dash) is invalid; upstream rejects the
 // whole postBuild rather than silently substituting nothing.
 var varsubRegex = regexp.MustCompile(`^[_a-zA-Z][_a-zA-Z0-9]*$`)
+
+// ValidSubstitutionName reports whether name follows Flux's variable-name rule.
+func ValidSubstitutionName(name string) bool { return varsubRegex.MatchString(name) }
 
 // Provider exposes the ConfigMap/Secret lookups needed for value
 // reference expansion. The controllers implement it against the central
@@ -50,33 +50,9 @@ func (p *storeProvider) Secret(namespace, name string) *manifest.Secret {
 	return s
 }
 
-// DeepMerge returns a new map with override's keys merged into base.
-// Nested maps recurse; lists and scalars from override fully replace
-// values from base — matching Helm's merge semantics. Both inputs
-// are read-only.
-//
-// Implemented as deepMergeShared over a fresh shallow copy of base:
-// the copy makes the top-level map owned, and deepMergeShared's
-// copy-on-collision recursion keeps every borrowed (base) sub-tree
-// read-only, so neither input is mutated.
-func DeepMerge(base, override map[string]any) map[string]any {
-	out := make(map[string]any, len(base)+len(override))
-	maps.Copy(out, base)
-	return deepMergeShared(out, override)
-}
-
-// DeepMergeInto merges override's keys into dst in place. Same merge
-// semantics as DeepMerge but mutates dst instead of allocating a new
-// map. Callers MUST own dst and any sub-maps reachable from it —
-// passing a map that shares sub-trees with another reachable
-// reference will corrupt that reference. Designed for hot paths
-// (ExpandValueReferences's per-ref loop) where the caller is
-// building up a fresh map across N refs and the N-1 intermediate
-// allocations DeepMerge would do are wasted.
-//
-// Sub-maps coming from override are inserted by reference (not
-// cloned) when no existing key collides — same as DeepMerge.
-// Returns dst for fluent-style use.
+// DeepMergeInto merges override into dst using Helm's merge semantics.
+// Callers MUST own dst and its sub-maps. Non-colliding override sub-maps
+// are inserted by reference; override remains read-only.
 func DeepMergeInto(dst, override map[string]any) map[string]any {
 	if dst == nil {
 		dst = map[string]any{}
@@ -103,18 +79,10 @@ func DeepMergeInto(dst, override map[string]any) map[string]any {
 // map/map key collision shallow-clones the existing dst node into a
 // fresh owned map BEFORE recursing — copy-on-write — so the recursion
 // never writes through a borrowed (shared) sub-tree. Non-colliding
-// override sub-maps are inserted by reference, exactly like DeepMerge.
+// override sub-maps are inserted by reference.
 //
-// The resulting value graph is identical to a DeepMerge(dst, override)
-// chain, but without re-copying the whole top-level accumulator on each
-// call: ExpandValueReferences's share path folds N valuesFrom refs into
-// one accumulator with N in-place merges instead of N functional
-// DeepMerges that each clone the growing top level. Returns dst.
-//
-// Safety invariant: override is never mutated (only read), and any dst
-// sub-map that aliases a shared canonical is cloned before it is
-// written to. The cache canonical therefore stays pristine, matching
-// the contract DeepMerge upheld in the old share path.
+// The accumulator is owned, but its sub-maps may alias immutable cache
+// entries. Clone colliding maps before writing through a borrowed node.
 func deepMergeShared(dst, override map[string]any) map[string]any {
 	for k, v := range override {
 		existing, ok := dst[k]
@@ -138,24 +106,12 @@ func deepMergeShared(dst, override map[string]any) map[string]any {
 	return dst
 }
 
-// Cache memoizes parsed-YAML output of valuesFrom refs across HRs.
-// One HR with N valuesFrom refs hits each entry once; M HRs sharing
-// the same ConfigMap/Secret/key tuple (a common pattern when a
-// platform values CM is referenced by every app HR) re-yaml.Unmarshal'd
-// the same bytes M times. Cache key folds the content hash so a
-// mutation to the underlying object (re-AddObject) invalidates
-// naturally without an explicit listener.
-//
-// Stored values are TREATED AS IMMUTABLE — callers receive a deep
-// clone before mutation so concurrent ExpandValueReferences calls
-// can't observe a partially-modified sub-tree. The cache itself is
-// safe for concurrent use.
-//
-// Zero value is a no-op cache: NewCache or a non-nil *Cache must
-// be supplied to opt into memoization. nil is the legacy fast path
-// for tests / one-shot embedders.
+// Cache memoizes valuesFrom YAML by content across HelmReleases.
+// Stored maps are immutable; callers must clone before mutation or merge
+// with copy-on-write. The zero value is ready for concurrent use.
+// A nil *Cache disables memoization.
 type Cache struct {
-	m sync.Map // map[uint64]map[string]any
+	m sync.Map // map[string]map[string]any
 }
 
 // NewCache returns an empty *Cache ready for use. Construct one per
@@ -166,7 +122,7 @@ func NewCache() *Cache { return &Cache{} }
 // NOT mutate the returned map; the cache's defensive-clone happens at
 // the call site (ExpandValueReferences) which knows whether the value
 // will be merged through DeepMergeInto (mutating) or read-only.
-func (c *Cache) lookup(key uint64) (map[string]any, bool) {
+func (c *Cache) lookup(key string) (map[string]any, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -177,51 +133,11 @@ func (c *Cache) lookup(key uint64) (map[string]any, bool) {
 	return v.(map[string]any), true
 }
 
-// store memoizes parsed under key. No-op when c is nil so the
-// non-cached path stays branchless on the caller.
-func (c *Cache) store(key uint64, parsed map[string]any) {
-	if c == nil {
-		return
+// put stores an immutable parsed map. A nil receiver disables memoization.
+func (c *Cache) put(key string, parsed map[string]any) {
+	if c != nil {
+		c.m.Store(key, parsed)
 	}
-	c.m.Store(key, parsed)
-}
-
-// valuesRefCacheKey folds (ref.Kind, namespace, ref.Name, valuesKey,
-// content-hash) into a FNV64 key. Including the content hash means
-// any mutation to the underlying ConfigMap/Secret data shifts the
-// key — re-AddObject changes the bytes, the new bytes hash differently,
-// and the next lookup misses naturally. No explicit invalidation needed.
-//
-// Why FNV64 (stdlib hash/fnv) over sha256: collision probability across
-// the small key-space a single flate run produces (≤ thousands of
-// entries) is effectively zero, and FNV is ~10× cheaper. The previous-
-// cache convention elsewhere in flate (chartValuesCache, store hashing)
-// uses sha256 for stable cross-run keys; this cache is single-run only,
-// so the faster hash is fine.
-func valuesRefCacheKey(kind, namespace, name, valuesKey, content string) uint64 {
-	// hash.Hash.Write never returns an error per its contract; the
-	// _, _ = drains the (int, error) tuple so gosec G104 doesn't flag
-	// every byte fed into the digest.
-	h := fnv.New64a()
-	// Each field is followed by a NUL so adjacent fields can't run
-	// together (e.g. name="ab"+key="c" vs name="a"+key="bc").
-	writeField := func(s string) {
-		_, _ = h.Write([]byte(s))
-		_, _ = h.Write([]byte{0})
-	}
-	writeField(kind)
-	writeField(namespace)
-	writeField(name)
-	writeField(valuesKey)
-	// Mix the content length into the hash explicitly so two refs that
-	// happen to FNV-collide on the same prefix don't end up sharing
-	// a cache entry; binary.LittleEndian.PutUint64 produces 8 stable
-	// bytes regardless of the host architecture.
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], uint64(len(content)))
-	_, _ = h.Write(b[:])
-	_, _ = h.Write([]byte(content))
-	return h.Sum64()
 }
 
 // ExpandValueReferences resolves all spec.valuesFrom references on hr,
@@ -263,7 +179,7 @@ func ExpandValueReferences(hr *manifest.HelmRelease, provider Provider, cache *C
 			}
 			return fmt.Errorf("building HelmRelease %s: %w", hr.Named().NamespacedName(), err)
 		}
-		if values, err = updateHelmReleaseValues(ref, found, values, hr.Namespace, cache, share); err != nil {
+		if values, err = updateHelmReleaseValues(ref, found, values, cache, share); err != nil {
 			return fmt.Errorf("building HelmRelease %s: %w", hr.Named().NamespacedName(), err)
 		}
 	}
@@ -288,120 +204,41 @@ func ExpandValueReferences(hr *manifest.HelmRelease, provider Provider, cache *C
 	return nil
 }
 
-// lookupValueRef returns the raw string value referenced by ref. It reads
-// only the single key the ref names (ref.GetValuesKey()), mirroring upstream
-// Flux's chartutil.ChartValuesFromReferences, which indexes
-// typedRes.Data[valuesKey] directly. This is the steady-state per-HelmRelease
-// path; reading one key avoids decodeBag's full-bag normalization, which
-// base64-decodes and coerces every sibling entry only to discard all but one
-// (decodeBag was ~25% of alloc_space in BenchmarkExpandValueReferences_*).
-//
-// Consequence — a deliberate, Flux-aligning narrowing of the error surface:
-// the old full-bag decode failed the ref if ANY sibling key was malformed,
-// whereas this validates only the requested key (as Flux does). Output for
-// every input that renders today is unchanged; only pathological inputs with a
-// valid requested key beside a malformed sibling stop erroring. The
-// substituteFrom/postBuild path (which legitimately consumes the whole bag)
-// keeps using lookupResourceData/decodeBag.
+// lookupValueRef reads only the requested key, preserving unrelated malformed siblings.
 func lookupValueRef(ref manifest.ValuesReference, namespace string, p Provider) (string, error) {
-	stringData, binaryData, found, err := resourceBag(ref.Kind, namespace, ref.Name, p)
+	data, err := resourceData(ref.Kind, namespace, ref.Name, p)
 	if err != nil {
 		return "", err
 	}
-	// An absent resource and a present-but-empty bag both surface as
-	// "resource not found": decodeBag returned nil for an empty bag, which the
-	// previous data==nil branch mapped to ErrObjectNotFound. Preserve that so
-	// error identity (and Optional handling) is unchanged.
-	if !found || (len(stringData) == 0 && len(binaryData) == 0) {
+	if data == nil {
 		return "", &missingValueRefError{kind: ref.Kind, namespace: namespace, name: ref.Name}
 	}
 	key := ref.GetValuesKey()
-	val, ok, err := lookupBagKey(stringData, binaryData, key)
+	value, ok, err := data.Value(key)
 	if err != nil {
 		return "", err
 	}
 	if !ok {
 		return "", &missingValueRefError{kind: ref.Kind, namespace: namespace, name: ref.Name, key: key}
 	}
-	return val, nil
+	return value, nil
 }
 
-// resourceBag returns the raw (stringData, binaryData) maps backing a
-// ConfigMap or Secret values reference, without decoding the whole bag. found
-// is false when the resource is absent (no error). ConfigMap binaryData is
-// intentionally nil: valuesFrom reads only ConfigMap.data, matching upstream
-// fluxcd ChartValuesFromReferences (see lookupResourceData).
-func resourceBag(kind, namespace, name string, p Provider) (stringData, binaryData map[string]any, found bool, err error) {
+// Empty bags retain the same missing-resource disposition as absent objects.
+func resourceData(kind, namespace, name string, p Provider) (manifest.Data, error) {
 	switch kind {
 	case manifest.KindSecret:
-		if s := p.Secret(namespace, name); s != nil {
-			return s.StringData, s.Data, true, nil
+		if s := p.Secret(namespace, name); s != nil && len(s.Data)+len(s.StringData) > 0 {
+			return s, nil
 		}
-		return nil, nil, false, nil
 	case manifest.KindConfigMap:
-		if c := p.ConfigMap(namespace, name); c != nil {
-			return c.Data, nil, true, nil
+		if c := p.ConfigMap(namespace, name); c != nil && len(c.Data) > 0 {
+			return c, nil
 		}
-		return nil, nil, false, nil
-	default:
-		return nil, nil, false, fmt.Errorf("%w: unsupported kind %s", manifest.ErrInvalidValuesReference, kind)
-	}
-}
-
-// lookupBagKey returns the value at key from a ConfigMap/Secret data bag,
-// applying decodeBag's coercion and precedence — binaryData wins over
-// stringData on collision (decodeBag writes stringData first, then binaryData
-// overwrites) — but reading ONLY key and leaving sibling entries untouched. ok
-// is false when key is absent. An error surfaces only when the requested key
-// itself is malformed; the error strings match decodeBag's so a malformed
-// requested key reports identically.
-func lookupBagKey(stringData, binaryData map[string]any, key string) (string, bool, error) {
-	if v, ok := binaryData[key]; ok {
-		s, err := bagValueAsString(v)
-		if err != nil {
-			return "", false, fmt.Errorf("binaryData[%s]: %w", key, err)
-		}
-		decoded, err := base64.StdEncoding.DecodeString(s)
-		if err != nil {
-			return "", false, fmt.Errorf("decode binaryData[%s]: %w", key, err)
-		}
-		return string(decoded), true, nil
-	}
-	if v, ok := stringData[key]; ok {
-		s, err := bagValueAsString(v)
-		if err != nil {
-			return "", false, fmt.Errorf("stringData[%s]: %w", key, err)
-		}
-		return s, true, nil
-	}
-	return "", false, nil
-}
-
-// lookupResourceData fetches and decodes the data bag for a ConfigMap or
-// Secret. Returns nil when the resource is not found (no error). Hard errors
-// (unsupported kind, malformed binaryData) always surface regardless of
-// Optional.
-func lookupResourceData(kind, namespace, name string, p Provider) (map[string]string, error) {
-	switch kind {
-	case manifest.KindSecret:
-		if s := p.Secret(namespace, name); s != nil {
-			return decodeBag(s.StringData, s.Data)
-		}
-		return nil, nil
-	case manifest.KindConfigMap:
-		if c := p.ConfigMap(namespace, name); c != nil {
-			// valuesFrom/substituteFrom read only ConfigMap.data; upstream
-			// fluxcd/pkg/chartutil/values.go ChartValuesFromReferences
-			// pulls from typedRes.Data exclusively and never touches
-			// BinaryData. Pass nil so a ConfigMap carrying binaryData
-			// doesn't quietly leak base64-decoded entries — flate would
-			// render with keys real Flux never sees.
-			return decodeBag(c.Data, nil)
-		}
-		return nil, nil
 	default:
 		return nil, fmt.Errorf("%w: unsupported kind %s", manifest.ErrInvalidValuesReference, kind)
 	}
+	return nil, nil
 }
 
 type missingValueRefError struct {
@@ -426,65 +263,6 @@ func (e *missingValueRefError) Unwrap() error {
 	return manifest.ErrObjectNotFound
 }
 
-// decodeBag normalizes ConfigMap/Secret data so callers see a single
-// map[string]string. binaryData values are base64-decoded. Non-string
-// shapes (a Secret.Data field decoded as []byte, a number leaf the
-// parser produced from an unquoted YAML scalar) get explicit handling
-// — the previous fmt.Sprint fallback silently rendered Go's Stringer
-// output, which for []byte is "[107 58]" rather than the intended
-// "k:" — silently breaking values-reference resolution.
-func decodeBag(stringData, binaryData map[string]any) (map[string]string, error) {
-	if len(stringData) == 0 && len(binaryData) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]string, len(stringData)+len(binaryData))
-	for k, v := range stringData {
-		s, err := bagValueAsString(v)
-		if err != nil {
-			return nil, fmt.Errorf("stringData[%s]: %w", k, err)
-		}
-		out[k] = s
-	}
-	for k, v := range binaryData {
-		s, err := bagValueAsString(v)
-		if err != nil {
-			return nil, fmt.Errorf("binaryData[%s]: %w", k, err)
-		}
-		decoded, err := base64.StdEncoding.DecodeString(s)
-		if err != nil {
-			return nil, fmt.Errorf("decode binaryData[%s]: %w", k, err)
-		}
-		out[k] = string(decoded)
-	}
-	return out, nil
-}
-
-// bagValueAsString coerces a single ConfigMap.Data / Secret.Data value
-// into the string form helm values / postBuild substitution consume.
-// Distinguishes the JSON/YAML shapes the decoder actually produces
-// (string, []byte after future schema corrections, JSON-numeric
-// scalars) from the "garbage value" case which now returns an error
-// instead of silently rendering "[107 58]"-style Stringer output.
-// Also used by VarsMap for scalar postBuild substitution values.
-func bagValueAsString(v any) (string, error) {
-	switch t := v.(type) {
-	case string:
-		return t, nil
-	case []byte:
-		// Secret.Data is spec-correct as []byte; a future schema fix or a
-		// non-standard decoder could land values here.
-		return string(t), nil
-	case nil:
-		return "", nil
-	case bool, int, int32, int64, uint, uint32, uint64, float32, float64:
-		// JSON scalar shapes — render via fmt.Sprint, deterministic
-		// for these types.
-		return fmt.Sprint(t), nil
-	default:
-		return "", fmt.Errorf("unsupported value type %T", v)
-	}
-}
-
 // updateHelmReleaseValues merges one valuesFrom ref into the values
 // accumulator and returns the (possibly new) accumulator.
 //
@@ -503,7 +281,7 @@ func bagValueAsString(v any) (string, error) {
 // via replaceLiteralValueAtPath).
 //
 // Otherwise the found YAML is parsed (memoized in cache when non-nil, keyed
-// by kind, namespace, name, valuesKey, content-hash) and deep-merged.
+// by content) and deep-merged.
 //
 // share selects the merge strategy, decided once per HR by the caller:
 //   - share=true (the HR has NO TargetPath ref): deepMergeShared, which
@@ -518,7 +296,7 @@ func bagValueAsString(v any) (string, error) {
 //     DeepMergeInto over a DeepCopyMap of the canonical, so the
 //     accumulator is FULLY OWNED and the in-place strvals write that a
 //     TargetPath ref performs can't reach (and corrupt) the shared cache.
-func updateHelmReleaseValues(ref manifest.ValuesReference, found string, values map[string]any, namespace string, cache *Cache, share bool) (map[string]any, error) {
+func updateHelmReleaseValues(ref manifest.ValuesReference, found string, values map[string]any, cache *Cache, share bool) (map[string]any, error) {
 	if ref.TargetPath != "" {
 		// Only reached when share==false (the caller sets share false the
 		// moment any ref carries a TargetPath), so `values` is owned and
@@ -531,8 +309,7 @@ func updateHelmReleaseValues(ref manifest.ValuesReference, found string, values 
 		return values, err
 	}
 
-	key := valuesRefCacheKey(ref.Kind, namespace, ref.Name, ref.GetValuesKey(), found)
-	parsed, ok := cache.lookup(key)
+	parsed, ok := cache.lookup(found)
 	if !ok {
 		if err := yaml.Unmarshal([]byte(found), &parsed); err != nil {
 			// Wiped Secret values surface here as the literal placeholder
@@ -540,7 +317,7 @@ func updateHelmReleaseValues(ref manifest.ValuesReference, found string, values 
 			// — treat as empty so a wiped values-file (common pattern: kustomize
 			// `secretGenerator` wrapping a SOPS-encrypted values.yaml) doesn't
 			// block the whole HR render.
-			if manifest.IsValuePlaceholder(found) {
+			if manifest.HasValuePlaceholder(found) {
 				return values, nil
 			}
 			return values, fmt.Errorf("expected '%s' values to be valid YAML: %w", ref.Name, err)
@@ -549,14 +326,13 @@ func updateHelmReleaseValues(ref manifest.ValuesReference, found string, values 
 			return values, nil
 		}
 		// Cache the parsed tree (canonical, never mutated) before merging.
-		cache.store(key, parsed)
+		cache.put(found, parsed)
 	}
 	if share {
 		// Folds parsed into the owned accumulator in place: non-colliding
 		// sub-trees are shared by reference; map collisions copy-on-write
 		// so the cache canonical (parsed) is never mutated. Avoids the
-		// per-ref full clone of the growing top-level map that a functional
-		// DeepMerge chain pays across N valuesFrom refs.
+		// per-ref full clone of the growing top-level map across N valuesFrom refs.
 		return deepMergeShared(values, parsed), nil
 	}
 	// Owned-accumulator path: clone the canonical so the later in-place
@@ -627,21 +403,24 @@ func stripMatchingQuotes(value string) (string, bool) {
 // Contents). Missing references are logged (Secrets silently) and the
 // substitution proceeds with what's available.
 func ExpandPostBuildSubstituteReference(ks *manifest.Kustomization, p Provider) error {
-	if ks == nil || len(ks.PostBuildSubstituteFrom) == 0 {
+	return ExpandPostBuildSubstituteReferenceWithSubstitutions(ks, p, nil)
+}
+
+// ExpandPostBuildSubstituteReferenceWithSubstitutions applies overlay after
+// referenced and inline values. An overlay never enables absent postBuild.
+func ExpandPostBuildSubstituteReferenceWithSubstitutions(ks *manifest.Kustomization, p Provider, overlay map[string]string) error {
+	if ks == nil || (len(ks.PostBuildSubstitute) == 0 && len(ks.PostBuildSubstituteFrom) == 0 &&
+		(ks.PostBuild == nil || len(overlay) == 0)) {
 		return nil
 	}
-	if ks.Namespace == "" {
+	if len(ks.PostBuildSubstituteFrom) > 0 && ks.Namespace == "" {
 		return fmt.Errorf("%w: Kustomization with substituteFrom has no namespace", manifest.ErrInvalidSubstituteReference)
 	}
 
-	// Upstream kustomize-controller's LoadVariables merges substituteFrom
-	// refs first, then OVERWRITES with inline spec.postBuild.substitute —
-	// inline values win on key collision. flate previously inverted this
-	// (seeded from inline, then substituteFrom overwrote). Match upstream:
-	// substituteFrom first into a fresh map, then layer inline on top.
+	// Flux gives inline substitutions precedence over references.
 	values := map[string]any{}
 	for _, ref := range ks.PostBuildSubstituteFrom {
-		data, err := lookupResourceData(ref.Kind, ks.Namespace, ref.Name, p)
+		data, err := resourceData(ref.Kind, ks.Namespace, ref.Name, p)
 		if err != nil {
 			if errors.Is(err, manifest.ErrInvalidValuesReference) {
 				// Unsupported kind — log and skip rather than failing the
@@ -659,29 +438,36 @@ func ExpandPostBuildSubstituteReference(ks *manifest.Kustomization, p Provider) 
 			}
 			continue
 		}
-		for k, v := range data {
-			// Match upstream kustomize-controller: every substituteFrom
-			// var value has \n stripped (multi-line ConfigMap entries
-			// would otherwise break inline substitution into single-line
-			// YAML fields like `image:`). See
-			// fluxcd/pkg/kustomize/kustomize_varsub.go.
+		var failure struct {
+			key string
+			err error
+		}
+		data.Keys()(func(k string) bool {
+			v, _, err := data.Value(k)
+			if err != nil {
+				if failure.err == nil || k < failure.key {
+					failure.err, failure.key = err, k
+				}
+				return true
+			}
+			// Flux strips newlines before substituting into single-line YAML fields.
 			values[k] = strings.ReplaceAll(v, "\n", "")
+			return true
+		})
+		if failure.err != nil {
+			return failure.err
 		}
 	}
 	// Layer inline spec.postBuild.substitute on top — inline wins on
 	// key collision per upstream LoadVariables order.
 	maps.Copy(values, ks.PostBuildSubstitute)
+	if ks.PostBuild != nil {
+		for name, value := range overlay {
+			values[name] = value
+		}
+	}
 
-	// Reject invalid var names — matches upstream fluxcd/pkg/kustomize
-	// varSubstitution which fails the whole postBuild on any name that
-	// doesn't match `^[_[:alpha:]][_[:alpha:][:digit:]]*$`. Without this
-	// check flate would render with the invalid keys silently dropped
-	// while real Flux would fail the Kustomization — divergent output.
-	// Collect every invalid name and report them sorted so the error
-	// message is deterministic across runs. Map iteration is
-	// randomized in Go; the previous "return first invalid name"
-	// surfaced a different bad name on each run when multiple were
-	// present, making bisection and CI noise unnecessarily painful.
+	// Flux rejects invalid variable names; sort diagnostics for determinism.
 	var invalid []string
 	for name := range values {
 		if !varsubRegex.MatchString(name) {
@@ -690,7 +476,7 @@ func ExpandPostBuildSubstituteReference(ks *manifest.Kustomization, p Provider) 
 	}
 	if len(invalid) > 0 {
 		slices.Sort(invalid)
-		return fmt.Errorf("%w: substituteFrom var name(s) %v invalid (must match %s)",
+		return fmt.Errorf("%w: substitute var name(s) %v invalid (must match %s)",
 			manifest.ErrInvalidSubstituteReference, invalid, varsubRegex.String())
 	}
 	ks.UpdatePostBuildSubstitutions(values)
@@ -718,7 +504,7 @@ func UnreadableSubstituteSecrets(ks *manifest.Kustomization, p Provider) []strin
 		if ref.Kind != manifest.KindSecret || ref.Optional {
 			continue
 		}
-		if data, err := lookupResourceData(ref.Kind, ks.Namespace, ref.Name, p); err == nil && data == nil {
+		if data, err := resourceData(ref.Kind, ks.Namespace, ref.Name, p); err == nil && data == nil {
 			unreadable = append(unreadable, ref.Name)
 		}
 	}
@@ -727,30 +513,4 @@ func UnreadableSubstituteSecrets(ks *manifest.Kustomization, p Provider) []strin
 	}
 	slices.Sort(unreadable)
 	return slices.Compact(unreadable)
-}
-
-// VarsMap returns the substitution variables for use with
-// kustomize.Substitute. Non-string scalar values are stringified;
-// nested maps/slices and other unsupported shapes are silently
-// dropped with a Debug log rather than rendered as Go's default
-// `map[k:v]` / `[1 2 3]` representation, which produced literal
-// garbage substitutions diverging from upstream kustomize-controller
-// (whose LoadVariables only accepts flat string→string). Newline
-// characters are stripped from every value — upstream does the same
-// so multi-line entries can't break inline substitution into
-// single-line YAML fields.
-func VarsMap(in map[string]any) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		s, err := bagValueAsString(v)
-		if err != nil {
-			slog.Debug("values: dropping non-scalar substitute var", "key", k, "err", err)
-			continue
-		}
-		out[k] = strings.ReplaceAll(s, "\n", "")
-	}
-	return out
 }

@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sync"
 
 	chart "helm.sh/helm/v4/pkg/chart/v2"
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
-	"helm.sh/helm/v4/pkg/cli"
+	"helm.sh/helm/v4/pkg/chart/v2/util"
 
 	"github.com/home-operations/flate/internal/diskcache"
 	"github.com/home-operations/flate/internal/keylock"
@@ -55,13 +57,13 @@ type Client struct {
 	chartLoadLocks *keylock.KeyMap[string]
 
 	// chartValuesCache memoizes mergeChartValuesFiles output keyed by
-	// (chart name + version + joined valuesFiles list). Multiple HRs
+	// (loaded fingerprint, ordered valuesFiles, missing-file policy). Multiple HRs
 	// sharing a base chart and the same spec.chart.spec.valuesFiles
 	// stack (common: bjw-s app-template with a fixed set of layered
 	// values-*.yaml files) re-yaml.Unmarshal'd the same bytes once per
 	// HR. The cache holds the canonical merged map; callers receive
 	// a deep clone (defensive-copy convention shared with chartCache)
-	// because downstream DeepMerge layering mutates the result.
+	// so callers cannot mutate the canonical merged map.
 	//
 	// Guarded by chartMu — same lock as chartCache. The two caches
 	// share a lifecycle (both live for the duration of the Client)
@@ -90,34 +92,6 @@ type Client struct {
 	// TemplateCacheBytes<=0). Both Get and Put handle nil receivers
 	// cleanly so the render path doesn't need extra wiring guards.
 	templateCache *templateCache
-
-	// settings is the helm CLI environment built once per Client and
-	// shared across every Template call. cli.New() reads ~20 env vars
-	// and allocates an EnvSettings + a *genericclioptions.ConfigFlags
-	// (~15 allocs / 1.1 KB) — work that is identical for every HR in a
-	// run, so building it per Template was pure waste on the uncached
-	// render path. Only RESTClientGetter() (the embedded *ConfigFlags)
-	// is consumed downstream, and that type guards its lazy-init caches
-	// with internal mutexes, so the shared getter is safe under the
-	// concurrent renders the orchestrator drives. Built lazily under
-	// settingsOnce so construction stays allocation-free for callers
-	// that never render (e.g. LocateChart-only embedders).
-	settingsOnce sync.Once
-	settings     *cli.EnvSettings
-}
-
-// envSettings returns the per-Client helm CLI environment, building it
-// exactly once. cli.New() is HR-invariant (env-var driven) so every
-// Template call reuses the same EnvSettings instead of re-reading the
-// environment and re-allocating the ConfigFlags. The returned getter
-// (*genericclioptions.ConfigFlags) is concurrency-safe: its lazy REST
-// caches are mutex-guarded, and flate's DryRunClient render path never
-// touches them.
-func (c *Client) envSettings() *cli.EnvSettings {
-	c.settingsOnce.Do(func() {
-		c.settings = cli.New()
-	})
-	return c.settings
 }
 
 // chartCacheEntry pairs the parsed chart with the (mtime, size) of
@@ -125,12 +99,13 @@ func (c *Client) envSettings() *cli.EnvSettings {
 // means the file was overwritten (mutable tag re-push, manual
 // edit) and the cache entry is stale.
 //
-// fingerprint, when non-empty, is the content-addressed digest of
+// fingerprint is the content-addressed digest of
 // the chart's loader.Load inputs — computed once at cache-fill
 // time and reused on every subsequent LoadChart hit. The template-
 // output cache mixes it into its own key so a stale chart never
 // serves a different chart's render.
 type chartCacheEntry struct {
+	immutable   bool
 	chart       *chart.Chart
 	mtime       int64 // unix nanos
 	size        int64
@@ -258,14 +233,6 @@ func (c *Client) Resolver() SourceResolver {
 	return c.resolver
 }
 
-func (c *Client) resolveOCIRepo(hr *manifest.HelmRelease) *manifest.OCIRepository {
-	r := c.Resolver()
-	if r == nil {
-		return nil
-	}
-	return r.OCIRepository(hr.Chart.RepoNamespace, hr.Chart.RepoName)
-}
-
 func (c *Client) resolveLocalSource(hr *manifest.HelmRelease) *store.SourceArtifact {
 	r := c.Resolver()
 	if r == nil {
@@ -274,9 +241,8 @@ func (c *Client) resolveLocalSource(hr *manifest.HelmRelease) *store.SourceArtif
 	return r.LocalSourceArtifact(hr.Chart.RepoKind, hr.Chart.RepoNamespace, hr.Chart.RepoName)
 }
 
-// LocateChart returns a filesystem path to the chart referenced by hr.
-// The caller is responsible for cleanup (chart paths inside the cache
-// are reused across calls; paths inside the tmp dir are not).
+// LocateChart returns a chart path within a local source artifact.
+// The artifact owner controls the path's lifetime.
 func (c *Client) LocateChart(hr *manifest.HelmRelease) (string, error) {
 	if hr == nil {
 		return "", errors.New("nil HelmRelease")
@@ -284,10 +250,14 @@ func (c *Client) LocateChart(hr *manifest.HelmRelease) (string, error) {
 	switch hr.Chart.RepoKind {
 	case manifest.KindGitRepository, manifest.KindBucket, manifest.KindExternalArtifact:
 		return c.locateLocalChart(hr)
-	case manifest.KindOCIRepository:
-		return c.locateOCIChart(hr)
-	case manifest.KindHelmChart:
-		return c.locateHelmChart(hr)
+	case manifest.KindOCIRepository, manifest.KindHelmChart:
+		art := c.resolveLocalSource(hr)
+		if art == nil || art.LocalPath == "" {
+			return "", fmt.Errorf("%w: %s %s artifact not available for HelmRelease %s",
+				manifest.ErrObjectNotFound, hr.Chart.RepoKind, hr.Chart.RepoFullName(), hr.Named().NamespacedName())
+		}
+		name, err := chartPathInFS(os.DirFS(art.LocalPath))
+		return filepath.Join(art.LocalPath, name), err
 	case manifest.KindHelmRepository, "":
 		// HelmRepository charts are materialized into a synthetic HelmChart
 		// by the orchestrator's HR controller before render (see
@@ -301,25 +271,39 @@ func (c *Client) LocateChart(hr *manifest.HelmRelease) (string, error) {
 	return "", fmt.Errorf("%w: unsupported chart repo kind %s", manifest.ErrInput, hr.Chart.RepoKind)
 }
 
-// LoadChart resolves and loads the chart into helm's in-memory model.
-// Parsed *chart.Chart values are cached by path — Helm's loader.Load
-// reparses the tgz (and recompiles values.schema.json) on every call,
-// which is a significant render-time hot spot when many HelmReleases
-// share a base chart (bjw-s app-template, podinfo, common-library, …).
-// Path comes from the source cache (a content-addressed blob for HTTP
-// tarballs, a ref-keyed slot for OCI) and is stable across reconciles; the
-// per-path (mtime,size) re-check below guards a mutable OCI re-push.
+// LoadChart caches immutable acquired charts by generation and local charts by path.
 func (c *Client) LoadChart(ctx context.Context, hr *manifest.HelmRelease) (ChartLoadResult, error) {
-	path, err := c.LocateChart(hr)
+	var location string
+	var err error
+	art := c.resolveLocalSource(hr)
+	var input fs.FS
+	if art != nil {
+		input = art.FS
+	}
+	if input != nil {
+		if art.Key == "" {
+			return ChartLoadResult{}, fmt.Errorf("%w: source artifact has no identity", manifest.ErrInput)
+		}
+		switch hr.Chart.RepoKind {
+		case manifest.KindBucket, manifest.KindGitRepository, manifest.KindExternalArtifact:
+			location = path.Clean(hr.Chart.Name)
+		default:
+			location, err = chartPathInFS(input)
+		}
+	} else {
+		location, err = c.LocateChart(hr)
+	}
 	if err != nil {
 		return ChartLoadResult{}, err
 	}
-	// Fast path: already parsed AND the file hasn't been rewritten
-	// since (mtime+size match). Mutable OCI tags re-pushed under the
-	// same name-version land via writeAtomic at the same path, so the
-	// path is a stable string but the underlying bytes may have
-	// changed; without the stat check we'd serve the stale chart.
-	if ch, fp, ok := c.lookupCachedChart(path); ok {
+	cacheKey := location
+	if input != nil {
+		cacheKey = art.Key + "\x00" + location
+	}
+	path := location
+
+	needsFingerprint := c.templateCache != nil || len(hr.ChartValuesFiles) > 0
+	if ch, fp, ok := c.lookupCachedChart(cacheKey); ok && (!needsFingerprint || fp != "") {
 		return ChartLoadResult{Path: path, Chart: cloneChartForRender(ch), Fingerprint: fp}, nil
 	}
 
@@ -327,7 +311,7 @@ func (c *Client) LoadChart(ctx context.Context, hr *manifest.HelmRelease) (Chart
 	// reconciles of the same base chart (bjw-s app-template referenced
 	// by 30+ HRs, podinfo across multiple test envs) issue exactly one
 	// loader.Load instead of N. Distinct paths still parse in parallel.
-	release, err := c.chartLoadLocks.Acquire(ctx, path)
+	release, err := c.chartLoadLocks.Acquire(ctx, cacheKey)
 	if err != nil {
 		return ChartLoadResult{}, err
 	}
@@ -335,33 +319,41 @@ func (c *Client) LoadChart(ctx context.Context, hr *manifest.HelmRelease) (Chart
 
 	// Re-check under the per-path lock — another goroutine may have
 	// populated the cache while we waited.
-	if ch, fp, ok := c.lookupCachedChart(path); ok {
+	ch, fp, cached := c.lookupCachedChart(cacheKey)
+	if cached && (!needsFingerprint || fp != "") {
 		return ChartLoadResult{Path: path, Chart: cloneChartForRender(ch), Fingerprint: fp}, nil
 	}
 
-	ch, err := loader.Load(path)
+	if !cached {
+		if input != nil {
+			ch, err = loadFSChart(input, location)
+		} else {
+			ch, err = loader.Load(path)
+		}
+	}
 	if err != nil {
-		// A truncated/corrupt chart tgz left on disk (process killed
-		// mid-download, fs fault, manual delete-then-recreate) would
-		// otherwise stay sticky-broken — `os.Stat`-based cache-hit
-		// checks in LocateChart see the file, return its path, and we
-		// re-error here on every subsequent run. Removing the file
-		// lets the next reconcile re-pull cleanly.
-		_ = os.Remove(path)
+		if input == nil {
+			_ = os.Remove(path)
+		}
+		if _, ok := errors.AsType[chart.ValidationError](err); ok {
+			err = fmt.Errorf("%w: %w", manifest.ErrInput, err)
+		}
 		return ChartLoadResult{}, fmt.Errorf("load chart %s: %w", path, err)
 	}
-	// Compute the chart fingerprint once per cache-fill so every
-	// subsequent Template call against this path participates in the
-	// template-output cache without re-walking the chart. Skipped
-	// when the template cache is disabled to avoid the (cheap but
-	// nonzero) digest cost for embedders that opted out.
+	// Fingerprinting is needed only for template or values caching. A shared
+	// chart loaded without either can acquire its fingerprint under this path lock.
 	var fingerprint string
-	if c.templateCache != nil {
+	if needsFingerprint {
 		fingerprint = chartFingerprint(ch)
 	}
-	if mtime, size, ok := chartCacheFingerprint(path); ok {
+	mtime, size, ok := int64(0), int64(0), input != nil
+	if input == nil {
+		mtime, size, ok = chartCacheFingerprint(path)
+	}
+	if ok {
 		c.chartMu.Lock()
-		c.chartCache[path] = chartCacheEntry{
+		c.chartCache[cacheKey] = chartCacheEntry{
+			immutable:   input != nil,
 			chart:       ch,
 			mtime:       mtime,
 			size:        size,
@@ -430,13 +422,16 @@ func cloneChartForRender(src *chart.Chart) *chart.Chart {
 // The second return is the chart's content-addressed fingerprint
 // (computed once at cache fill); the template-output cache mixes
 // it into its own key so a stale chart never serves a different
-// chart's render. Empty when the template cache is disabled.
+// chart's render.
 func (c *Client) lookupCachedChart(path string) (*chart.Chart, string, bool) {
 	c.chartMu.RLock()
 	entry, ok := c.chartCache[path]
 	c.chartMu.RUnlock()
 	if !ok {
 		return nil, "", false
+	}
+	if entry.immutable {
+		return entry.chart, entry.fingerprint, true
 	}
 	mtime, size, ok := chartCacheFingerprint(path)
 	if !ok {
@@ -463,7 +458,7 @@ func chartCacheFingerprint(path string) (mtime, size int64, ok bool) {
 	if !info.IsDir() {
 		return info.ModTime().UnixNano(), info.Size(), true
 	}
-	cy, err := os.Stat(filepath.Join(path, chartYamlFilename))
+	cy, err := os.Stat(filepath.Join(path, util.ChartfileName))
 	if err != nil {
 		return 0, 0, false
 	}

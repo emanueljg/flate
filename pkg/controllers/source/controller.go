@@ -17,6 +17,7 @@ import (
 
 	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/controllers/base"
+	"github.com/home-operations/flate/pkg/depwait"
 	"github.com/home-operations/flate/pkg/manifest"
 	src "github.com/home-operations/flate/pkg/source"
 	"github.com/home-operations/flate/pkg/store"
@@ -62,7 +63,7 @@ type FetchOptions struct {
 }
 
 // New constructs a source controller. Register fetchers on the
-// returned struct's Fetchers map before Start.
+// returned struct's Fetchers map before StartLifecycle.
 func New(s *store.Store, t *task.Service) *Controller {
 	return &Controller{
 		Controller: base.New(s, t, "source"),
@@ -71,18 +72,11 @@ func New(s *store.Store, t *task.Service) *Controller {
 }
 
 // Configure installs the post-bootstrap state. Panics if called after
-// Start.
+// StartLifecycle.
 func (c *Controller) Configure(opts FetchOptions) {
 	c.SetFilter(opts.Filter)
 	c.allowMissingSecrets = opts.AllowMissingSecrets
 	c.producers = opts.Producers
-}
-
-// Start registers listeners on the Store. The controller runs until
-// Close is called. The scheduler owns dispatch (via ReconcileNode), so
-// Start only wires lifecycle state — no dispatch listener.
-func (c *Controller) Start(_ context.Context) {
-	c.StartLifecycle()
 }
 
 // suspendedSource reports whether a source object is suspended, via the
@@ -90,12 +84,6 @@ func (c *Controller) Start(_ context.Context) {
 func suspendedSource(obj manifest.BaseManifest) bool {
 	s, _ := obj.(src.Suspendable)
 	return s != nil && s.Suspended()
-}
-
-// HasFetcher reports whether a fetcher is registered for kind.
-func (c *Controller) HasFetcher(kind string) bool {
-	_, ok := c.Fetchers[kind]
-	return ok
 }
 
 // Owns reports whether id is a node this controller reconciles — the dag
@@ -106,7 +94,7 @@ func (c *Controller) HasFetcher(kind string) bool {
 // An id absent from the store still counts as ours — reporting the
 // vanished object is the controller's job.
 func (c *Controller) Owns(id manifest.NamedResource) bool {
-	if !c.HasFetcher(id.Kind) {
+	if _, ok := c.Fetchers[id.Kind]; !ok {
 		return false
 	}
 	obj := c.Store.GetObject(id)
@@ -114,24 +102,24 @@ func (c *Controller) Owns(id manifest.NamedResource) bool {
 }
 
 // ReconcileNode runs id's source fetch under the dag engine, returning the
-// blocked dependency set (always nil — sources have no depwait gates) and
-// whether id ended Ready. The orchestrator's scheduler Dispatcher calls this
-// for source-kind nodes.
-func (c *Controller) ReconcileNode(ctx context.Context, id manifest.NamedResource, drainLevel int) []manifest.NamedResource {
-	return c.DispatchNode(ctx, id, drainLevel,
-		suspendedSource, c.reconcile)
+// blocked Secret dependencies, or nil when the fetch terminalizes. The
+// orchestrator's scheduler Dispatcher calls this for source-kind nodes.
+func (c *Controller) ReconcileNode(ctx context.Context, id manifest.NamedResource, level manifest.DrainLevel) []manifest.NamedResource {
+	return c.DispatchNode(ctx, id, level, base.Dispatch[manifest.BaseManifest]{
+		Suspended: suspendedSource,
+		Reconcile: c.reconcile,
+	})
 }
 
 // reconcile fetches the source artifact via the registered Fetcher and
-// writes the result through base.RunWithStatus so panic recovery,
+// writes the result through base.RunWithStatusOutcome so panic recovery,
 // final status writes, and ErrSourceSkipped routing match the
 // KS/HR controllers' shape. Returning ErrSourceSkipped yields a
-// Ready+"skipped: ..." status; any other error yields Failed.
-func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest) error {
+// Ready+"skipped: ..." status; ErrBlocked parks the fetch for a dependency
+// retry; any other error yields Failed.
+func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest, level manifest.DrainLevel) error {
 	id := obj.Named()
-	// The listener already filtered by registered Kind (see
-	// onObjectAdded), so this Fetchers lookup can't miss; it's cheap and
-	// gives us a typed reference for the rest of the function.
+	// Dispatcher ownership guarantees a fetcher for this kind.
 	fetcher := c.Fetchers[id.Kind]
 	// Existence short-circuit: a source we already fetched in this run
 	// stays fetched. Idempotent re-AddObject (e.g. a parent KS
@@ -153,16 +141,31 @@ func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest) e
 	c.SetPendingUnlessReady(id, "fetching")
 	started := time.Now()
 
-	// Release the worker slot during the fetch so consumers of this
-	// source (KS/HR depwait watchers) can acquire one and make
-	// progress instead of blocking on a fetcher that's itself blocked
-	// on network I/O. Mirrors KS/HR's pattern of yielding around
-	// depwait calls.
+	// Release the worker slot during network I/O so other nodes can progress.
 	var artifact *store.SourceArtifact
 	var fetchErr error
 	c.Tasks.YieldSlot(func() {
 		artifact, fetchErr = fetcher.Fetch(ctx, obj)
 	})
+	// A Kustomization may still emit or patch this Secret. Wait for the
+	// rendered contents; only fall back, fail or skip for a missing Secret
+	// once the scheduler reaches a fixpoint. The wait MUST precede the
+	// fallback so an in-repo Secret takes precedence over the global
+	// registry config.
+	missing, isMissing := errors.AsType[*src.MissingSecretError](fetchErr)
+	if isMissing && level == manifest.DrainNone {
+		c.Store.UpdateStatus(id, store.StatusPending, "waiting for source Secret")
+		return &depwait.ErrBlocked{Deps: []manifest.NamedResource{missing.Secret}}
+	}
+	if isMissing && missing.RetryWithRegistryConfig != nil && !c.producerBacked(fetchErr) {
+		c.Tasks.YieldSlot(func() {
+			artifact, fetchErr = missing.RetryWithRegistryConfig(ctx, missing.RegistryConfig)
+		})
+		// An optional registry retry MUST preserve --allow-missing-secrets skips.
+		if fetchErr != nil && c.allowMissingSecrets {
+			fetchErr = missing
+		}
+	}
 	if fetchErr != nil {
 		c.Logger().Debug("fetch failed", "id", id.String(), "duration", time.Since(started), "err", fetchErr)
 		// Skip a missing auth Secret either when the user asked globally
@@ -178,7 +181,7 @@ func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest) e
 	c.Logger().Debug("fetch complete", "id", id.String(), "duration", time.Since(started), "artifact", artifact != nil)
 	// An ExistenceFetcher returns (nil, nil) — the kind doesn't produce
 	// an on-disk artifact (HelmRepository; OCIRepository when fetching
-	// is disabled). RunWithStatus will still mark Ready so dependsOn
+	// is disabled). RunWithStatusOutcome will still mark Ready so dependsOn
 	// watchers unblock; chart resolution falls through to whichever
 	// mechanism actually serves the chart.
 	if artifact != nil {
@@ -194,10 +197,10 @@ func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest) e
 // the Secret identity; a missing-secret error that isn't that type (or whose
 // Secret has no producer) is not producer-backed.
 func (c *Controller) producerBacked(err error) bool {
-	var mse *src.MissingSecretError
-	if !errors.As(err, &mse) {
+	mse, ok := errors.AsType[*src.MissingSecretError](err)
+	if !ok {
 		return false
 	}
-	_, ok := c.producers.Producer(mse.Secret)
+	_, ok = c.producers.Producer(mse.Secret)
 	return ok
 }

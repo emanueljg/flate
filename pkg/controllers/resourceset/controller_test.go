@@ -21,7 +21,7 @@ func newController(t *testing.T) (*Controller, *store.Store) {
 	tasks := task.NewBounded(0)
 	c := New(s, tasks, true)
 	c.Configure(Options{})
-	c.Start(context.Background())
+	c.StartLifecycle()
 	t.Cleanup(func() {
 		c.Close()
 		tasks.BlockTillDone()
@@ -36,7 +36,7 @@ func newController(t *testing.T) (*Controller, *store.Store) {
 // kustomization controller test harness.
 func dispatchToFixpoint(t *testing.T, c *Controller, s *store.Store, id manifest.NamedResource) store.StatusInfo {
 	t.Helper()
-	for _, drain := range []int{0, 1, 2} {
+	for _, drain := range []manifest.DrainLevel{manifest.DrainNone, manifest.DrainCascade, manifest.DrainForce} {
 		if blocked := c.ReconcileNode(context.Background(), id, drain); len(blocked) == 0 {
 			break
 		}
@@ -241,5 +241,59 @@ func TestWantsDrainRerun_NamedOnly(t *testing.T) {
 	// Unknown id → false.
 	if c.WantsDrainRerun(manifest.NamedResource{Kind: manifest.KindResourceSet, Name: "ghost"}) {
 		t.Error("WantsDrainRerun = true for an absent RS, want false")
+	}
+}
+
+func TestReconcile_AlreadyReady_NoTransientPending(t *testing.T) {
+	c, s := newController(t)
+	rs := &manifest.ResourceSet{Name: "ready", Namespace: "apps", ResourcesTemplate: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: output}`}
+	s.AddObject(rs)
+	if info := dispatchToFixpoint(t, c, s, rs.Named()); info.Status != store.StatusReady {
+		t.Fatalf("first status = %+v, want Ready", info)
+	}
+	artifact := s.GetArtifact(rs.Named())
+	unsub := s.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
+		if id == rs.Named() && payload.(store.StatusInfo).Status == store.StatusPending {
+			t.Error("already-Ready ResourceSet transiently became Pending")
+		}
+	}, false)
+	t.Cleanup(unsub)
+	c.ReconcileNode(t.Context(), rs.Named(), manifest.DrainNone)
+	if info, _ := s.GetStatus(rs.Named()); info.Status != store.StatusReady {
+		t.Errorf("final status = %+v, want Ready", info)
+	}
+	if s.GetArtifact(rs.Named()) != artifact {
+		t.Error("no-op reconcile replaced artifact")
+	}
+}
+
+func TestReconcile_DisabledUsesSuspensionGate(t *testing.T) {
+	for _, value := range []string{fluxopv1.DisabledValue, "DISABLED"} {
+		t.Run(value, func(t *testing.T) {
+			c, s := newController(t)
+			doc := map[string]any{
+				"apiVersion": fluxopv1.GroupVersion.String(), "kind": manifest.KindResourceSet,
+				"metadata": map[string]any{"name": "disabled", "namespace": "default", "annotations": map[string]any{fluxopv1.ReconcileAnnotation: value}},
+				"spec":     map[string]any{"inputsFrom": []any{map[string]any{"name": "missing"}}, "resourcesTemplate": "<< inputs.missing >>"},
+			}
+			obj, _, _, err := manifest.ParseDoc(doc, manifest.ParseDocOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.AddObject(obj)
+			blocked := c.ReconcileNode(t.Context(), obj.Named(), manifest.DrainNone)
+			if len(blocked) != 0 {
+				t.Fatalf("disabled ResourceSet blocked on %v", blocked)
+			}
+			info, _ := s.GetStatus(obj.Named())
+			if info.Status != store.StatusReady || info.Message != store.MsgSuspended {
+				t.Fatalf("status = %+v, want Ready/suspended", info)
+			}
+			if art := s.GetArtifact(obj.Named()); art != nil {
+				t.Fatalf("disabled ResourceSet rendered: %v", art)
+			}
+		})
 	}
 }

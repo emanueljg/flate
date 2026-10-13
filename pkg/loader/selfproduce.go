@@ -3,336 +3,381 @@ package loader
 import (
 	"cmp"
 	"fmt"
-	"os"
+	"io/fs"
+	"iter"
+	"log/slog"
+	"maps"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/safepath"
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// SelfProduceIndex maps a ConfigMap id (kind + resolved namespace +
-// name) to the Flux Kustomization(s) whose OWN render subtree emits it.
-//
-// It exists for one job: let collectDeps tell a self-substitute apart
-// from a cross-KS substituteFrom. A Kustomization that renders the very
-// ConfigMap it lists in postBuild.substituteFrom (the bjw-s/onedr0p
-// `cluster-apps` → `cluster-settings` pattern: a bare-dir spec.path whose
-// subdir bases pull in a component defining the CM) must NOT hard-wait on
-// that CM — no other reconcile can produce it, so depwait would deadlock
-// the consumer against its own render. A CM produced by a DIFFERENT KS,
-// or genuinely absent, is left out of this index so its dependency edge
-// stays and still fails loudly.
-//
-// Built once per Bootstrap (in discovery.Run) and read-only afterwards.
-type SelfProduceIndex struct {
-	byID map[manifest.NamedResource][]manifest.NamedResource
-	// emissionParentByFile: cross-tree base ks.yaml path → its single emitting
-	// parent KS. See EmissionParentByFile.
-	emissionParentByFile map[string]manifest.NamedResource
-	// filesByKS: every file the walk reads (each layer's kustomization
-	// file plus every resource file) → the top-level Kustomization(s)
-	// that reached it. Unlike the prefix claim index, this follows the
-	// actual resources:/components: graph, so it also covers a
-	// resources: escape outside every claimed spec.path. See OwnersOfFile.
-	filesByKS map[string][]manifest.NamedResource
-}
-
-// ProducedBy returns the Kustomizations whose render subtree emits cm.
-// Nil-safe: a nil index (no repoRoot, stripped-down tests) produces no
-// matches, so collectDeps falls back to the always-add edge behavior.
-func (i *SelfProduceIndex) ProducedBy(cm manifest.NamedResource) []manifest.NamedResource {
-	if i == nil {
-		return nil
-	}
-	return i.byID[cm]
-}
-
-// OwnersOfFile returns the top-level Kustomization(s) whose render
-// subtree reads file, regardless of whether file falls under any
-// claimed spec.path. Used by change.ownershipIndex to supplement the
-// prefix claim index with resources: reads a prefix match alone can't
-// see (#833) — including a file another KS also claims by prefix.
-// Multiple owners are possible when peer overlays share a base.
-// Nil-safe.
-func (i *SelfProduceIndex) OwnersOfFile(file string) []manifest.NamedResource {
-	if i == nil {
-		return nil
-	}
-	// A directory key exists only for a resources: entry whose directory is
-	// gone, so a parent hit means file was deleted with it. Union it with any
-	// exact hit: a peer KS may claim the file directly while another owns the
-	// deleted directory. Clone so the append never mutates the stored slice.
-	owners := slices.Clone(i.filesByKS[file])
-	for dir := path.Dir(file); dir != "." && dir != "/"; dir = path.Dir(dir) {
-		for _, ks := range i.filesByKS[dir] {
-			owners = appendUniqueProducer(owners, ks)
-		}
-	}
-	return owners
-}
-
-// EmissionParentByFile returns the Flux Kustomization whose render subtree emits
-// the ks.yaml at the given repo-relative path, when exactly one does — i.e. a
-// cross-tree kustomize base (apps/base/app-X/ks.yaml pulled in via
-// apps/test/app-X -> ../../base/app-X, applied by cluster-apps with postBuild
-// substitution). discovery.Run gates such a base on that parent so it reconciles
-// the parent's substituted emission, not the raw file. Keyed by FILE so it maps
-// onto the loaded copy's store id regardless of namespace inheritance; nil-safe.
-// See #777.
-func (i *SelfProduceIndex) EmissionParentByFile(file string) (manifest.NamedResource, bool) {
-	if i == nil {
-		return manifest.NamedResource{}, false
-	}
-	p, ok := i.emissionParentByFile[file]
-	return p, ok
-}
-
-// BuildSelfProduceIndex resolves, per Flux Kustomization with a spec.path,
-// which ConfigMaps its own kustomize render emits and in which namespace —
-// by walking the render graph the loader's discovery pass does not attribute
-// to a producer: bare-dir base generation (each immediate subdir holding a
-// kustomization file becomes a base, mirroring Flux's own generator),
-// recursion through `resources:` (files + nested bases) and `components:`,
-// and propagation of each layer's `namespace:` transformer. repoRoot anchors
-// the on-disk reads; an empty repoRoot yields an empty (but usable) index.
-//
-// The same walk doubles as the discovery-time producer scan: when producers is
-// non-nil, every in-repo ExternalSecret / SealedSecret it encounters is
-// recorded as target-Secret → producer, with the same effective-namespace
-// resolution applied to ConfigMaps. This seeds the producer index BEFORE any
-// source fetch (sources reconcile early), so producer-backed auth Secrets can
-// be skipped without --allow-missing-secrets. It rides this walk so it inherits
-// the namespace-transform faithfulness and reads each file once. Producers
-// generated by ResourceSets/kustomize generators, or whose name is rewritten by
-// a namePrefix/nameSuffix, are not covered here — they fall back to the
-// render-time listener (valuesFrom) or fail-loud/the flag (source auth).
-func BuildSelfProduceIndex(s *store.Store, repoRoot string, producers *manifest.ProducerIndex, wipeSecrets bool) *SelfProduceIndex {
-	idx := &SelfProduceIndex{
-		byID:                 map[manifest.NamedResource][]manifest.NamedResource{},
-		emissionParentByFile: map[string]manifest.NamedResource{},
-		filesByKS:            map[string][]manifest.NamedResource{},
-	}
+func (l *Loader) buildRenderers(repoRoot string, producers *manifest.ProducerIndex) {
 	if repoRoot == "" {
-		return idx
+		return
 	}
-	b := &selfProduceBuilder{
-		repoRoot:     repoRoot,
-		dirs:         map[string]cachedDir{},
-		idx:          idx,
-		emittedFiles: map[string][]manifest.NamedResource{},
-		producers:    producers,
-		store:        s,
-		wipeSecrets:  wipeSecrets,
-	}
-	// A KS sourced from a genuine external repo renders that repo's tree, not the
-	// local checkout — walking its spec.path against repoRoot would record it as
-	// producing local ConfigMaps/Secrets it doesn't own (and cascade its skip).
-	// See loader.ExternalSourcedKSIDs.
-	external := ExternalSourcedKSIDs(s, repoRoot)
-	for _, ks := range s.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
-		if ks.Path == "" {
-			continue
-		}
-		if _, skip := external[ks.Named()]; skip {
-			continue
-		}
-		b.walkRoot(ks)
-	}
-	// Keep only files reached through exactly one parent — a base shared by peer
-	// overlays is ambiguous, so add no gate.
-	for file, parents := range b.emittedFiles {
-		if len(parents) == 1 {
-			idx.emissionParentByFile[file] = parents[0]
+	b := &selfProduceBuilder{idx: l.Index,
+		emittedFiles: map[string][]manifest.NamedResource{}, producers: producers,
+		store: l.Store, wipeSecrets: l.Options.WipeSecrets, reader: l.documents,
+		secrets: map[manifest.NamedResource]*manifest.Secret{}}
+	var generators []generatorRecord
+	kss := l.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization)
+	remaining := map[string]struct{}{}
+	for dir, doc := range l.documents.cache {
+		if doc.body != nil && len(doc.body.ConfigMapGenerator)+len(doc.body.SecretGenerator) != 0 {
+			remaining[dir] = struct{}{}
 		}
 	}
-	return idx
+	var standalone []string
+	if len(remaining) != 0 {
+		standalone = l.standaloneRoots(repoRoot, kss)
+	}
+	record := func(v graphVisit) {
+		if v.owner != (manifest.NamedResource{}) {
+			b.idx.Readers[v.coordinate] = appendUniqueProducer(b.idx.Readers[v.coordinate], v.owner)
+		}
+		if v.document != nil {
+			delete(remaining, filepath.Dir(v.file))
+			for _, g := range v.document.ConfigMapGenerator {
+				generators = append(generators, generatorRecord{root: v.root, file: v.file, namespace: cmp.Or(v.namespace, g.Namespace, v.fallback), isConfigMap: true, args: g.GeneratorArgs, owner: v.owner, reader: l.documents})
+			}
+			for _, g := range v.document.SecretGenerator {
+				generators = append(generators, generatorRecord{root: v.root, file: v.file, namespace: cmp.Or(v.namespace, g.Namespace, v.fallback), args: g.GeneratorArgs, owner: v.owner, reader: l.documents})
+			}
+			return
+		}
+		if v.owner != (manifest.NamedResource{}) && v.readable {
+			b.recordProduced(v, l.documents.cache[v.file].objects)
+		}
+	}
+	for v := range l.graphVisits(repoRoot, kss, standalone) {
+		record(v)
+	}
+	if len(remaining) != 0 {
+		for v := range l.graphVisits(repoRoot, nil, l.unreachedGeneratorRoots(repoRoot, remaining)) {
+			record(v)
+		}
+	}
+	l.addGenerated(generators)
+	for _, id := range slices.SortedFunc(maps.Keys(b.secrets), manifest.NamedResource.Compare) {
+		l.Store.AddObject(b.secrets[id])
+	}
+	for id, r := range l.Index.Files() {
+		if id.Kind == manifest.KindKustomization && r.Parent == (manifest.NamedResource{}) {
+			if parents := b.emittedFiles[r.File]; len(parents) == 1 && parents[0] != id {
+				r.Parent = parents[0]
+				l.Index.Records[id] = r
+			}
+		}
+	}
 }
 
-type cachedDir struct {
-	d    kustomizeDirectives
-	file string
-	ok   bool
+func (l *Loader) unreachedGeneratorRoots(repoRoot string, remaining map[string]struct{}) []string {
+	var roots []string
+	for _, dir := range slices.Sorted(maps.Keys(remaining)) {
+		rel, err := filepath.Rel(repoRoot, l.documents.cache[dir].file)
+		if err != nil {
+			continue
+		}
+		owners, _ := l.Index.OwnersOfFile(filepath.ToSlash(rel))
+		if slices.ContainsFunc(owners, func(owner manifest.NamedResource) bool {
+			ks, ok := l.Store.Get[*manifest.Kustomization](owner)
+			if !ok {
+				return false
+			}
+			_, pinned, _ := SourceView(l.Store, ks, repoRoot)
+			return pinned
+		}) {
+			continue
+		}
+		roots = append(roots, filepath.ToSlash(filepath.Dir(rel)))
+	}
+	return roots
+}
+
+func (l *Loader) addGenerated(generators []generatorRecord) {
+	for _, r := range generators {
+		// Generator names are indexed before suffix hashing, including failed inputs.
+		id := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: r.namespace, Name: r.args.Name}
+		if r.isConfigMap {
+			id.Kind = manifest.KindConfigMap
+		}
+		record := l.Index.Records[id]
+		if record.File == "" {
+			record.File = l.fileCoordinate(r.file)
+		}
+		if r.owner != (manifest.NamedResource{}) {
+			record.Renderers = appendUniqueProducer(record.Renderers, r.owner)
+		}
+		l.Index.Records[id] = record
+		obj, err := r.materialize(l.Options.WipeSecrets)
+		if err != nil {
+			slog.Debug("loader: skipping generator input", "file", r.file, "generator", r.args.Name, "error", err)
+			continue
+		}
+		if l.Store.GetObject(id) == nil {
+			l.Store.AddObject(obj)
+		}
+	}
+}
+
+type graphContext struct {
+	root, dir, namespace, fallback string
+}
+
+type graphVisit struct {
+	graphContext
+	file               string
+	prefix, coordinate string
+	owner              manifest.NamedResource
+	peers              []manifest.NamedResource
+	document           *kustomizationDocument
+	readable           bool
+}
+
+// graphVisits projects each source and namespace separately. Visits borrow cached
+// documents; consumers must never mutate them or alter the traversal's sources.
+func (l *Loader) graphVisits(repoRoot string, kss []*manifest.Kustomization, standalone []string) iter.Seq[graphVisit] {
+	return func(yield func(graphVisit) bool) {
+		w := graphWalker{documents: l.documents, visited: map[graphContext]struct{}{}}
+		var scopes map[string][]namespaceContext
+		for _, ks := range kss {
+			if ks.Namespace == "" {
+				scopes = map[string][]namespaceContext{}
+				break
+			}
+		}
+		emit := func(v graphVisit) bool {
+			if scopes != nil {
+				scope := namespaceContext{namespace: v.namespace, fallback: v.fallback}
+				if !slices.Contains(scopes[v.file], scope) {
+					scopes[v.file] = append(scopes[v.file], scope)
+				}
+			}
+			peers := v.peers
+			v.peers = nil
+			if !yield(v) {
+				return false
+			}
+			for _, owner := range peers {
+				v.owner = owner
+				if !yield(v) {
+					return false
+				}
+			}
+			return true
+		}
+		for _, dir := range standalone {
+			if !w.walk(graphVisit{root: repoRoot, dir: dir}, emit) {
+				return
+			}
+		}
+		for _, v := range l.graphRoots(repoRoot, kss, scopes) {
+			clear(w.visited)
+			if d, _ := l.documents.read(filepath.Join(v.root, v.dir)); d != nil {
+				if !w.walk(v, emit) {
+					return
+				}
+				continue
+			}
+			input, name := l.documents.input(filepath.Join(v.root, v.dir))
+			entries, _ := fs.ReadDir(input, name)
+			for _, e := range entries {
+				if e.IsDir() {
+					child := v
+					child.dir = path.Join(v.dir, e.Name())
+					if !w.walk(child, emit) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+func (l *Loader) graphRoots(repoRoot string, kss []*manifest.Kustomization, scopes map[string][]namespaceContext) []graphVisit {
+	var roots []graphVisit
+	grouped := map[graphContext]int{}
+	for _, ks := range kss {
+		if ks.Path == "" && ks.SourceName == "" {
+			continue
+		}
+		root, _, external := SourceView(l.Store, ks, repoRoot)
+		if external {
+			continue
+		}
+		ns := ks.Namespace
+		if ns == "" {
+			if contexts := scopes[l.Index.Records[ks.Named()].Path]; len(contexts) != 0 {
+				ns = cmp.Or(contexts[0].namespace, contexts[0].fallback)
+			}
+		}
+		v := graphVisit{root: root, dir: l.documents.claimBase(root, ks.Path), namespace: ks.TargetNamespace, fallback: cmp.Or(ks.TargetNamespace, ns), owner: ks.Named()}
+		if root != repoRoot {
+			prefix, err := filepath.Rel(repoRoot, root)
+			if err != nil {
+				continue
+			}
+			v.prefix = filepath.ToSlash(prefix)
+		}
+		if i, found := grouped[v.graphContext]; found {
+			roots[i].peers = append(roots[i].peers, v.owner)
+		} else {
+			grouped[v.graphContext] = len(roots)
+			roots = append(roots, v)
+		}
+	}
+	return roots
+}
+
+func (l *Loader) standaloneRoots(repoRoot string, kss []*manifest.Kustomization) []string {
+	roots := map[string]struct{}{}
+	for dir, doc := range l.documents.cache {
+		if doc.body != nil {
+			roots[dir] = struct{}{}
+		}
+	}
+	for _, ks := range kss {
+		root, pinned, _ := SourceView(l.Store, ks, repoRoot)
+		base := l.documents.claimBase(root, ks.Path)
+		delete(roots, filepath.Join(root, base))
+		if pinned {
+			local := filepath.Join(repoRoot, base)
+			prefix := strings.TrimSuffix(local, string(filepath.Separator)) + string(filepath.Separator)
+			for dir := range roots {
+				if dir == local || strings.HasPrefix(dir, prefix) {
+					delete(roots, dir)
+				}
+			}
+		}
+	}
+	for dir, doc := range l.documents.cache {
+		if doc.body == nil {
+			continue
+		}
+		for _, refs := range [][]string{doc.body.Resources, doc.body.Components} {
+			for _, ref := range refs {
+				if child, ok := resolvePath(dir, ref); ok {
+					delete(roots, child)
+				}
+			}
+		}
+	}
+	var dirs []string
+	for dir := range roots {
+		rel, err := filepath.Rel(repoRoot, dir)
+		if err == nil && !safepath.Escaped(rel) {
+			dirs = append(dirs, filepath.ToSlash(rel))
+		}
+	}
+	slices.Sort(dirs)
+	return dirs
+}
+
+// Kustomize graph and transformer references use slash separators on every OS.
+func escapedSlashPath(rel string) bool {
+	rel = path.Clean(rel)
+	return rel == ".." || strings.HasPrefix(rel, "../")
+}
+
+type graphWalker struct {
+	documents documentReader
+	visited   map[graphContext]struct{}
+}
+
+// An outer namespace stays locked across nested bases and components.
+func (w *graphWalker) walk(v graphVisit, yield func(graphVisit) bool) bool {
+	if escapedSlashPath(v.dir) {
+		return true
+	}
+	d, file := w.documents.read(filepath.Join(v.root, v.dir))
+	if d == nil {
+		return true
+	}
+	v.namespace = cmp.Or(v.namespace, d.Namespace)
+	if _, seen := w.visited[v.graphContext]; seen {
+		return true
+	}
+	w.visited[v.graphContext] = struct{}{}
+	v.file, v.document, v.readable = file, d, true
+	v.coordinate = path.Join(v.prefix, v.dir, filepath.Base(file))
+	if !yield(v) {
+		return false
+	}
+	for _, refs := range [][]string{d.Resources, d.Components} {
+		for _, ref := range refs {
+			resolved, ok := resolvePath(v.dir, ref)
+			if !ok {
+				continue
+			}
+			child := v
+			child.dir = filepath.ToSlash(resolved)
+			abs := filepath.Join(v.root, resolved)
+			childDoc, known := w.documents.cache[abs]
+			directory := childDoc.body != nil
+			if !known {
+				input, name := w.documents.input(abs)
+				info, err := fs.Stat(input, name)
+				directory = err == nil && info.IsDir()
+			}
+			if directory {
+				if !w.walk(child, yield) {
+					return false
+				}
+				continue
+			}
+			child.file, child.document = abs, nil
+			child.coordinate = path.Join(v.prefix, filepath.ToSlash(resolved))
+			_, child.readable = resolveDataPath(v.dir, ref)
+			if !yield(child) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 type selfProduceBuilder struct {
-	repoRoot string
-	// dirs memoizes whole-file kustomization reads (namespace / resources /
-	// components) keyed by repo-relative dir, so subtrees shared across the
-	// KS list — every app group's substitutions component, say — are read
-	// once. Discovery is serial, so no lock is needed.
-	dirs map[string]cachedDir
-	idx  *SelfProduceIndex
-	// emittedFiles accumulates each cross-tree-emitted ks.yaml path → the
-	// distinct parents reaching it; resolved to single-parent
-	// emissionParentByFile edges after the walk.
+	reader       documentReader
+	idx          *manifest.DiscoveryIndex
 	emittedFiles map[string][]manifest.NamedResource
-	// producers, when non-nil, receives target-Secret → ExternalSecret /
-	// SealedSecret edges discovered during the same walk. See
-	// BuildSelfProduceIndex.
-	producers *manifest.ProducerIndex
-	// store receives a synthetic placeholder Secret for each producer whose
-	// output keys are statically declared (see synthesizePlaceholderSecret).
-	store *store.Store
-	// wipeSecrets gates the placeholder synthesis — it is a wipe-mode behavior
-	// (a stand-in for a secret flate can't read offline), matching the SOPS
-	// ciphertext wipe; --no-wipe-secrets leaves the secret genuinely absent.
-	wipeSecrets bool
+	producers    *manifest.ProducerIndex
+	store        *store.Store
+	secrets      map[manifest.NamedResource]*manifest.Secret
+	wipeSecrets  bool
 }
 
-// directives returns the (memoized) kustomization directives at the
-// repo-relative dir, plus the repo-relative path of the kustomization file
-// itself; ok is false when no kustomization file is present.
-func (b *selfProduceBuilder) directives(dir string) (kustomizeDirectives, string, bool) {
-	if c, ok := b.dirs[dir]; ok {
-		return c.d, c.file, c.ok
-	}
-	d, file, ok := readKustomizeDirectives(b.repoRoot, dir)
-	b.dirs[dir] = cachedDir{d: d, file: file, ok: ok}
-	return d, file, ok
-}
-
-// walkRoot enumerates the base(s) of a Flux Kustomization's spec.path and
-// walks each. A spec.path that holds a kustomization file is itself the
-// single base; a bare spec.path (no kustomization file — Flux's generator
-// synthesizes one listing the subdirs) contributes each immediate subdir
-// that holds a kustomization file. The root imposes no namespace of its
-// own (Flux's generated kustomization sets only `resources:`); rootNS is
-// the consumer-side fallback for a ConfigMap that no layer ever stamps.
-func (b *selfProduceBuilder) walkRoot(ks *manifest.Kustomization) {
-	id := ks.Named()
-	rootNS := cmp.Or(ks.TargetNamespace, ks.Namespace)
-	specDir := manifest.NormalizeClaimBase(ks.Path)
-	visited := map[string]struct{}{}
-
-	if _, _, ok := b.directives(specDir); ok {
-		b.walkBase(specDir, "", rootNS, id, visited)
-		return
-	}
-	entries, err := os.ReadDir(filepath.Join(b.repoRoot, specDir))
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		sub := path.Join(specDir, e.Name())
-		if _, _, ok := b.directives(sub); ok {
-			b.walkBase(sub, "", rootNS, id, visited)
-		}
-	}
-}
-
-// walkBase walks one kustomize base (or component) at the repo-relative
-// dir, recording the ConfigMaps it emits for ks. parentNS is the namespace
-// inherited from the enclosing layer; baseNS applies the kustomize-faithful
-// rule that the OUTER (ancestor) `namespace:` wins — once an ancestor set
-// one it is locked, so an inner base's directive cannot override it.
-func (b *selfProduceBuilder) walkBase(dir, parentNS, rootNS string, ks manifest.NamedResource, visited map[string]struct{}) {
-	if dir == "" || strings.HasPrefix(dir, "..") {
-		return // outside the repo root — never read
-	}
-	// Key the cycle guard by (dir, inherited namespace): a shared component
-	// (e.g. ../../components/substitutions) is legitimately included by every
-	// app group, each stamping its own `namespace:` — so the SAME dir under a
-	// DIFFERENT inherited namespace produces a DIFFERENT ConfigMap id and must
-	// be walked again. Keying by dir alone would attribute the CM to whichever
-	// group walked the component first.
-	key := dir + "\x00" + parentNS
-	if _, seen := visited[key]; seen {
-		return // cycle / repeated-under-same-namespace guard
-	}
-	visited[key] = struct{}{}
-
-	d, file, ok := b.directives(dir)
-	if !ok {
-		return
-	}
-	b.recordFile(file, ks)
-	baseNS := cmp.Or(parentNS, d.Namespace)
-
-	for _, r := range d.Resources {
-		resolved, ok := resolveResourcePath(dir, r)
-		if !ok {
-			continue
-		}
-		resolved = filepath.ToSlash(resolved)
-		info, err := os.Stat(filepath.Join(b.repoRoot, resolved))
-		if err != nil {
-			// Still attribute the path: a resource deleted from this tree
-			// while its resources: entry remains must resolve to ks in
-			// changed-only mode so the broken reference renders and fails
-			// loud instead of being skipped.
-			b.recordFile(resolved, ks)
-			continue
-		}
-		if info.IsDir() {
-			b.walkBase(resolved, baseNS, rootNS, ks, visited)
-			continue
-		}
-		// File resource — re-impose the stricter, escape-rejecting policy
-		// used for paths that get opened (resolveResourcePath permits
-		// escapes for the dir-descent case only).
-		if _, ok := resolveDataPath(dir, r); !ok {
-			// Escaping file: not opened for content, but still attributed so
-			// changed-only mode keeps ks when it is the only edit (#833).
-			b.recordFile(resolved, ks)
-			continue
-		}
-		b.recordProduced(resolved, baseNS, rootNS, ks)
-	}
-
-	for _, c := range d.Components {
-		resolved, ok := resolveComponentPath(dir, c)
-		if !ok {
-			continue
-		}
-		// A component carries no namespace of its own that wins over the
-		// including base — baseNS flows in as the parent and stays locked.
-		b.walkBase(filepath.ToSlash(resolved), baseNS, rootNS, ks, visited)
-	}
-}
-
-// recordProduced parses one file `resources:` entry and records what it
-// produces: every ConfigMap into the self-produce index, every ExternalSecret /
-// SealedSecret into the producer index (+ a placeholder target Secret), and
-// every SOPS-wiped Secret into the store (see materializeSecret). It rides
-// decodeFileObjects with keepRaw so ExternalSecret / SealedSecret — which parse
-// as RawObject and parseFile drops — are visible, while inheriting the shared
-// parse-error / envsubst filtering, so the recorded ConfigMap set stays
-// identical to the prior parseFile-based recording.
-func (b *selfProduceBuilder) recordProduced(relFile, baseNS, rootNS string, ks manifest.NamedResource) {
-	b.recordFile(relFile, ks)
-	_ = decodeFileObjects(filepath.Join(b.repoRoot, relFile),
-		manifest.ParseDocOptions{WipeSecrets: true}, true,
-		func(obj manifest.BaseManifest) {
-			switch o := obj.(type) {
-			case *manifest.ConfigMap:
-				b.recordConfigMap(o, baseNS, rootNS, ks)
-			case *manifest.Secret:
-				b.materializeSecret(o, baseNS, rootNS)
-			case *manifest.Kustomization:
-				b.recordEmittedKS(relFile, ks)
-			case *manifest.RawObject:
-				b.recordProducer(o, baseNS, rootNS)
+func (b *selfProduceBuilder) recordProduced(v graphVisit, objects []manifest.BaseManifest) {
+	record := func(obj manifest.BaseManifest) {
+		switch o := obj.(type) {
+		case *manifest.ConfigMap, *manifest.Secret:
+			b.recordDataObject(o, v.namespace, v.fallback, v.owner)
+			if s, ok := o.(*manifest.Secret); ok {
+				b.materializeSecret(s, v.namespace, v.fallback)
 			}
-		})
+		case *manifest.Kustomization:
+			b.emittedFiles[v.coordinate] = appendUniqueProducer(b.emittedFiles[v.coordinate], v.owner)
+		case *manifest.RawObject:
+			b.recordProducer(o, v.namespace, v.fallback, v.owner)
+		}
+	}
+	if objects != nil {
+		for _, obj := range objects {
+			record(obj)
+		}
+		return
+	}
+	_ = b.reader.decodeFileObjects(v.file, manifest.ParseDocOptions{WipeSecrets: b.wipeSecrets}, true, record)
 }
 
-// materializeSecret pre-loads an in-repo SOPS-wiped Secret into the store under
-// its rendered namespace, so a Kustomization that substituteFroms a secret its
-// OWN render produces resolves it to placeholders at Prepare time. The
-// cluster-config self-produce pattern hits this: a substitutions component holds
-// cluster-secrets, and the root Kustomization substituteFroms it — but it isn't
-// in the store until that very render runs, so its Prepare-time lookup would
-// otherwise see it absent and flag it unreadable / render its ${VAR}s empty.
-// Like a SOPS secret's keys are knowable though its values aren't (and like a
-// producer's declared keys, see recordProducer), the placeholder copy lets the
-// vars resolve. Scoped to wipe-mode placeholder secrets — a cleartext Secret is
-// left alone — and never clobbers a Secret already in the store.
+// materializeSecret retains SOPS stand-ins under the rendered namespace so
+// self-produced substituteFrom inputs are available before reconciliation.
+// Real Store objects win; the last SOPS Secret replaces earlier stand-ins.
 func (b *selfProduceBuilder) materializeSecret(s *manifest.Secret, baseNS, rootNS string) {
 	ns := cmp.Or(baseNS, s.Namespace, rootNS)
 	if !b.wipeSecrets || b.store == nil || ns == "" {
@@ -341,48 +386,32 @@ func (b *selfProduceBuilder) materializeSecret(s *manifest.Secret, baseNS, rootN
 	if !manifest.ContainsValuePlaceholder(s.StringData) && !manifest.ContainsValuePlaceholder(s.Data) {
 		return
 	}
-	s.Namespace = ns
-	if b.store.GetObject(s.Named()) == nil {
-		b.store.AddObject(s)
+	c := *s
+	c.Namespace = ns
+	if b.store.GetObject(c.Named()) == nil {
+		b.secrets[c.Named()] = &c
 	}
 }
 
-// recordConfigMap attributes cm to ks's self-produce set under its effective
-// namespace: the active transformer (baseNS) wins, then the resource's own,
-// then the consumer-side rootNS fallback (so a namespace-less CM still matches
-// a same-namespace substituteFrom lookup).
-func (b *selfProduceBuilder) recordConfigMap(cm *manifest.ConfigMap, baseNS, rootNS string, ks manifest.NamedResource) {
-	ns := cmp.Or(baseNS, cm.Namespace, rootNS)
-	if ns == "" {
+// Rendered data uses graph namespace, then authored namespace, then consumer fallback.
+func (b *selfProduceBuilder) recordDataObject(obj manifest.BaseManifest, baseNS, rootNS string, ks manifest.NamedResource) {
+	id := obj.Named()
+	ns := cmp.Or(baseNS, id.Namespace, rootNS)
+	if ns == "" || ks == (manifest.NamedResource{}) {
 		return
 	}
-	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: ns, Name: cm.Name}
-	b.idx.byID[id] = appendUniqueProducer(b.idx.byID[id], ks)
-}
-
-// recordFile attributes relFile to ks in SelfProduceIndex.filesByKS (see
-// OwnersOfFile). Called for every file the walk reads, regardless of
-// what it parses as.
-func (b *selfProduceBuilder) recordFile(relFile string, ks manifest.NamedResource) {
-	if relFile == "" {
-		return
-	}
-	b.idx.filesByKS[relFile] = appendUniqueProducer(b.idx.filesByKS[relFile], ks)
-}
-
-// recordEmittedKS notes that ks's render subtree reaches a Flux Kustomization
-// defined at relFile — i.e. ks emits that cross-tree base. Accumulated per file;
-// resolved to a single-parent gate after the walk (see EmissionParentByFile).
-func (b *selfProduceBuilder) recordEmittedKS(relFile string, ks manifest.NamedResource) {
-	b.emittedFiles[relFile] = appendUniqueProducer(b.emittedFiles[relFile], ks)
+	id.Namespace = ns
+	r := b.idx.Records[id]
+	r.Renderers = appendUniqueProducer(r.Renderers, ks)
+	b.idx.Records[id] = r
 }
 
 // recordProducer records the target(s) a producer generates — the Secret an
 // ExternalSecret / SealedSecret materializes, or the Secret + ConfigMap an
 // ObjectBucketClaim's provisioner creates — each re-keyed under the producer's
 // effective namespace so it matches a consumer's same-namespace lookup.
-// Non-producer kinds and a nil index are no-ops.
-func (b *selfProduceBuilder) recordProducer(raw *manifest.RawObject, baseNS, rootNS string) {
+// Non-producer kinds are no-ops. Ownership is recorded before rendering.
+func (b *selfProduceBuilder) recordProducer(raw *manifest.RawObject, baseNS, rootNS string, ks manifest.NamedResource) {
 	for _, target := range manifest.ProducerTargets(raw) {
 		ns := cmp.Or(baseNS, target.Namespace, rootNS)
 		if ns == "" {
@@ -390,29 +419,34 @@ func (b *selfProduceBuilder) recordProducer(raw *manifest.RawObject, baseNS, roo
 		}
 		target.Namespace = ns
 		b.producers.Record(target.NamedResource, raw.Named())
+		producer := raw.Named()
+		projected := producer
+		projected.Namespace = ns
+		for _, producer := range []manifest.NamedResource{producer, projected} {
+			if ks == (manifest.NamedResource{}) {
+				continue
+			}
+			r := b.idx.Records[producer]
+			r.DeclarationOwners = appendUniqueProducer(r.DeclarationOwners, ks)
+			b.idx.Records[producer] = r
+		}
 		if len(target.DeclaredKeys) > 0 && target.Kind == manifest.KindSecret {
 			b.synthesizePlaceholderSecret(target.NamedResource, target.DeclaredKeys)
 		}
 	}
 }
 
-// synthesizePlaceholderSecret materializes a stand-in Secret for a producer
-// target whose output keys are statically declared but whose values flate can't
-// read offline — so its ${VAR}s (postBuild substituteFrom) and valuesFrom keys
-// resolve to ..PLACEHOLDER_<key>.. instead of the empty string, the same shape
-// flate gives a SOPS-encrypted Secret. It never clobbers a real or SOPS-wiped
-// Secret already loaded under the same id (a producer materializing a secret
-// that ALSO ships in-repo is the in-repo copy's call); the GetObject guard plus
-// AddObject's identical-value dedup keep the repeated walk idempotent.
+// synthesizePlaceholderSecret retains declared keys for offline substitution.
+// Existing Store objects and collected stand-ins take precedence.
 func (b *selfProduceBuilder) synthesizePlaceholderSecret(target manifest.NamedResource, keys []string) {
-	if !b.wipeSecrets || b.store == nil || b.store.GetObject(target) != nil {
+	if !b.wipeSecrets || b.store == nil || b.store.GetObject(target) != nil || b.secrets[target] != nil {
 		return
 	}
 	stringData := make(map[string]any, len(keys))
 	for _, k := range keys {
 		stringData[k] = fmt.Sprintf(manifest.ValuePlaceholderTemplate, k)
 	}
-	b.store.AddObject(&manifest.Secret{Name: target.Name, Namespace: target.Namespace, StringData: stringData})
+	b.secrets[target] = &manifest.Secret{Name: target.Name, Namespace: target.Namespace, StringData: stringData}
 }
 
 func appendUniqueProducer(dst []manifest.NamedResource, v manifest.NamedResource) []manifest.NamedResource {

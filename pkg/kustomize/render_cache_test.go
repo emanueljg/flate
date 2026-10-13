@@ -3,11 +3,18 @@ package kustomize
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/store"
 )
 
 var demoRawSpec = map[string]any{
@@ -30,7 +37,7 @@ func TestRenderFlux_CacheHitMissInvalidate(t *testing.T) {
 	cache.SetRenderCache(t.TempDir(), 1<<30)
 	ctx := context.Background()
 
-	out1, err := RenderFlux(ctx, cache, root, false, ".", demoRawSpec)
+	out1, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: false, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("first render: %v", err)
 	}
@@ -50,7 +57,7 @@ func TestRenderFlux_CacheHitMissInvalidate(t *testing.T) {
 		t.Fatal("first render did not populate the cache")
 	}
 	cache.render.put(key, snap, []byte("SENTINEL\n"))
-	out2, err := RenderFlux(ctx, cache, root, false, ".", demoRawSpec)
+	out2, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: false, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("second render: %v", err)
 	}
@@ -64,7 +71,7 @@ func TestRenderFlux_CacheHitMissInvalidate(t *testing.T) {
 		[]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\ndata:\n  k: v2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out3, err := RenderFlux(ctx, cache, root, false, ".", demoRawSpec)
+	out3, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: false, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("post-edit render: %v", err)
 	}
@@ -93,7 +100,7 @@ func TestRenderFlux_SourceignoreContentInvalidates(t *testing.T) {
 	cache.SetRenderCache(cacheDir, 1<<30)
 	ctx := context.Background()
 
-	out1, err := RenderFlux(ctx, cache, root, true /* applyIgnore */, ".", demoRawSpec)
+	out1, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: true, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("first render: %v", err)
 	}
@@ -109,7 +116,7 @@ func TestRenderFlux_SourceignoreContentInvalidates(t *testing.T) {
 
 	cache = NewTreeCache()
 	cache.SetRenderCache(cacheDir, 1<<30)
-	out2, err := RenderFlux(ctx, cache, root, true, ".", demoRawSpec)
+	out2, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: true, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("second render: %v", err)
 	}
@@ -133,7 +140,7 @@ func TestRenderFlux_DisabledCacheUnchanged(t *testing.T) {
 
 	rootA := writeTree(t, files)
 	plain := NewTreeCache()
-	outPlain, err := RenderFlux(ctx, plain, rootA, false, ".", demoRawSpec)
+	outPlain, err := RenderFlux(ctx, plain, RenderRequest{Label: rootA, ApplyIgnore: false, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("plain render: %v", err)
 	}
@@ -141,7 +148,7 @@ func TestRenderFlux_DisabledCacheUnchanged(t *testing.T) {
 	rootB := writeTree(t, files)
 	cached := NewTreeCache()
 	cached.SetRenderCache(t.TempDir(), 1<<30)
-	outCached, err := RenderFlux(ctx, cached, rootB, false, ".", demoRawSpec)
+	outCached, err := RenderFlux(ctx, cached, RenderRequest{Label: rootB, ApplyIgnore: false, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("cached render: %v", err)
 	}
@@ -188,5 +195,65 @@ func TestDecodeFrame_RejectsMalformed(t *testing.T) {
 	// Header claims 10 snapshot bytes but only 1 follows.
 	if _, _, err := decodeFrame([]byte{0, 0, 0, 10, 'x'}); err == nil {
 		t.Error("an out-of-range header length must error")
+	}
+}
+
+func TestRenderFlux_RemoteNotCached(t *testing.T) {
+	var version atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: remote-v%d}\n", version.Load())
+	}))
+	t.Cleanup(srv.Close)
+	root := writeTree(t, map[string]string{"kustomization.yaml": existingKustomization(srv.URL + "/cm.yaml")})
+	cacheDir := t.TempDir()
+	for _, v := range []int64{1, 2} {
+		version.Store(v)
+		cache := NewTreeCache()
+		cache.SetRenderCache(cacheDir, 1<<20)
+		out, err := RenderFlux(t.Context(), cache, RenderRequest{Label: root, SubPath: ".", Spec: demoRawSpec})
+		if err != nil || !strings.Contains(string(out), fmt.Sprintf("name: remote-v%d", v)) {
+			t.Fatalf("remote version %d: %s, %v", v, out, err)
+		}
+	}
+}
+
+func TestRenderKey_VersionedSalt(t *testing.T) {
+	files := map[string]string{"kustomization.yaml": existingKustomization("cm.yaml"), "cm.yaml": cmYAML("fresh")}
+	root := writeTree(t, files)
+	oldKey := manifest.Fingerprint(struct {
+		Spec       map[string]any
+		SourceRoot string
+		SubPath    string
+		Ignore     string
+	}{demoRawSpec, root, ".", ""})
+	want := manifest.Fingerprint(struct {
+		Spec       map[string]any
+		SourceRoot string
+		SubPath    string
+		Ignore     string
+		Version    string
+	}{demoRawSpec, root, ".", "", "render-fs-v3"})
+	if got := renderKey(demoRawSpec, root, ".", ""); got != want {
+		t.Errorf("render key salt changed: got %s, want %s", got, want)
+	}
+	for _, origin := range []string{"disk", "artifact"} {
+		t.Run(origin, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			cache := NewTreeCache()
+			cache.SetRenderCache(cacheDir, 1<<20)
+			req := RenderRequest{Label: root, SubPath: ".", Spec: demoRawSpec}
+			key := oldKey
+			if origin == "artifact" {
+				req.Source = &store.SourceArtifact{Key: "pin", FS: memoryTree(t, files)}
+				key = manifest.Fingerprint([]string{oldKey, "pin", "render-fs-v2"})
+			}
+			cache.render.put(key, readSetSnapshot{}, []byte("STALE"))
+			cache = NewTreeCache()
+			cache.SetRenderCache(cacheDir, 1<<20)
+			out, err := RenderFlux(t.Context(), cache, req)
+			if err != nil || !strings.Contains(string(out), "name: fresh") {
+				t.Fatalf("persisted old key reused: %s, %v", out, err)
+			}
+		})
 	}
 }

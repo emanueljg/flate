@@ -1,0 +1,30 @@
+package git
+
+import (
+	"testing"
+
+	"github.com/home-operations/flate/pkg/manifest"
+)
+
+func BenchmarkResolveLocal(b *testing.B) {
+	root, _, _, _ := localFixture(b)
+	for _, name := range []string{"HEAD", "Cold", "Warm"} {
+		b.Run(name, func(b *testing.B) {
+
+			tag := "v1.0.0"
+			if name == "HEAD" {
+				tag = "v2.0.0"
+			}
+			repositories := []*manifest.GitRepository{localSource(manifest.GitRepositoryRef{Tag: tag})}
+			if _, err := ResolveLocal(b.Context(), root, repositories); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ResolveLocal(b.Context(), root, repositories); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

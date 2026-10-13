@@ -23,6 +23,7 @@ package schedule
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 
@@ -44,38 +45,33 @@ const (
 	OutcomeTerminal Outcome = iota
 	// OutcomeBlocked means the body could not proceed because one or more
 	// dependencies are unsatisfied; the scheduler parks the node keyed on the
-	// returned ids and re-runs it when any advances.
+	// returned ids and re-runs it when any advances. Blocked bodies MUST gate
+	// before publishing: emit-before-block feedback cannot be distinguished
+	// from unchanged dependency retries and is outside the convergence guard.
 	OutcomeBlocked
-)
-
-// Drain levels passed to Dispatcher.Dispatch. 0 is normal operation; the
-// scheduler escalates only at the structural fixpoint (nothing in flight,
-// nodes still parked).
-const (
-	// DrainNone: normal operation — an unsatisfiable dependency parks.
-	DrainNone = 0
-	// DrainCascade: an absent dependency (and a never-true ReadyExpr)
-	// terminalizes as a failure; a present-but-Pending dependency still
-	// parks, so a dangling chain fails leaf-first and each level cascades
-	// the child's real terminal message upward.
-	DrainCascade = 1
-	// DrainForce: a present-but-Pending dependency ALSO terminalizes ("not
-	// ready"). Reached only when a DrainCascade pass made no progress — i.e.
-	// a cross-kind structural cycle the same-kind preflight detector cannot
-	// represent; forcing the failure breaks it.
-	DrainForce = 2
+	// OutcomeDependencyFailed is terminal for this attempt, with dependency
+	// identities retained so actual Ready progress can reconsider the failure.
+	OutcomeDependencyFailed
+	// OutcomeTerminalNoop is terminal with no object arrivals from this body.
+	// Selector clients may use it for verified dedup no-ops; ambiguous results
+	// MUST remain OutcomeTerminal for conservative replay accounting.
+	OutcomeTerminalNoop
 )
 
 // Dispatcher runs a node's reconcile body. The orchestrator supplies the
 // concrete implementation, closing over the store and the three controllers;
 // the scheduler never sees a store or controller type.
+// The returned blocked slice MUST NOT be mutated by the dispatcher after return;
+// the scheduler retains it until the node's next completion with a different
+// blocker set.
 type Dispatcher interface {
 	// Dispatch invokes id's reconcile body synchronously on the calling
 	// goroutine (a task.Service worker) and reports back:
-	//   - out: OutcomeTerminal or OutcomeBlocked.
-	//   - blocked: unsatisfied dependency ids (non-nil only when Blocked).
-	// drainLevel is one of DrainNone/DrainCascade/DrainForce.
-	Dispatch(ctx context.Context, id NodeID, drainLevel int) (out Outcome, blocked []NodeID)
+	//   - out: OutcomeTerminal, OutcomeTerminalNoop, OutcomeBlocked, or OutcomeDependencyFailed.
+	//   - blocked: unsatisfied or failed dependency ids for the latter two outcomes.
+	//   - rerun: re-evaluate this node at the structural fixpoint.
+	// drainLevel is one of manifest.DrainNone/manifest.DrainCascade/manifest.DrainForce.
+	Dispatch(ctx context.Context, id NodeID, drainLevel manifest.DrainLevel) (out Outcome, blocked []NodeID, rerun bool)
 }
 
 type nodeState uint8
@@ -87,18 +83,61 @@ const (
 	stateTerminal
 )
 
+// Bound content-driven feedback per node while leaving dependency retries free
+// to propagate through arbitrarily long dependency chains.
+const maxRedispatches = 32
+
+type edgeIdx map[NodeID]map[NodeID]struct{}
+
+func (e edgeIdx) add(dep, id NodeID) {
+	set := e[dep]
+	if set == nil {
+		set = map[NodeID]struct{}{}
+		e[dep] = set
+	}
+	set[id] = struct{}{}
+}
+
+func (e edgeIdx) del(dep, id NodeID) {
+	set := e[dep]
+	delete(set, id)
+	if len(set) == 0 {
+		delete(e, dep)
+	}
+}
+
+type failedMark struct {
+	check uint64
+	next  *failedMark
+}
+
 type node struct {
-	id        NodeID
-	state     nodeState
-	blockedOn []NodeID // deps recorded at the last OutcomeBlocked
+	id           NodeID
+	state        nodeState
+	blockedOn    []NodeID // deps recorded at the last OutcomeBlocked
+	redispatches int
+	failedOn     []NodeID // unique dependencies; borrowed dispatcher slices MUST stay immutable
+	failedSeen   map[NodeID]*failedMark
+	failedFree   *failedMark
+	failedCheck  uint64
+	startedAt    uint64
+	readyAt      uint64
+	// Unrelated progress permits only one free retry per unchanged blocker set.
+	conservativeUsed bool
 	// rerunRequested is set when a wake arrives while the node is running, so
 	// complete() re-queues it once instead of dropping the wake (the re-run
 	// re-reads the store and re-evaluates its gate against current state).
 	rerunRequested bool
+	// Content, dependency recovery and selector productivity coalesce into one charge
+	// for the next execution, including a free runnable execution upgraded by
+	// a later arrival. queuedCharged is consumed when dispatch starts.
+	contentRequested bool
+	productive       bool
+	queuedCharged    bool
 	// rerun marks a node that re-runs at the structural fixpoint — a
 	// ResourceSet whose selector-only inputsFrom has no nameable producer to
 	// park on, so it must re-expand once the store has quiesced. Set from the
-	// scheduler's rerunAtDrain predicate after the node's first dispatch.
+	// Dispatcher after every reconcile body.
 	rerun bool
 }
 
@@ -109,31 +148,28 @@ type Scheduler struct {
 	tasks *task.Service
 	disp  Dispatcher
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	nodes     map[NodeID]*node
-	runq      []NodeID
-	parkedIdx map[NodeID]map[NodeID]struct{} // dep id -> set of nodes parked on it
-	inFlight  int                            // count of stateRunning nodes (EXCLUDES parked)
-	draining  int                            // DrainNone/DrainCascade/DrainForce
-	canceled  bool
+	mu    sync.Mutex
+	cond  *sync.Cond
+	nodes map[NodeID]*node
+	runq  []NodeID
+	// Wake snapshots are shared only while mu is held.
+	waiters   []NodeID
+	parkedIdx edgeIdx // dep id -> set of nodes parked on it
+	failedIdx edgeIdx // dep id -> terminal dependency failures
+	// One overwriteable witness preserves unknown-ID registration evidence.
+	untracked   NodeID
+	untrackedAt uint64
+	generation  uint64
+	inFlight    int                 // count of stateRunning nodes (EXCLUDES parked)
+	draining    manifest.DrainLevel // manifest.DrainNone/manifest.DrainCascade/manifest.DrainForce
+	err         error
 	// dirty records that an object arrived since the last quiescence sweep. A
 	// rerun node re-expands at the structural fixpoint only when the store has
 	// grown since it last ran; the sweep clears dirty, so a sweep that produces
 	// nothing new (every re-render a dedup no-op) leaves it clear and the run
 	// terminates. Arrivals are finite and monotone, so sweeps are bounded.
 	dirty bool
-	// rerunAtDrain reports whether a node wants to re-run at the fixpoint. Set
-	// by the orchestrator (SetRerunAtDrain); evaluated off the hot path in the
-	// dispatch goroutine, never under mu.
-	rerunAtDrain func(NodeID) bool
 }
-
-// SetRerunAtDrain installs the predicate that decides whether a node re-runs at
-// the structural fixpoint (a selector-only ResourceSet, which has no nameable
-// input provider to park on). It is evaluated in the dispatch goroutine after
-// each Dispatch, so it may read the store. Optional — nil means no node reruns.
-func (s *Scheduler) SetRerunAtDrain(fn func(NodeID) bool) { s.rerunAtDrain = fn }
 
 // New constructs a Scheduler that runs bodies on tasks via disp.
 func New(tasks *task.Service, disp Dispatcher) *Scheduler {
@@ -141,7 +177,8 @@ func New(tasks *task.Service, disp Dispatcher) *Scheduler {
 		tasks:     tasks,
 		disp:      disp,
 		nodes:     map[NodeID]*node{},
-		parkedIdx: map[NodeID]map[NodeID]struct{}{},
+		parkedIdx: edgeIdx{},
+		failedIdx: edgeIdx{},
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
@@ -165,15 +202,20 @@ func (s *Scheduler) Seed(ids []NodeID) {
 }
 
 // Run drives the scheduler to a fixpoint, returning when every node is
-// terminal (or ctx is canceled) after the in-flight bodies drain.
-func (s *Scheduler) Run(ctx context.Context) {
+// terminal, ctx is canceled, or a node exceeds its redispatch budget.
+// In-flight bodies drain before returning.
+func (s *Scheduler) Run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
 		select {
 		case <-ctx.Done():
 			s.mu.Lock()
-			s.canceled = true
+			if s.err == nil {
+				s.err = ctx.Err()
+			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
 		case <-stop:
@@ -181,9 +223,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}()
 
 	s.mu.Lock()
-	for !s.canceled {
+	for s.err == nil {
 		// 1. Dispatch the runnable frontier onto the bounded pool.
-		for len(s.runq) > 0 && !s.canceled {
+		for len(s.runq) > 0 && s.err == nil {
 			id := s.runq[0]
 			s.runq = s.runq[1:]
 			n := s.nodes[id]
@@ -191,17 +233,20 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 			n.state = stateRunning
-			n.rerunRequested = false
+			n.startedAt = s.generation
+			n.queuedCharged = false
 			n.blockedOn = nil
 			s.inFlight++
 			level := s.draining
 			s.mu.Unlock()
-			s.tasks.Go(ctx, "schedule/"+id.String(), func(ctx context.Context) {
-				out, blocked := s.disp.Dispatch(ctx, id, level)
-				rerun := s.rerunAtDrain != nil && s.rerunAtDrain(id)
+			s.tasks.Go(runCtx, "schedule/"+id.String(), func(ctx context.Context) {
+				out, blocked, rerun := s.disp.Dispatch(ctx, id, level)
 				s.complete(id, out, blocked, rerun)
 			})
 			s.mu.Lock()
+		}
+		if s.err != nil {
+			break
 		}
 		// 2. Frontier empty. If nothing is in flight, we are at a fixpoint:
 		//    either done, or the remaining parked nodes are unproducible and
@@ -227,10 +272,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 			// mid-cascade, because a terminalize that wakes a waiter pushes it
 			// to runq before the loop re-checks inFlight — so reaching here
 			// again means the level made no progress: a cross-kind structural
-			// cycle (same-kind cycles fail earlier at preflight). DrainForce
+			// cycle (same-kind cycles fail earlier at preflight). manifest.DrainForce
 			// fails present-Pending deps, breaking the cycle the way the event
 			// engine's quiescence does; finalSweep is the last-resort backstop.
-			if s.draining >= DrainForce {
+			if s.draining >= manifest.DrainForce {
 				break
 			}
 			s.draining++
@@ -240,11 +285,19 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// 3. Work in flight, frontier empty: wait for a completion or arrival.
 		s.cond.Wait()
 	}
-	if !s.canceled {
+	if s.err == nil {
 		s.finalSweepLocked()
 	}
 	s.mu.Unlock()
+	cancel()
 	s.tasks.BlockTillDone()
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = ctx.Err()
+	}
+	err := s.err
+	s.mu.Unlock()
+	return err
 }
 
 // complete records the result of one Dispatch. Runs on the worker goroutine;
@@ -259,11 +312,110 @@ func (s *Scheduler) complete(id NodeID, out Outcome, blocked []NodeID, rerun boo
 	defer s.cond.Broadcast()
 	n := s.nodes[id]
 	s.inFlight--
-	// Record the node's rerun intent, re-evaluated at each dispatch. The value
-	// is stable per node — a selector-only ResourceSet's rerun status is a fixed
-	// spec property — so each write sets the same value. Read by
-	// requeueRerunLocked at the fixpoint.
+	sameFailed := out == OutcomeDependencyFailed && s.sameFailedLocked(n, blocked)
+	if !sameFailed {
+		n.conservativeUsed = false
+		if out != OutcomeDependencyFailed {
+			s.clearFailedLocked(n)
+		}
+	}
+	if s.err != nil {
+		s.clearFailedLocked(n)
+		n.state = stateTerminal
+		n.conservativeUsed = false
+		return
+	}
 	n.rerun = rerun
+	if out == OutcomeDependencyFailed {
+		if !sameFailed {
+			previous := n.failedOn
+			n.failedOn = blocked
+			if len(previous) <= 2 && len(blocked) <= 2 {
+				if len(blocked) > 1 && blocked[0] == blocked[1] {
+					n.failedOn = slices.Clone(blocked[:1])
+				}
+				for _, dep := range n.failedOn {
+					if len(previous) > 0 && (dep == previous[0] || len(previous) == 2 && dep == previous[1]) {
+						continue
+					}
+					s.failedIdx.add(dep, id)
+				}
+				for _, dep := range previous {
+					if len(n.failedOn) > 0 && (dep == n.failedOn[0] || len(n.failedOn) == 2 && dep == n.failedOn[1]) {
+						continue
+					}
+					s.failedIdx.del(dep, id)
+				}
+				n.failedSeen, n.failedFree = nil, nil
+			} else {
+				if n.failedSeen == nil {
+					n.failedSeen = make(map[NodeID]*failedMark, max(len(previous), len(blocked)))
+					marks := make([]failedMark, max(len(previous), len(blocked))+1)
+					for i := range marks {
+						marks[i].next = n.failedFree
+						n.failedFree = &marks[i]
+					}
+					for _, dep := range previous {
+						n.failedSeen[dep] = n.failedFree
+						n.failedFree = n.failedFree.next
+					}
+				}
+				n.failedCheck++
+				duplicate := false
+				for i, dep := range blocked {
+					mark := n.failedSeen[dep]
+					if mark != nil && mark.check == n.failedCheck {
+						if !duplicate {
+							// Dispatcher slices may be shared; only a private copy is compacted.
+							n.failedOn = make([]NodeID, i, len(blocked))
+							copy(n.failedOn, blocked[:i])
+							duplicate = true
+						}
+						continue
+					}
+					if mark == nil {
+						if n.failedFree == nil {
+							mark = &failedMark{}
+						} else {
+							mark = n.failedFree
+							n.failedFree = mark.next
+						}
+						n.failedSeen[dep] = mark
+						s.failedIdx.add(dep, id)
+					}
+					mark.check = n.failedCheck
+					if duplicate {
+						n.failedOn = append(n.failedOn, dep)
+					}
+				}
+				for _, dep := range previous {
+					mark := n.failedSeen[dep]
+					if mark.check != n.failedCheck {
+						s.failedIdx.del(dep, id)
+						delete(n.failedSeen, dep)
+						mark.next = n.failedFree
+						n.failedFree = mark
+					}
+				}
+			}
+		}
+		// Only progress after dispatch start can race failed-edge registration.
+		if s.generation > n.startedAt {
+			for _, dep := range blocked {
+				d := s.nodes[dep]
+				if (d != nil && d.readyAt > n.startedAt) || (dep == s.untracked && s.untrackedAt > n.startedAt) {
+					n.productive = true
+					n.rerunRequested = true
+					break
+				}
+			}
+		}
+		if !n.rerunRequested && !n.conservativeUsed && s.generation > n.startedAt {
+			n.conservativeUsed = true
+			n.rerunRequested = true
+		}
+	}
+	n.productive = n.productive || rerun && out == OutcomeTerminal
 
 	// A wake landed while this body was running: honor it exactly once by
 	// re-queuing, regardless of the outcome just reported. The re-run
@@ -272,15 +424,12 @@ func (s *Scheduler) complete(id NodeID, out Outcome, blocked []NodeID, rerun boo
 	// re-emit). We do NOT mark it terminal, so a parker never sees a stale
 	// terminal here.
 	if n.rerunRequested {
-		n.rerunRequested = false
-		n.state = stateRunnable
-		n.blockedOn = nil
-		s.runq = append(s.runq, id)
+		s.redispatchLocked(n)
 		return
 	}
 
 	switch out {
-	case OutcomeTerminal:
+	case OutcomeTerminal, OutcomeTerminalNoop, OutcomeDependencyFailed:
 		n.state = stateTerminal
 		n.blockedOn = nil
 		s.wakeWaitersLocked(id)
@@ -294,8 +443,7 @@ func (s *Scheduler) complete(id NodeID, out Outcome, blocked []NodeID, rerun boo
 		// a terminal-Failed dep cascades).
 		for _, dep := range blocked {
 			if d := s.nodes[dep]; d != nil && d.state == stateTerminal {
-				n.state = stateRunnable
-				s.runq = append(s.runq, id)
+				s.redispatchLocked(n)
 				return
 			}
 		}
@@ -305,12 +453,7 @@ func (s *Scheduler) complete(id NodeID, out Outcome, blocked []NodeID, rerun boo
 		n.state = stateParked
 		n.blockedOn = blocked
 		for _, dep := range blocked {
-			set := s.parkedIdx[dep]
-			if set == nil {
-				set = map[NodeID]struct{}{}
-				s.parkedIdx[dep] = set
-			}
-			set[id] = struct{}{}
+			s.parkedIdx.add(dep, id)
 		}
 	}
 }
@@ -322,10 +465,7 @@ func (s *Scheduler) wakeWaitersLocked(depID NodeID) {
 	if len(set) == 0 {
 		return
 	}
-	waiters := make([]NodeID, 0, len(set))
-	for w := range set {
-		waiters = append(waiters, w)
-	}
+	waiters := s.sortedWaiters(set)
 	for _, w := range waiters {
 		n := s.nodes[w]
 		if n == nil {
@@ -340,20 +480,112 @@ func (s *Scheduler) wakeWaitersLocked(depID NodeID) {
 	}
 }
 
+// Caller holds mu; the next wake batch invalidates the snapshot.
+func (s *Scheduler) sortedWaiters(set map[NodeID]struct{}) []NodeID {
+	waiters := slices.Grow(s.waiters[:0], len(set))
+	for waiter := range set {
+		waiters = append(waiters, waiter)
+	}
+	if len(waiters) > 1 {
+		slices.SortFunc(waiters, func(a, b NodeID) int { return a.Compare(b) })
+	}
+	s.waiters = waiters
+	return waiters
+}
+
 // unparkLocked moves a parked node to runnable and removes it from every
 // parkedIdx set it was registered in. Caller holds mu.
 func (s *Scheduler) unparkLocked(n *node) {
-	for _, dep := range n.blockedOn {
-		if set := s.parkedIdx[dep]; set != nil {
-			delete(set, n.id)
-			if len(set) == 0 {
-				delete(s.parkedIdx, dep)
+	s.unparkSelfLocked(n)
+	s.redispatchLocked(n)
+}
+
+func (s *Scheduler) sameFailedLocked(n *node, blocked []NodeID) bool {
+	if len(blocked) < len(n.failedOn) {
+		return false
+	}
+	if len(blocked) == len(n.failedOn) {
+		equal := true
+		for i, dep := range blocked {
+			if dep != n.failedOn[i] {
+				// A replacement can follow a long unchanged prefix; check its edge first.
+				if _, ok := s.failedIdx[dep][n.id]; !ok {
+					return false
+				}
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return true
+		}
+	}
+	count := 0
+	n.failedCheck++
+	var seen uint8
+	for _, dep := range blocked {
+		if _, ok := s.failedIdx[dep][n.id]; !ok {
+			return false
+		}
+		if len(n.failedOn) <= 2 {
+			bit := uint8(1)
+			if dep != n.failedOn[0] {
+				bit = 2
+			}
+			if seen&bit == 0 {
+				seen |= bit
+				count++
+			}
+		} else {
+			// Only registered marks are updated, so duplicate checks never allocate.
+			mark := n.failedSeen[dep]
+			if mark.check != n.failedCheck {
+				mark.check = n.failedCheck
+				count++
 			}
 		}
 	}
-	n.blockedOn = nil
-	n.state = stateRunnable
-	s.runq = append(s.runq, n.id)
+	return count == len(n.failedOn)
+}
+
+func (s *Scheduler) clearFailedLocked(n *node) {
+	for _, dep := range n.failedOn {
+		s.failedIdx.del(dep, n.id)
+	}
+	n.failedOn = nil
+	n.failedSeen, n.failedFree = nil, nil
+}
+
+// Callers bypass idle events to keep the non-inlineable waiter wake path off arrivals.
+func (s *Scheduler) recordProgressLocked(id NodeID) {
+	if s.inFlight == 0 && (len(s.failedIdx) == 0 || len(s.failedIdx[id]) == 0) {
+		return
+	}
+	s.generation++
+	if n := s.nodes[id]; n != nil {
+		n.readyAt = s.generation
+	} else {
+		s.untracked = id
+		s.untrackedAt = s.generation
+	}
+	set := s.failedIdx[id]
+	if len(set) == 0 {
+		return
+	}
+	waiters := s.sortedWaiters(set)
+	for _, waiter := range waiters {
+		n := s.nodes[waiter]
+		switch n.state {
+		case stateTerminal, stateRunnable:
+			n.productive = true
+			if !s.redispatchLocked(n) {
+				return
+			}
+		case stateRunning:
+			n.productive = true
+			n.rerunRequested = true
+		}
+	}
 }
 
 // OnArrival is called from the store's EventObjectAdded subscription (which
@@ -367,9 +599,15 @@ func (s *Scheduler) unparkLocked(n *node) {
 func (s *Scheduler) OnArrival(id NodeID, schedulable bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.err != nil {
+		return
+	}
 	// An arrival can change a rerun node's resolved input set; mark the store
 	// dirty so the next quiescence sweep re-expands rerun nodes.
 	s.dirty = true
+	if !schedulable && (s.inFlight > 0 || len(s.failedIdx) > 0) {
+		s.recordProgressLocked(id)
+	}
 	if n := s.nodes[id]; n == nil {
 		if schedulable {
 			// Render-discovered node: register and queue it.
@@ -379,14 +617,14 @@ func (s *Scheduler) OnArrival(id NodeID, schedulable bool) {
 		// Non-schedulable unknown id (ConfigMap/Secret): fall through to wake
 		// nodes parked on it, but do not register it.
 	} else {
-		switch n.state {
-		case stateTerminal:
-			// Content changed (Refire reset, or a parent re-emitted a mutated
-			// spec): re-run so the new content is reconciled.
-			n.state = stateRunnable
-			s.runq = append(s.runq, id)
-		case stateRunning:
+		n.contentRequested = true
+		if n.state == stateRunning {
 			n.rerunRequested = true
+		} else {
+			if n.state == stateParked {
+				s.unparkSelfLocked(n)
+			}
+			s.redispatchLocked(n)
 		}
 	}
 	// Always wake nodes parked ON id — a node parked on its own emitted child
@@ -395,22 +633,27 @@ func (s *Scheduler) OnArrival(id NodeID, schedulable bool) {
 	s.cond.Broadcast()
 }
 
-// OnStatusWake is called from the store's EventStatusUpdated subscription. It
-// acts only on a TERMINAL store status (Ready or Failed): a parked node gates
-// on Ready/Failed, so intermediate Pending progress writes never change its
-// gate answer and waking on them is pure churn that also widens race windows.
+// OnStatusWake wakes parked nodes on terminal status updates. Store condition
+// writes suppress identical values, so every Ready wake records fresh progress.
 func (s *Scheduler) OnStatusWake(id NodeID, ready, failed bool) {
 	if !ready && !failed {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.err != nil {
+		return
+	}
+	if ready && (s.inFlight > 0 || len(s.failedIdx) > 0) {
+		s.recordProgressLocked(id)
+	}
 	s.wakeWaitersLocked(id)
 	s.cond.Broadcast()
 }
 
 // unparkSelfLocked removes n from every parkedIdx set without queuing it (used
 // when forcibly terminalizing a parked node). Caller holds mu.
+// Reverse-edge deletion MUST stay inline here to bound the OnArrival stack frame.
 func (s *Scheduler) unparkSelfLocked(n *node) {
 	for _, dep := range n.blockedOn {
 		if set := s.parkedIdx[dep]; set != nil {
@@ -464,6 +707,32 @@ func (s *Scheduler) requeueRerunLocked() bool {
 	}
 	slices.SortFunc(due, func(a, b *node) int { return a.id.Compare(b.id) })
 	for _, n := range due {
+		if !s.redispatchLocked(n) {
+			break
+		}
+	}
+	return true
+}
+
+func (s *Scheduler) redispatchLocked(n *node) bool {
+	if s.err != nil {
+		return false
+	}
+	if (n.contentRequested || n.productive) && !n.queuedCharged {
+		if n.redispatches >= maxRedispatches {
+			s.err = fmt.Errorf("schedule: %s exceeded %d redispatches; reconcile did not converge", n.id, maxRedispatches)
+			return false
+		}
+		n.redispatches++
+		n.queuedCharged = true
+	}
+	if n.productive {
+		n.conservativeUsed = false
+	}
+	n.contentRequested = false
+	n.productive = false
+	n.rerunRequested = false
+	if n.state != stateRunnable {
 		n.state = stateRunnable
 		n.blockedOn = nil
 		s.runq = append(s.runq, n.id)
@@ -471,8 +740,8 @@ func (s *Scheduler) requeueRerunLocked() bool {
 	return true
 }
 
-// finalSweepLocked is a defensive backstop: after DrainForce every parked node
-// should have terminalized (DrainForce fails present-Pending deps), so nothing
+// finalSweepLocked is a defensive backstop: after manifest.DrainForce every parked node
+// should have terminalized (manifest.DrainForce fails present-Pending deps), so nothing
 // should remain parked. If a node somehow does, force it terminal so a parked
 // node can never masquerade as a clean run. Caller holds mu.
 func (s *Scheduler) finalSweepLocked() {

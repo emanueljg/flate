@@ -2,9 +2,12 @@ package orchestrator
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
@@ -27,7 +30,7 @@ func TestFailDependsOnCycles_RecordsPreflightFailures(t *testing.T) {
 	// `extra` is an acyclic dep — it must not be marked failed.
 	idExtra := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "extra"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB, idExtra))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.store.AddObject(makeKS("extra", "ns"))
@@ -57,7 +60,7 @@ func TestFailDependsOnCycles_ClearsResolvedCycle(t *testing.T) {
 	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
 	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.failDependsOnCycles()
@@ -78,7 +81,7 @@ func TestFailDependsOnCycles_RefiresResolvedMembers(t *testing.T) {
 	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
 	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.failDependsOnCycles()
@@ -112,7 +115,7 @@ func TestFailDependsOnCycles_RenderEmittedCycle(t *testing.T) {
 	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
 	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	// Bootstrap-time graph: just one acyclic KS. No cycles to break.
 	o.store.AddObject(makeKS("acyclic", "ns"))
 	o.failDependsOnCycles()
@@ -146,7 +149,7 @@ func TestFailDependsOnCycles_RenderEmittedCycle(t *testing.T) {
 // with exactly one id, no batched DFS.
 func TestUpdateDependencyGraphFor_LargeAcyclicAddThenCycle(t *testing.T) {
 	const N = 10000
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 
 	// Chain: ks-0 → ks-1 → ks-2 → ... → ks-(N-1). Pure DAG.
 	ids := make([]manifest.NamedResource, N)
@@ -193,7 +196,7 @@ func TestUpdateDependencyGraphFor_BreaksCycle(t *testing.T) {
 	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
 	idC := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "c"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.updateDependencyGraphFor(idA)
 	o.store.AddObject(makeKS("b", "ns", idC))
@@ -225,7 +228,7 @@ func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
 	idX := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "x"}
 	idY := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "y"}
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(&manifest.HelmRelease{
 		Name: "x", Namespace: "ns",
 		DependsOn: testutil.DepRefs(idY),
@@ -241,5 +244,37 @@ func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
 		if msg, ok := o.preflightFailure(id); !ok || !strings.Contains(msg, "dependency cycle detected") {
 			t.Fatalf("HR %s preflight = %q, %v", id, msg, ok)
 		}
+	}
+}
+
+func TestLogNewCycleMessages_Deterministic(t *testing.T) {
+	var got []string
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == "message" {
+				got = append(got, a.Value.String())
+			}
+			return a
+		},
+	})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	next := make(map[manifest.NamedResource]string)
+	for i, msg := range []string{"cycle-d", "cycle-c", "cycle-b", "cycle-a"} {
+		for _, member := range []string{"a", "b"} {
+			id := manifest.NamedResource{
+				Kind: manifest.KindKustomization, Namespace: "ns", Name: fmt.Sprintf("%d-%s", i, member),
+			}
+			next[id] = msg
+		}
+	}
+	prev := map[manifest.NamedResource]string{
+		{Kind: manifest.KindKustomization, Namespace: "ns", Name: "1-a"}: "cycle-c",
+	}
+	for range 20 {
+		got = nil
+		logNewCycleMessages(prev, next)
+		assert.Diff(t, got, []string{"cycle-d", "cycle-b", "cycle-a"})
 	}
 }

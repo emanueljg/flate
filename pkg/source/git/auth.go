@@ -29,14 +29,14 @@ func (f *Fetcher) resolveAuth(repo *manifest.GitRepository) (transport.AuthMetho
 		return nil, source.MissingSecretErr("GitRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "not found")
 	}
 	if isSSHURL(repo.URL) {
-		identity := source.StringFromSecret(sec, "identity")
-		if identity == "" {
+		identity, _, _ := sec.Value("identity")
+		if identity == "" || manifest.HasValuePlaceholder(identity) {
 			// Empty covers both missing-key and PLACEHOLDER-wiped values
 			// (the ExternalSecret case). Same sentinel so
 			// --allow-missing-secrets covers both shapes.
 			return nil, source.MissingSecretErr("GitRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "missing 'identity' for SSH auth")
 		}
-		password := source.StringFromSecret(sec, "password")
+		password, _, _ := sec.Value("password")
 		user := sshUserFromURL(repo.URL)
 		auth, err := gitssh.NewPublicKeys(user, []byte(identity), password)
 		if err != nil {
@@ -46,7 +46,7 @@ func (f *Fetcher) resolveAuth(repo *manifest.GitRepository) (transport.AuthMetho
 		// enforce strict host-key checking; otherwise skip (offline
 		// renders against ephemeral worktrees are the norm). Users who
 		// need strict checks provide `known_hosts` in the Secret.
-		if kh := source.StringFromSecret(sec, "known_hosts"); kh != "" {
+		if kh, _, _ := sec.Value("known_hosts"); kh != "" && !manifest.HasValuePlaceholder(kh) {
 			cb, herr := knownHostsCallback([]byte(kh))
 			if herr != nil {
 				return nil, fmt.Errorf("%s: parse known_hosts: %w", gitID(repo), herr)
@@ -59,7 +59,7 @@ func (f *Fetcher) resolveAuth(repo *manifest.GitRepository) (transport.AuthMetho
 	}
 	// HTTPS / HTTP: bearerToken takes precedence over basic auth, mirroring
 	// source-controller's docs.
-	if token := source.StringFromSecret(sec, "bearerToken"); token != "" {
+	if token, _, _ := sec.Value("bearerToken"); token != "" && !manifest.HasValuePlaceholder(token) {
 		return &githttp.TokenAuth{Token: token}, nil
 	}
 	username, password, err := source.BasicAuthFromSecret(sec, "GitRepository", repo.Namespace, repo.Name, repo.SecretRef.Name)
@@ -82,8 +82,8 @@ func isSSHURL(url string) bool {
 // "ssh://user@host/repo" forms. Defaults to "git" when absent.
 func sshUserFromURL(url string) string {
 	u := strings.TrimPrefix(url, "ssh://")
-	if at := strings.Index(u, "@"); at > 0 {
-		return u[:at]
+	if user, _, found := strings.Cut(u, "@"); found && user != "" {
+		return user
 	}
 	return "git"
 }

@@ -1,17 +1,20 @@
 package helm
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
+	"sync"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/chart/common"
 	chart "helm.sh/helm/v4/pkg/chart/v2"
+	"helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/cli"
 	release "helm.sh/helm/v4/pkg/release/v1"
 	"sigs.k8s.io/yaml"
 
@@ -19,6 +22,10 @@ import (
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/values"
 )
+
+const sourceHeader = "# Source: "
+
+var envSettings = sync.OnceValue(cli.New)
 
 // Template renders a HelmRelease and returns the rendered manifest as a
 // single YAML string (multiple documents separated by "---" lines).
@@ -37,13 +44,28 @@ func (c *Client) Template(ctx context.Context, hr *manifest.HelmRelease, hrValue
 	if err != nil {
 		return "", err
 	}
+	if hr.UsesDirectOCIRepository() {
+		art := c.resolveLocalSource(hr)
+		if art == nil {
+			return "", fmt.Errorf("track oci chart version: %w: OCIRepository %s artifact not available",
+				manifest.ErrObjectNotFound, hr.Chart.RepoFullName())
+		}
+		version, err := ociChartVersion(loaded.Chart.Metadata.Version, art.Revision)
+		if err != nil {
+			return "", fmt.Errorf("track oci chart version: %w", err)
+		}
+		if !opts.DisableChartDigestTracking {
+			loaded.Chart.Metadata.Version = version
+		}
+		loaded.Fingerprint = ociChartFingerprint(loaded.Fingerprint, art, opts.DisableChartDigestTracking)
+	}
 	caps, err := opts.capabilities()
 	if err != nil {
 		return "", err
 	}
 
 	cfg := new(action.Configuration)
-	if err := cfg.Init(c.envSettings().RESTClientGetter(), hr.ReleaseNamespace(), ""); err != nil {
+	if err := cfg.Init(envSettings().RESTClientGetter(), hr.ReleaseNamespace(), ""); err != nil {
 		return "", fmt.Errorf("helm init: %w", err)
 	}
 	cfg.Capabilities = caps
@@ -58,10 +80,7 @@ func (c *Client) Template(ctx context.Context, hr *manifest.HelmRelease, hrValue
 		deterministic.SeedFor(hr.ReleaseName(), hr.ReleaseNamespace()),
 	)
 
-	inst, disableHooks, err := newInstallAction(cfg, hr, opts, caps)
-	if err != nil {
-		return "", err
-	}
+	inst, disableHooks := newInstallAction(cfg, hr, opts, caps)
 	if hrValues == nil {
 		hrValues = map[string]any{}
 	}
@@ -72,11 +91,11 @@ func (c *Client) Template(ctx context.Context, hr *manifest.HelmRelease, hrValue
 	// (handled internally by helm) → chart-named valuesFiles → HR.Values.
 	finalValues := hrValues
 	if len(hr.ChartValuesFiles) > 0 {
-		base, err := c.mergeChartValuesFiles(loaded.Chart, hr.ChartValuesFiles, hr.IgnoreMissingValuesFiles)
+		base, err := c.mergeChartValuesFiles(loaded, hr.ChartValuesFiles, hr.IgnoreMissingValuesFiles)
 		if err != nil {
 			return "", fmt.Errorf("helm chart valuesFiles %s/%s: %w", hr.Namespace, hr.Name, err)
 		}
-		finalValues = values.DeepMerge(base, hrValues)
+		finalValues = loader.MergeMaps(base, hrValues)
 	}
 
 	// Output cache: the same (chart fingerprint, finalValues, opts,
@@ -89,8 +108,10 @@ func (c *Client) Template(ctx context.Context, hr *manifest.HelmRelease, hrValue
 	var key string
 	if c.templateCache != nil {
 		key = computeTemplateKey(loaded.Fingerprint, loaded.Chart, finalValues, opts, hr)
-		if cached, ok := c.templateCache.Get(key); ok {
-			return cached, nil
+		if key != "" {
+			if cached, ok := c.templateCache.Get(key); ok {
+				return cached, nil
+			}
 		}
 	}
 
@@ -103,15 +124,42 @@ func (c *Client) Template(ctx context.Context, hr *manifest.HelmRelease, hrValue
 		return "", fmt.Errorf("helm template %s/%s: unexpected release type %T", hr.Namespace, hr.Name, rel)
 	}
 
+	// Disabled dependencies must be pruned before validating their CRDs.
+	if opts.SkipCRDs && hr.CRDsPolicy != string(helmv2.Skip) {
+		crds := loaded.Chart.CRDObjects()
+		for _, crd := range crds {
+			docs, err := manifest.DecodeDocs(crdReader(crd))
+			for _, doc := range docs {
+				manifest.ReleaseDoc(doc)
+			}
+			if err != nil {
+				// Full-stream diagnostics preserve Helm's line numbers across CRD files.
+				readers := make([]io.Reader, len(crds))
+				for i, crd := range crds {
+					readers[i] = crdReader(crd)
+				}
+				if _, fullErr := manifest.DecodeDocs(io.MultiReader(readers...)); fullErr != nil {
+					err = fullErr
+				}
+				return "", err
+			}
+		}
+	}
+
 	// spec.test.enable defaults to false; tests only land in the
 	// rendered output when the HR explicitly enables them or the
 	// CLI overrides. CLI --skip-tests always wins.
 	skipTests := opts.SkipTests || hr.Test == nil || !hr.Test.Enable
 	out := releaseManifest(relV1, opts, disableHooks, skipTests)
-	if c.templateCache != nil {
+	if key != "" {
 		c.templateCache.Put(key, out)
 	}
 	return out, nil
+}
+
+func crdReader(crd chart.CRD) io.Reader {
+	return io.MultiReader(strings.NewReader("---\n"+sourceHeader+crd.Filename+"\n"),
+		bytes.NewReader(crd.File.Data), strings.NewReader("\n"))
 }
 
 // schemaValidationSkipped reports whether to bypass helm's values.schema.json
@@ -131,8 +179,8 @@ func schemaValidationSkipped(opts Options, hr *manifest.HelmRelease, values map[
 // renders through, mirroring helm-controller's install/upgrade field
 // wiring. Returns the configured install, the effective disableHooks
 // flag (reused by Template's post-render hook filter so hooks don't
-// leak into the output when disabled), and any kube-version parse error.
-func newInstallAction(cfg *action.Configuration, hr *manifest.HelmRelease, opts Options, caps *common.Capabilities) (*action.Install, bool, error) {
+// leak into the output when disabled).
+func newInstallAction(cfg *action.Configuration, hr *manifest.HelmRelease, opts Options, caps *common.Capabilities) (*action.Install, bool) {
 	inst := action.NewInstall(cfg)
 	inst.DryRunStrategy = action.DryRunClient
 	inst.ReleaseName = hr.ReleaseName()
@@ -143,15 +191,11 @@ func newInstallAction(cfg *action.Configuration, hr *manifest.HelmRelease, opts 
 	// chart resolution) but fails in cluster, or vice versa.
 	inst.Devel = true
 	inst.IncludeCRDs = !opts.SkipCRDs
-	// HR-scoped policy wins: spec.install.crds / spec.upgrade.crds set
-	// to "Skip" suppresses CRDs even when the CLI requests them.
-	// "Create" / "CreateReplace" force them on. An empty policy lets
-	// the CLI flag decide.
-	switch hr.CRDsPolicy {
-	case "Skip":
+	// The CLI skip flag suppresses CRDs regardless of HR policy.
+	// spec.install.crds / spec.upgrade.crds set to "Skip" also suppresses
+	// CRDs when the CLI requests them.
+	if hr.CRDsPolicy == string(helmv2.Skip) {
 		inst.IncludeCRDs = false
-	case "Create", "CreateReplace":
-		inst.IncludeCRDs = true
 	}
 	// HR-scoped install/upgrade.disableHooks OR'd with the CLI flag,
 	// mirroring helm-controller. Either side forces hooks off — and
@@ -181,13 +225,7 @@ func newInstallAction(cfg *action.Configuration, hr *manifest.HelmRelease, opts 
 	inst.PostRenderer = newPostRenderer(hr.PostRenderers)
 	// action.Install consults its own KubeVersion field for chart
 	// compatibility checks and ignores cfg.Capabilities for that purpose.
-	if opts.KubeVersion != "" {
-		kv, err := common.ParseKubeVersion(opts.KubeVersion)
-		if err != nil {
-			return nil, false, fmt.Errorf("parse kube-version %q: %w", opts.KubeVersion, err)
-		}
-		inst.KubeVersion = kv
-	}
+	inst.KubeVersion = &caps.KubeVersion
 	// Same for APIVersions — action.Install under DryRunClient
 	// replaces cfg.Capabilities with a fresh default copy and then
 	// only re-applies inst.APIVersions onto that copy. Setting
@@ -199,32 +237,24 @@ func newInstallAction(cfg *action.Configuration, hr *manifest.HelmRelease, opts 
 	if hr.Chart.Version != "" {
 		inst.Version = hr.Chart.Version
 	}
-	return inst, disableHooks, nil
+	return inst, disableHooks
 }
 
-// mergeChartValuesFiles is the cache-aware entry point: it consults
-// Client.chartValuesCache before re-parsing and stores the canonical
-// merged map on miss. Callers receive a deep clone — downstream
-// layering DeepMerges the result, which may mutate intermediate
-// sub-maps.
-//
-// Cache key = sha256(chart.Name || chart.Version || joined valuesFiles
-// list || ignoreMissing bit). Distinct chart identities (different
-// name or version, e.g. a chart upgrade landing under the same path)
-// produce distinct keys, so a stale entry never serves a different
-// chart's values. ignoreMissing is folded into the key because two
-// HRs with the same (chart, valuesFiles) but different policies must
-// not share — a missing file is an error in one and skipped in the
-// other.
-func (c *Client) mergeChartValuesFiles(ch *chart.Chart, names []string, ignoreMissing bool) (map[string]any, error) {
-	key := chartValuesCacheKey(ch, names, ignoreMissing)
+// mergeChartValuesFiles caches by loaded content and ordered filenames. Returned
+// maps MUST be cloned because downstream values layering mutates them. The
+// missing-file policy separates requests that skip files from those that fail.
+func (c *Client) mergeChartValuesFiles(loaded ChartLoadResult, names []string, ignoreMissing bool) (map[string]any, error) {
+	if loaded.Fingerprint == "" {
+		return mergeChartValuesFilesUncached(loaded.Chart, names, ignoreMissing)
+	}
+	key := chartValuesCacheKey(loaded.Fingerprint, names, ignoreMissing)
 	c.chartMu.RLock()
 	cached, ok := c.chartValuesCache[key]
 	c.chartMu.RUnlock()
 	if ok {
 		return manifest.DeepCopyMap(cached), nil
 	}
-	merged, err := mergeChartValuesFilesUncached(ch, names, ignoreMissing)
+	merged, err := mergeChartValuesFilesUncached(loaded.Chart, names, ignoreMissing)
 	if err != nil {
 		return nil, err
 	}
@@ -240,31 +270,21 @@ func (c *Client) mergeChartValuesFiles(ch *chart.Chart, names []string, ignoreMi
 	return manifest.DeepCopyMap(merged), nil
 }
 
-// chartValuesCacheKey builds the cache key for a (chart, valuesFiles,
-// ignoreMissing) tuple. The hash input is delimited so a chart named
-// "a-b" with version "c" hashes distinctly from a chart named "a"
-// with version "b-c". The trailing ignoreMissing byte separates the
-// two policy variants.
-func chartValuesCacheKey(ch *chart.Chart, names []string, ignoreMissing bool) string {
-	// hash.Hash.Write never returns an error per its contract; drain
-	// the (int, error) tuple so gosec G104 stays quiet.
-	h := sha256.New()
-	if ch != nil && ch.Metadata != nil {
-		_, _ = h.Write([]byte(ch.Metadata.Name))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(ch.Metadata.Version))
-	}
-	_, _ = h.Write([]byte{0})
+// chartValuesCacheKey separates ordered filenames and the missing-file policy.
+func chartValuesCacheKey(fingerprint string, names []string, ignoreMissing bool) string {
+	var buf [512]byte
+	data := append(buf[:0], fingerprint...)
+	data = append(data, 0)
 	for _, n := range names {
-		_, _ = h.Write([]byte(n))
-		_, _ = h.Write([]byte{0})
+		data = append(data, n...)
+		data = append(data, 0)
 	}
 	if ignoreMissing {
-		_, _ = h.Write([]byte{1})
+		data = append(data, 1)
 	} else {
-		_, _ = h.Write([]byte{0})
+		data = append(data, 0)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return manifest.SHA256Hex(data)
 }
 
 // mergeChartValuesFilesUncached merges the named values files (relative
@@ -272,11 +292,6 @@ func chartValuesCacheKey(ch *chart.Chart, names []string, ignoreMissing bool) st
 // are skipped when ignoreMissing is true; otherwise the first missing
 // file is an error. Mirrors helm-controller's chartutil layering: each
 // file is merged on top of the previous one.
-//
-// Pure function — no caching. Client.mergeChartValuesFiles wraps this
-// with the chart-keyed cache layer so production callers never re-parse
-// the same bytes twice. Kept exported-to-package so benchmarks can
-// measure the uncached parse cost in isolation.
 func mergeChartValuesFilesUncached(c *chart.Chart, names []string, ignoreMissing bool) (map[string]any, error) {
 	out := map[string]any{}
 	for _, name := range names {
@@ -300,7 +315,7 @@ func mergeChartValuesFilesUncached(c *chart.Chart, names []string, ignoreMissing
 		// out is freshly built and wholly owned by this call (each m is
 		// unmarshaled here and discarded after merge), so merge in place
 		// rather than reallocating a new top-level map per file. Same
-		// merge semantics as DeepMerge — override sub-maps are inserted
+		// merge semantics as Helm — override sub-maps are inserted
 		// by reference, collisions recurse — but without the growing
 		// maps.Copy of the accumulator on every iteration. The caller
 		// (mergeChartValuesFiles) hands out a DeepCopyMap clone, so the
@@ -398,7 +413,7 @@ func isHookDoc(doc map[string]any) bool {
 	if anns == nil {
 		return false
 	}
-	_, has := anns["helm.sh/hook"]
+	_, has := anns[release.HookAnnotation]
 	return has
 }
 
@@ -412,10 +427,10 @@ func releaseManifest(rel *release.Release, opts Options, disableHooks, skipTests
 	size := len(rel.Manifest)
 	if !disableHooks {
 		for _, h := range rel.Hooks {
-			if skipTests && isTestHook(h) {
+			if skipTests && slices.Contains(h.Events, release.HookTest) {
 				continue
 			}
-			size += len("---\n# Source: \n") + len(h.Path) + len(h.Manifest) + 1
+			size += len("---\n"+sourceHeader+"\n") + len(h.Path) + len(h.Manifest) + 1
 		}
 	}
 	var b strings.Builder
@@ -424,13 +439,13 @@ func releaseManifest(rel *release.Release, opts Options, disableHooks, skipTests
 	lastNewline := strings.HasSuffix(rel.Manifest, "\n")
 	if !disableHooks {
 		for _, h := range rel.Hooks {
-			if skipTests && isTestHook(h) {
+			if skipTests && slices.Contains(h.Events, release.HookTest) {
 				continue
 			}
 			if !lastNewline {
 				b.WriteByte('\n')
 			}
-			fmt.Fprintf(&b, "---\n# Source: %s\n%s", h.Path, h.Manifest)
+			fmt.Fprintf(&b, "---\n"+sourceHeader+"%s\n%s", h.Path, h.Manifest)
 			lastNewline = strings.HasSuffix(h.Manifest, "\n")
 		}
 	}
@@ -450,7 +465,7 @@ func filterShowOnly(content string, paths []string) string {
 	for section := range strings.SplitSeq(content, "\n---\n") {
 		var header string
 		for line := range strings.SplitSeq(section, "\n") {
-			if rest, ok := strings.CutPrefix(line, "# Source: "); ok {
+			if rest, ok := strings.CutPrefix(line, sourceHeader); ok {
 				header = rest
 				break
 			}
@@ -464,8 +479,4 @@ func filterShowOnly(content string, paths []string) string {
 		out.WriteString(section)
 	}
 	return out.String()
-}
-
-func isTestHook(h *release.Hook) bool {
-	return slices.Contains(h.Events, release.HookTest)
 }

@@ -2,13 +2,17 @@ package orchestrator_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/diff"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/orchestrator"
+	"github.com/home-operations/flate/pkg/source/cacheroot"
 )
 
 // writeCluster lays out a two-app Flux cluster under dir: app-a renders
@@ -91,12 +95,22 @@ func TestRenderTrees_ChangedOnlyAndDiff(t *testing.T) {
 		}
 	}
 
-	// The structured diff: exactly cfg-a changed.
-	changes := diff.Changes(
-		diff.DocsFromManifests(base.Result.Manifests, nil),
-		diff.DocsFromManifests(head.Result.Manifests, nil),
-		diff.Options{},
-	)
+	selected, selectedErr, _ := orchestrator.Select([]orchestrator.Rendered{base, head}, err,
+		[]manifest.NamedResource{{Kind: manifest.KindKustomization}, {Kind: manifest.KindHelmRelease}}, nil)
+	body, err := diff.Compare(
+		diff.Snapshot{Objects: selected[0].Objects, Manifests: selected[0].Manifests, Unavailable: selected[0].Unavailable},
+		diff.Snapshot{Objects: selected[1].Objects, Manifests: selected[1].Manifests, Unavailable: selected[1].Unavailable},
+		selectedErr, diff.Options{Format: diff.FormatJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		Changes []diff.Change `json:"changes"`
+	}
+	if err := json.Unmarshal(body, &output); err != nil {
+		t.Fatal(err)
+	}
+	changes := output.Changes
 	if len(changes) != 1 {
 		t.Fatalf("want exactly 1 change (cfg-a), got %d: %+v", len(changes), changes)
 	}
@@ -178,15 +192,45 @@ func TestRenderTrees_RepoRootRelativeNoGit(t *testing.T) {
 	if base.Result == nil || head.Result == nil {
 		t.Fatalf("both sides must render: base=%v head=%v", base.Result, head.Result)
 	}
-	changes := diff.Changes(
-		diff.DocsFromManifests(base.Result.Manifests, nil),
-		diff.DocsFromManifests(head.Result.Manifests, nil),
-		diff.Options{},
-	)
+	selected, selectedErr, _ := orchestrator.Select([]orchestrator.Rendered{base, head}, err,
+		[]manifest.NamedResource{{Kind: manifest.KindKustomization}, {Kind: manifest.KindHelmRelease}}, nil)
+	body, err := diff.Compare(
+		diff.Snapshot{Objects: selected[0].Objects, Manifests: selected[0].Manifests, Unavailable: selected[0].Unavailable},
+		diff.Snapshot{Objects: selected[1].Objects, Manifests: selected[1].Manifests, Unavailable: selected[1].Unavailable},
+		selectedErr, diff.Options{Format: diff.FormatJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		Changes []diff.Change `json:"changes"`
+	}
+	if err := json.Unmarshal(body, &output); err != nil {
+		t.Fatal(err)
+	}
+	changes := output.Changes
 	if len(changes) != 1 {
 		t.Fatalf("want exactly 1 change (demo ConfigMap), got %d: %+v", len(changes), changes)
 	}
 	if c := changes[0]; c.Name != "demo" || c.Kind != "ConfigMap" || c.Status != diff.StatusChanged {
 		t.Errorf("change = %+v; want ConfigMap demo changed", c)
+	}
+}
+
+func TestRenderTrees_OwnCacheCloses(t *testing.T) {
+	for _, workers := range []int{2, 4} {
+		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
+			baseDir, headDir, root := t.TempDir(), t.TempDir(), t.TempDir()
+			writeCluster(t, baseDir, "v1", "same")
+			writeCluster(t, headDir, "v2", "same")
+			if _, _, err := orchestrator.RenderTrees(t.Context(), orchestrator.Tree{RepoRoot: baseDir}, orchestrator.Tree{RepoRoot: headDir},
+				orchestrator.Config{CacheDir: root, Concurrency: workers}); err != nil {
+				t.Fatal(err)
+			}
+			lock := flock.New(cacheroot.New(root).OCILock())
+			defer func() { _ = lock.Close() }()
+			if acquired, err := lock.TryLock(); err != nil || !acquired {
+				t.Fatalf("own cache retained lock: acquired=%v err=%v", acquired, err)
+			}
+		})
 	}
 }

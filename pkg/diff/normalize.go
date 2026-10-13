@@ -10,12 +10,6 @@ import (
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// normalize applies o's strip/normalize config to a doc set — the
-// shared pre-diff scrub every render path runs on both its inputs.
-func (o Options) normalize(docs []Doc) []Doc {
-	return normalizeDocs(docs, o.StripAttrs, o.StripFields, o.Normalize)
-}
-
 // normalizeDocs clones each Doc's manifest and rewrites fields that
 // should not participate verbatim in human-facing diffs: the listed
 // annotation/label keys (chart-bump noise like helm.sh/chart,
@@ -94,6 +88,11 @@ func configMapBinaryData(m map[string]any) (map[string]any, bool) {
 	return bd, ok
 }
 
+const (
+	binaryDataRawSummaryFormat = "<redacted binary data: %d base64 chars sha256:%s>"
+	binaryDataSummaryFormat    = "<redacted binary data: %d bytes sha256:%s>"
+)
+
 // binaryDataSummary returns a stable, content-derived placeholder for
 // a single binaryData value. base64-decode is the happy path
 // (binaryData is spec'd as base64); the trim handles YAML's trailing
@@ -108,8 +107,8 @@ func binaryDataSummary(v any) string {
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
 	if err != nil {
 		sum := sha256.Sum256([]byte(s))
-		return fmt.Sprintf("<redacted binary data: %d base64 chars sha256:%s>", len(s), hex.EncodeToString(sum[:8]))
+		return fmt.Sprintf(binaryDataRawSummaryFormat, len(s), hex.EncodeToString(sum[:8]))
 	}
 	sum := sha256.Sum256(decoded)
-	return fmt.Sprintf("<redacted binary data: %d bytes sha256:%s>", len(decoded), hex.EncodeToString(sum[:8]))
+	return fmt.Sprintf(binaryDataSummaryFormat, len(decoded), hex.EncodeToString(sum[:8]))
 }

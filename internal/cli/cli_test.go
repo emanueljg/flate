@@ -6,9 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 )
 
@@ -127,6 +129,41 @@ func TestRun_UnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "frobnicate") {
 		t.Errorf("error should name the unknown command; got %q", stderr)
+	}
+}
+
+func TestRun_GroupDefaultsToAll(t *testing.T) {
+	elapsed := regexp.MustCompile(`   [0-9]+\.[0-9]+s\n$`)
+	for _, group := range []string{"build", "diff", "get", "test"} {
+		t.Run(group, func(t *testing.T) {
+			path := writeFixture(t)
+			flags := []string{"-p", path, "--concurrency", "2"}
+			if group == "diff" {
+				orig := writeFixture(t)
+				testutil.WriteFileAt(t, filepath.Join(path, "apps", "cm.yaml"),
+					"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: hello, namespace: apps}\ndata: {greeting: changed}\n")
+				flags = append(flags, "--path-orig", orig)
+			}
+			want, wantErr, wantCode := runCLI(t, append([]string{group, "all"}, flags...)...)
+			got, gotErr, gotCode := runCLI(t, append([]string{group}, flags...)...)
+			if wantCode != 0 || gotCode != wantCode || gotErr != wantErr {
+				t.Fatalf("bare: exit %d, stderr %q; all: exit %d, stderr %q", gotCode, gotErr, wantCode, wantErr)
+			}
+			assert.Diff(t, elapsed.ReplaceAllString(got, ""), elapsed.ReplaceAllString(want, ""))
+			_, stderr, code := runCLI(t, group, "frobnicate")
+			if code != 1 || !strings.Contains(stderr, `unknown command "frobnicate"`) {
+				t.Errorf("unknown subcommand: exit %d, stderr %q", code, stderr)
+			}
+			help, stderr, code := runCLI(t, group, "--help")
+			if code != 0 || stderr != "" {
+				t.Fatalf("help: exit %d, stderr %q", code, stderr)
+			}
+			for _, text := range []string{"Available Commands:", "all", "--path", "defaults to all"} {
+				if !strings.Contains(help, text) {
+					t.Errorf("help missing %q: %s", text, help)
+				}
+			}
+		})
 	}
 }
 
@@ -719,6 +756,7 @@ func TestBindHelmFlags_OnReconcilingSubcommands(t *testing.T) {
 		{"diff", "ks"},
 		{"diff", "hr"},
 		{"diff", "all"},
+		{"diff", "images"},
 		{"get", "all"},
 		{"get", "images"},
 		{"get", "ks"},
@@ -733,6 +771,13 @@ func TestBindHelmFlags_OnReconcilingSubcommands(t *testing.T) {
 		}
 		if sub.Flags().Lookup("kube-version") == nil {
 			t.Errorf("%v: missing helm flag kube-version", argv)
+		}
+		flag := sub.Flags().Lookup("disable-chart-digest-tracking")
+		if flag == nil || flag.Value.Type() != "boolfunc" || flag.NoOptDefVal != "true" {
+			t.Fatalf("%v: missing boolean override binding", argv)
+		}
+		if !strings.Contains(flag.Usage, envKey("disable-chart-digest-tracking")) {
+			t.Errorf("%v: missing environment usage", argv)
 		}
 	}
 }
@@ -765,15 +810,18 @@ func TestCompareDocs_OrdersByKindNamespaceName(t *testing.T) {
 	}
 }
 
-// TestFilterCRDsOnly drops every non-CRD doc.
-func TestFilterCRDsOnly(t *testing.T) {
+// TestEmissionDocs_OnlyCRDs drops every non-CRD doc.
+func TestEmissionDocs_OnlyCRDs(t *testing.T) {
 	docs := []map[string]any{
 		{"kind": "ConfigMap"},
 		{"kind": "CustomResourceDefinition"},
 		{"kind": "Secret"},
 		{"kind": "CustomResourceDefinition"},
 	}
-	out := filterCRDsOnly(docs)
+	out := emissionDocs(docs, &buildFlags{onlyCRDs: true})
+	if docs[2]["kind"] != "Secret" {
+		t.Errorf("emissionDocs mutated the input: %+v", docs)
+	}
 	if len(out) != 2 {
 		t.Errorf("expected 2 CRDs, got %d: %+v", len(out), out)
 	}
@@ -784,56 +832,12 @@ func TestFilterCRDsOnly(t *testing.T) {
 	}
 }
 
-// TestFilterCRDsOnly_EmptyOnNoCRDs covers the common-case zero-alloc
-// path: no CRDs in input → nil out.
-func TestFilterCRDsOnly_EmptyOnNoCRDs(t *testing.T) {
+func TestEmissionDocs_EmptyOnNoCRDs(t *testing.T) {
 	docs := []map[string]any{{"kind": "ConfigMap"}, {"kind": "Secret"}}
-	if out := filterCRDsOnly(docs); out != nil {
-		t.Errorf("expected nil for no-CRD input, got %+v", out)
+	if out := emissionDocs(docs, &buildFlags{onlyCRDs: true}); len(out) != 0 {
+		t.Errorf("expected no docs for no-CRD input, got %+v", out)
 	}
 }
-
-// TestJoinRunErrors covers the four arms of helpers.joinRunErrors.
-func TestJoinRunErrors(t *testing.T) {
-	e1 := &dummyErr{"e1"}
-	e2 := &dummyErr{"e2"}
-	cases := []struct {
-		orig, curr error
-		wantNil    bool
-		wantSub    string
-	}{
-		{nil, nil, true, ""},
-		{e1, nil, false, "orig snapshot"},
-		{nil, e2, false, "current snapshot"},
-		{e1, e2, false, "both snapshots"},
-	}
-	for _, tc := range cases {
-		got := joinRunErrors(tc.orig, tc.curr)
-		if (got == nil) != tc.wantNil {
-			t.Errorf("orig=%v curr=%v: nil? = %v, want %v", tc.orig, tc.curr, got == nil, tc.wantNil)
-			continue
-		}
-		if !tc.wantNil && !strings.Contains(got.Error(), tc.wantSub) {
-			t.Errorf("orig=%v curr=%v: error %q missing %q", tc.orig, tc.curr, got, tc.wantSub)
-		}
-		if tc.orig != nil && !strings.Contains(got.Error(), tc.orig.Error()) {
-			t.Errorf("orig=%v curr=%v: error %q missing orig detail", tc.orig, tc.curr, got)
-		}
-		if tc.curr != nil && !strings.Contains(got.Error(), tc.curr.Error()) {
-			t.Errorf("orig=%v curr=%v: error %q missing current detail", tc.orig, tc.curr, got)
-		}
-		if tc.orig != nil && !errors.Is(got, tc.orig) {
-			t.Errorf("orig=%v curr=%v: errors.Is missing orig", tc.orig, tc.curr)
-		}
-		if tc.curr != nil && !errors.Is(got, tc.curr) {
-			t.Errorf("orig=%v curr=%v: errors.Is missing current", tc.orig, tc.curr)
-		}
-	}
-}
-
-type dummyErr struct{ s string }
-
-func (d *dummyErr) Error() string { return d.s }
 
 type failingWriter struct {
 	err error
@@ -917,5 +921,45 @@ spec:
 	}
 	if !strings.Contains(stderr, ignore+".missing") {
 		t.Errorf("error should name the missing file; got %q", stderr)
+	}
+}
+
+func TestRun_TestNamed_MatchingFailureFromOtherKind(t *testing.T) {
+	root := writeFixture(t)
+	testutil.WriteFile(t, root, "flux/ghost.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: ghost, namespace: flux-system}
+spec:
+  path: ./missing-ghost
+  sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
+`)
+	stdout, stderr, code := runCLI(t, "test", "hr", "ghost", "--path", root, "--cache-dir", t.TempDir(), "--concurrency", "2")
+	if code != 1 || !strings.Contains(stderr, `no HelmRelease named "ghost"`) || stdout != "" {
+		t.Fatalf("other-kind diagnostic satisfied named roster: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+}
+
+func TestRun_GetHRChartVersions(t *testing.T) {
+	for _, tc := range []struct{ name, reference, chart, want string }{
+		{name: "digest", reference: "digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, semver: '>=1.2.0', tag: '1.2.3'", want: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{name: "semver", reference: "semver: '>=1.2.0', tag: '1.2.3'", want: ">=1.2.0"},
+		{name: "tag", reference: "tag: '1.2.3'", want: "1.2.3"},
+		{name: "own version", reference: "tag: '1.2.3'", chart: "chart: {spec: {chart: app, version: '9.9.9', sourceRef: {kind: OCIRepository, name: chart}}}", want: "9.9.9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			chart := tc.chart
+			if chart == "" {
+				chart = "chartRef: {kind: OCIRepository, name: chart}"
+			}
+			testutil.WriteFile(t, root, "flux.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata: {name: app, namespace: apps}\nspec: {suspend: true, "+chart+"}\n---\napiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata: {name: chart, namespace: apps}\nspec: {suspend: true, url: 'oci://example.test/app', ref: {"+tc.reference+"}}\n")
+			stdout, stderr, code := runCLI(t, "get", "hr", "--path", root, "--cache-dir", t.TempDir(), "--concurrency", "2", "-o", "json")
+			var rows []struct {
+				Version string `json:"version"`
+			}
+			if code != 0 || json.Unmarshal([]byte(stdout), &rows) != nil || len(rows) != 1 || rows[0].Version != tc.want {
+				t.Fatalf("chart version: exit=%d stdout=%s stderr=%s want=%s", code, stdout, stderr, tc.want)
+			}
+		})
 	}
 }

@@ -1,10 +1,10 @@
 [tools]
 actionlint = "1.7.12"
-go = "1.27.1"
+go = "1.27.2"
 "go:golang.org/x/vuln/cmd/govulncheck" = "v1.8.0"
-golangci-lint = "2.13.2"
-lefthook = "2.1.14"
-oxfmt = "0.68.0"
+golangci-lint = "2.14.0"
+lefthook = "2.2.0"
+oxfmt = "0.72.0"
 zizmor = "1.30.1"
 
 [tasks.fmt]
@@ -20,20 +20,20 @@ description = "Scan for known vulnerabilities with govulncheck"
 run = "govulncheck ./..."
 
 [tasks.test]
-description = "Run tests with coverage"
-run = "go test $(go list ./...) -coverprofile cover.out"
+description = "Run tests with race detection and coverage"
+run = "go test -race $(go list ./...) -coverprofile cover.out"
 
 [tasks.bench]
 description = "Run benchmark suite (use BENCH=Pattern to filter, COUNT=N to repeat)"
 run = """
 mkdir -p bench/results && \
-go test -run=^$ -bench="${BENCH:-.}" -benchmem -count="${COUNT:-1}" -timeout=20m ./pkg/loader ./pkg/change ./pkg/manifest ./pkg/store ./pkg/kustomize ./pkg/helm ./pkg/values ./pkg/depwait ./pkg/diff ./pkg/source/git | tee "bench/results/$(date +%Y%m%dT%H%M%S)-$(git rev-parse --short HEAD)$([ -n "$(git status --porcelain)" ] && echo -dirty).txt"
+go test -run=^$ -bench="${BENCH:-.}" -benchmem -count="${COUNT:-1}" -timeout=20m ./pkg/loader ./pkg/discovery ./pkg/orchestrator ./pkg/schedule ./pkg/controllers/base ./pkg/controllers/helmrelease ./pkg/controllers/kustomization ./pkg/change ./pkg/manifest ./pkg/store ./pkg/kustomize ./pkg/helm ./pkg/values ./pkg/depwait ./pkg/diff ./pkg/source/git ./pkg/source/gittree ./internal/diskcache | tee "bench/results/$(date +%Y%m%dT%H%M%S)-$(git rev-parse --short HEAD)$([ -n "$(git status --porcelain)" ] && echo -dirty).txt"
 """
 
 [tasks.bench-baseline]
 description = "Refresh bench/baseline.txt by running the bench suite"
 run = """
-go test -run=^$ -bench=. -benchmem -count=5 -timeout=30m ./pkg/loader ./pkg/change ./pkg/manifest ./pkg/store ./pkg/kustomize ./pkg/helm ./pkg/values ./pkg/depwait ./pkg/diff ./pkg/source/git > bench/baseline.txt
+go test -run=^$ -bench=. -benchmem -count=5 -timeout=30m ./pkg/loader ./pkg/discovery ./pkg/orchestrator ./pkg/schedule ./pkg/controllers/base ./pkg/controllers/helmrelease ./pkg/controllers/kustomization ./pkg/change ./pkg/manifest ./pkg/store ./pkg/kustomize ./pkg/helm ./pkg/values ./pkg/depwait ./pkg/diff ./pkg/source/git ./pkg/source/gittree ./internal/diskcache > bench/baseline.txt
 """
 
 [tasks.lint]

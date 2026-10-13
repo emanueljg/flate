@@ -2,11 +2,14 @@ package report
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/orchestrator"
 	"github.com/home-operations/flate/pkg/store"
 )
 
@@ -37,7 +40,12 @@ func TestBuild_GroupsCascadeUnderRoots(t *testing.T) {
 		dependent: {missing},
 	}
 
-	m := Build(f, blocked, nil, nil)
+	m := Build(&orchestrator.Result{
+		Failed: f, Blocked: blocked,
+		Causes: map[manifest.NamedResource][]manifest.NamedResource{
+			root: {leaf, mid}, missing: {dependent},
+		},
+	})
 
 	if len(m.Primary) != 1 || m.Primary[0].ID != root {
 		t.Fatalf("Primary = %+v, want only root", m.Primary)
@@ -54,7 +62,7 @@ func TestBuild_GroupsCascadeUnderRoots(t *testing.T) {
 	}
 
 	var b bytes.Buffer
-	if err := m.Write(&b, false, 0); err != nil {
+	if err := m.Write(&b, false); err != nil {
 		t.Fatal(err)
 	}
 	out := b.String()
@@ -74,7 +82,7 @@ func TestBuild_GroupsCascadeUnderRoots(t *testing.T) {
 // TestBuild_PrimaryOnly covers a lone real failure with nothing depending on it.
 func TestBuild_PrimaryOnly(t *testing.T) {
 	a := ks("a")
-	m := Build(failed(a), nil, nil, nil)
+	m := Build(&orchestrator.Result{Failed: failed(a), Causes: map[manifest.NamedResource][]manifest.NamedResource{a: nil}})
 	if len(m.Primary) != 1 || len(m.Missing) != 0 || len(m.Primary[0].Blocks) != 0 {
 		t.Fatalf("want one primary with no blocks, got %+v", m)
 	}
@@ -83,22 +91,9 @@ func TestBuild_PrimaryOnly(t *testing.T) {
 	}
 }
 
-// TestBuild_NotesOnly covers a clean run that only carries deferred log notes.
-func TestBuild_NotesOnly(t *testing.T) {
-	m := Build(nil, nil, nil, []Note{{Text: "resource orphaned id=x", Count: 3}})
-	if len(m.Primary) != 0 || len(m.Missing) != 0 || m.Empty() {
-		t.Fatalf("notes-only model should be non-empty with no failures: %+v", m)
-	}
-	var b bytes.Buffer
-	_ = m.Write(&b, false, 0)
-	if out := b.String(); !strings.Contains(out, "notes (3)") || !strings.Contains(out, "×3") {
-		t.Errorf("notes footer missing or not collapsed:\n%s", out)
-	}
-}
-
 // TestBuild_Empty covers a clean run with nothing to show.
 func TestBuild_Empty(t *testing.T) {
-	if !Build(nil, nil, nil, nil).Empty() {
+	if !Build(&orchestrator.Result{}).Empty() {
 		t.Error("a clean run must produce an empty model")
 	}
 }
@@ -111,12 +106,12 @@ func TestWrite_WarningsSection(t *testing.T) {
 		{Resource: hr, Category: manifest.WarnStaleValues, Message: "values not defined by the chart schema", Detail: []string{"image.tagg", "oldKey"}},
 		{Category: manifest.WarnEmptyScan, Message: "no Flux objects found"}, // global
 	}
-	m := Build(nil, nil, warns, nil)
+	m := Build(&orchestrator.Result{Unrelated: warns})
 	if m.Empty() {
 		t.Fatal("a model with warnings is not empty")
 	}
 	var b bytes.Buffer
-	if err := m.Write(&b, false, 0); err != nil {
+	if err := m.Write(&b, false); err != nil {
 		t.Fatal(err)
 	}
 	out := b.String()
@@ -134,7 +129,7 @@ func TestWrite_WarningsSection(t *testing.T) {
 func TestWrite_WarningCount(t *testing.T) {
 	warns := []manifest.Warning{{Category: manifest.WarnPathConfig, Message: "same root", Count: 4}}
 	var b bytes.Buffer
-	_ = Build(nil, nil, warns, nil).Write(&b, false, 0)
+	_ = Build(&orchestrator.Result{Unrelated: warns}).Write(&b, false)
 	if out := b.String(); !strings.Contains(out, "×4") {
 		t.Errorf("warning repeat count not rendered:\n%s", out)
 	}
@@ -151,7 +146,7 @@ func TestWrite_PrimaryMessageIsMultiLine(t *testing.T) {
 			"duplicate resource(s) produced by multiple accumulated paths:\n  - ./one\n  - ./two"},
 	}
 	var b bytes.Buffer
-	if err := Build(f, nil, nil, nil).Write(&b, false, 0); err != nil {
+	if err := Build(&orchestrator.Result{Failed: f, Causes: map[manifest.NamedResource][]manifest.NamedResource{a: nil}}).Write(&b, false); err != nil {
 		t.Fatal(err)
 	}
 	out := b.String()
@@ -172,7 +167,12 @@ func TestBuild_BlockedCountsDistinctResources(t *testing.T) {
 		dual: {root, missing}, // blocked by a failed parent AND a missing dep
 	}
 
-	m := Build(f, blocked, nil, nil)
+	m := Build(&orchestrator.Result{
+		Failed: f, Blocked: blocked,
+		Causes: map[manifest.NamedResource][]manifest.NamedResource{
+			root: {dual}, missing: {dual},
+		},
+	})
 	if m.Blocked != 1 {
 		t.Errorf("Blocked = %d, want 1 distinct blocked resource", m.Blocked)
 	}
@@ -184,9 +184,31 @@ func TestBuild_BlockedCountsDistinctResources(t *testing.T) {
 	}
 
 	var b bytes.Buffer
-	_ = m.Write(&b, false, 0)
+	_ = m.Write(&b, false)
 	if out := b.String(); !strings.Contains(out, "1 blocked") {
 		t.Errorf("verdict should count the dual-rooted resource once:\n%s", out)
+	}
+}
+
+func TestSummarize_KindOnCollision(t *testing.T) {
+	hr := func(namespace, name string) manifest.NamedResource {
+		return manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: namespace, Name: name}
+	}
+	tests := []struct {
+		name string
+		ids  []manifest.NamedResource // sorted, as Build delivers them
+		want string
+	}{
+		{"same name, different kind", []manifest.NamedResource{hr("flux-system", "acars"), ks("acars")}, "HelmRelease flux-system/acars, Kustomization flux-system/acars"},
+		{"same name, different namespace", []manifest.NamedResource{hr("default", "acars"), ks("acars")}, "default/acars, flux-system/acars"},
+		{"collision hidden by the cap", []manifest.NamedResource{hr("flux-system", "zzz"), ks("a"), ks("b"), ks("c"), ks("d"), ks("e"), ks("zzz")}, "HelmRelease flux-system/zzz, flux-system/a, flux-system/b, flux-system/c, flux-system/d, flux-system/e +1 more"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := summarize(tc.ids); got != tc.want {
+				t.Errorf("summarize = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -235,15 +257,73 @@ func TestVerdict(t *testing.T) {
 	}
 }
 
-// TestRoots_WalksTransitiveChainToTrueRoot pins the shared grouping the test
-// runner reuses: a leaf folds under the primary at the top of its blocker chain.
-func TestRoots_WalksTransitiveChainToTrueRoot(t *testing.T) {
-	root, mid, leaf := ks("root"), ks("mid"), ks("leaf")
-	byRoot := Roots(map[manifest.NamedResource][]manifest.NamedResource{
-		mid:  {root},
-		leaf: {mid},
-	})
-	if got := byRoot[root]; len(got) != 2 {
-		t.Fatalf("root should gather mid and leaf, got %+v", got)
+func TestBuild_PreparedCycleRoot(t *testing.T) {
+	root, peer, leaf := ks("root"), ks("peer"), ks("leaf")
+	result := &orchestrator.Result{
+		Failed: map[manifest.NamedResource]store.StatusInfo{
+			root: {Status: store.StatusFailed, Message: "dependency cycle: blocked by " + peer.String()},
+			peer: {Status: store.StatusFailed, Message: "dependency cycle: blocked by " + root.String()},
+			leaf: {Status: store.StatusFailed, Message: "dependencies failed"},
+		},
+		Blocked: map[manifest.NamedResource][]manifest.NamedResource{
+			root: {peer}, peer: {root}, leaf: {root},
+		},
+	}
+	o, err := orchestrator.New(orchestrator.Config{Path: t.TempDir(), CacheDir: t.TempDir(), Concurrency: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Stop)
+	selected, selectedErr, _ := orchestrator.Select([]orchestrator.Rendered{{Orchestrator: o, Result: result}}, &orchestrator.FailuresError{Message: "raw failures"},
+		[]manifest.NamedResource{{Kind: manifest.KindKustomization}}, nil)
+	m := Build(selected[0])
+	if selectedErr == nil || !strings.Contains(selectedErr.Error(), fmt.Sprintf("(+%d blocked", m.Blocked)) {
+		t.Fatalf("selected error and report counts disagree: report=%+v error=%v", m, selectedErr)
+	}
+	if len(m.Primary) != 2 || m.Blocked != 1 {
+		t.Fatalf("want 2 primary cycles and 1 distinct blocked child, got %+v", m)
+	}
+	var b bytes.Buffer
+	if err := m.Write(&b, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"dependency cycle: blocked by " + peer.String(), "blocks flux-system/leaf", "2 failed · 1 blocked"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("prepared report missing %q:\n%s", want, b.String())
+		}
+	}
+	if len(result.Blocked) != 3 || result.Failed[leaf].Message != "dependencies failed" {
+		t.Fatal("Build mutated the selected failure snapshot")
 	}
 }
+
+func TestWriteErrors_NonResourceDiagnostics(t *testing.T) {
+	closeErr := errors.New("cache close failed")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "none"},
+		{name: "wrapped close", err: fmt.Errorf("close: %w", closeErr), want: "flate error: close: cache close failed\n"},
+		{name: "joined", err: errors.Join(closeErr, errors.New("cancelled")), want: "flate error: cache close failed\ncancelled\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var b bytes.Buffer
+			if err := WriteErrors(&b, tc.err); err != nil {
+				t.Fatal(err)
+			}
+			if got := b.String(); got != tc.want {
+				t.Fatalf("WriteErrors = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	writeErr := errors.New("write failed")
+	if err := WriteErrors(errorWriter{writeErr}, closeErr); !errors.Is(err, writeErr) {
+		t.Fatalf("writer error = %v, want %v", err, writeErr)
+	}
+}
+
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }

@@ -49,19 +49,11 @@ func New(version string) *cobra.Command {
 		}
 		// The live status bar paints to stderr only when it is an
 		// interactive terminal (pipes/CI/e2e buffers stay clean), --no-progress
-		// is unset, and a --stream build isn't sharing that terminal with its
-		// stdout output (the sticky bar and raw streamed YAML would interleave —
-		// see progressBarEnabled). When active, slog is routed through the same
-		// stderrRouter so log records interleave above the bar instead of
-		// corrupting it; otherwise slog writes straight to stderr.
-		//
-		// `stream` is a build-subcommand flag, absent on other commands —
-		// GetBool then returns (false, err), which is the correct "no stream".
-		noProgress, _ := cmd.Flags().GetBool("no-progress")
-		stream, _ := cmd.Flags().GetBool("stream")
+		// is unset. Logs share the progress renderer when it is active.
 		barSink = nil
 		logSink := cmd.ErrOrStderr()
-		if progressBarEnabled(noProgress, stream, writerIsTTY(cmd.OutOrStdout()), writerIsTTY(cmd.ErrOrStderr())) {
+		noProgress, _ := cmd.Flags().GetBool("no-progress")
+		if progressBarEnabled(noProgress, writerIsTTY(cmd.ErrOrStderr())) {
 			barSink = newBarWriter(cmd.ErrOrStderr())
 			logSink = barSink
 		}
@@ -110,11 +102,9 @@ func run(version string, args []string, stdout, stderr io.Writer) int {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	err := root.ExecuteContext(ctx)
-	// Deferred log notes (and Result.Warnings) are surfaced ONLY by `flate
-	// test`, the diagnostic command — a data-producing verb (build/get/diff/
-	// cache) stays quiet. So there is no end-of-run flush: anything buffered by
-	// a non-test verb is intentionally dropped (it has already been drained and
-	// rendered by `test`, or it belongs to a verb that doesn't report it).
+	// Deferred log notes and render advisories belong to `flate test`;
+	// diff also reports omitted required values on stderr. There is no
+	// end-of-run log flush: only `test` drains the buffered notes.
 	if err != nil {
 		// reportFailures already rendered a styled report for this error; don't
 		// reprint it as a flat "flate error: …" line.
@@ -129,8 +119,7 @@ func run(version string, args []string, stdout, stderr io.Writer) int {
 // setLogLevel validates lvl against the published enum and installs
 // the slog default. Unknown values are rejected up-front so
 // `--log-level bogus` fails clearly instead of silently degrading to
-// info — the previous behavior misled users who typo'd `--log-level
-// dbug` and assumed Debug output was simply quiet.
+// info.
 func setLogLevel(lvl string, explicit bool, w io.Writer) error {
 	var l slog.Level
 	switch lvl {

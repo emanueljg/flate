@@ -8,21 +8,52 @@ import (
 	"testing"
 	"time"
 
+	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/internal/report"
 	"github.com/home-operations/flate/internal/style"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/orchestrator"
 	"github.com/home-operations/flate/pkg/store"
 )
+
+func TestWrite_NotesFooter(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		notes []report.Note
+		want  string
+	}{
+		{name: "empty", want: "\n  ✓ 0 passed\n"},
+		{
+			name:  "single",
+			notes: []report.Note{{Text: "resource orphaned id=x"}},
+			want:  "\n  notes (1)\n    resource orphaned id=x\n\n  ✓ 0 passed\n",
+		},
+		{
+			name:  "collapsed",
+			notes: []report.Note{{Text: "resource orphaned id=x", Count: 3}, {Text: "source fetched", Count: 1}},
+			want:  "\n  notes (4)\n    resource orphaned id=x (×3)\n    source fetched\n\n  ✓ 0 passed\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var b bytes.Buffer
+			if err := (Report{}).Write(&b, nil, tc.notes, false, 0); err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, b.String(), tc.want)
+		})
+	}
+}
 
 // TestWrite_VerdictGlyphAndElapsed: the summary leads with a green ✓ when all
 // pass and a red ✗ when anything fails, and shows the elapsed clock only when
 // non-zero.
 func TestWrite_VerdictGlyphAndElapsed(t *testing.T) {
-	pass := store.New()
+	po, pass := newRunner(t)
 	ok := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "ok"}
 	pass.AddObject(&manifest.Kustomization{Name: ok.Name, Namespace: ok.Namespace})
 	pass.UpdateStatus(ok, store.StatusReady, "")
 	var pb bytes.Buffer
-	if err := Run(Job{Store: pass}).Write(&pb, nil, nil, false, 1500*time.Millisecond); err != nil {
+	if err := runSelected(t, po).Write(&pb, nil, nil, false, 1500*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if out := pb.String(); !strings.Contains(out, style.GlyphPass) || strings.Contains(out, style.GlyphFail) {
@@ -31,12 +62,12 @@ func TestWrite_VerdictGlyphAndElapsed(t *testing.T) {
 		t.Errorf("summary should show the elapsed clock:\n%s", out)
 	}
 
-	fail := store.New()
+	fo, fail := newRunner(t)
 	bad := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "bad"}
 	fail.AddObject(&manifest.Kustomization{Name: bad.Name, Namespace: bad.Namespace})
 	fail.UpdateStatus(bad, store.StatusFailed, "boom")
 	var fb bytes.Buffer
-	_ = Run(Job{Store: fail}).Write(&fb, nil, nil, false, 0)
+	_ = runSelected(t, fo).Write(&fb, nil, nil, false, 0)
 	if out := fb.String(); !strings.Contains(out, style.GlyphFail) {
 		t.Errorf("failing summary wants ✗:\n%s", out)
 	} else if strings.Contains(out, "0.0s") {
@@ -45,13 +76,13 @@ func TestWrite_VerdictGlyphAndElapsed(t *testing.T) {
 }
 
 func TestRun_AllPass(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	s.AddObject(&manifest.Kustomization{Name: "apps", Namespace: "flux-system"})
 	s.AddObject(&manifest.HelmRelease{Name: "demo", Namespace: "apps"})
 	s.UpdateStatus(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}, store.StatusReady, "")
 	s.UpdateStatus(manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "demo"}, store.StatusReady, "")
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if rep.AnyFailed() || rep.Passed != 2 {
 		t.Errorf("expected 2 passed, got %+v", rep)
 	}
@@ -65,11 +96,11 @@ func TestRun_AllPass(t *testing.T) {
 }
 
 func TestRun_OneFailed(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	s.AddObject(&manifest.Kustomization{Name: "apps", Namespace: "flux-system"})
 	s.UpdateStatus(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}, store.StatusFailed, "boom")
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if !rep.AnyFailed() {
 		t.Errorf("expected failure: %+v", rep)
 	}
@@ -81,12 +112,12 @@ func TestRun_OneFailed(t *testing.T) {
 func TestRun_SkippedReasonReportedAsSkipped(t *testing.T) {
 	// A KS that soft-skipped (e.g. source was --allow-missing-secrets'd)
 	// reports as SKIPPED, not PASSED or FAILED.
-	s := store.New()
+	o, s := newRunner(t)
 	s.AddObject(&manifest.Kustomization{Name: "apps", Namespace: "flux-system"})
 	s.UpdateStatus(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"},
 		store.StatusReady, "skipped: source GitRepository/flux-system/sealed missing auth")
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if rep.AnyFailed() {
 		t.Errorf("skipped-reason case must not fail: %+v", rep)
 	}
@@ -99,41 +130,16 @@ func TestRun_SkippedReasonReportedAsSkipped(t *testing.T) {
 }
 
 func TestRun_NoStatus(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	s.AddObject(&manifest.Kustomization{Name: "x", Namespace: "ns"})
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if !rep.AnyFailed() {
 		t.Errorf("expected failure for no-status case")
 	}
 }
 
-// TestRun_SkipsForeignKindLookalike pins issue #872: `flate test all` rosters
-// the Flux source kinds, and a CRD from another API group that reuses one of
-// those kind names (seaweed.seaweedfs.com Bucket) is an ordinary rendered
-// resource no controller reconciles. It carries no status, so rostering it
-// would report "no status reported" and fail the run.
-func TestRun_SkipsForeignKindLookalike(t *testing.T) {
-	s := store.New()
-	flux := manifest.NamedResource{Kind: manifest.KindBucket, Namespace: "flux-system", Name: "minio"}
-	s.AddObject(&manifest.Bucket{Name: flux.Name, Namespace: flux.Namespace})
-	s.UpdateStatus(flux, store.StatusReady, "")
-	s.AddRendered(&manifest.RawObject{
-		Kind:       manifest.KindBucket,
-		APIVersion: "seaweed.seaweedfs.com/v1",
-		Name:       "greptimedb", Namespace: "observability",
-	})
-
-	rep := Run(Job{Store: s, Kinds: []string{manifest.KindBucket}})
-	if rep.AnyFailed() {
-		t.Errorf("foreign Bucket CRD must not be rostered; got %+v", rep)
-	}
-	if rep.Matched != 1 || rep.Passed != 1 || rep.Cases[0].ID != flux {
-		t.Errorf("report = %+v, want only the Flux Bucket %s", rep, flux)
-	}
-}
-
-func TestRun_IncludePredicate(t *testing.T) {
-	s := store.New()
+func TestRun_SelectedNamespace(t *testing.T) {
+	o, s := newRunner(t)
 	alpha := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "alpha", Name: "apps"}
 	beta := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "beta", Name: "apps"}
 	s.AddObject(&manifest.Kustomization{Name: alpha.Name, Namespace: alpha.Namespace})
@@ -141,19 +147,14 @@ func TestRun_IncludePredicate(t *testing.T) {
 	s.UpdateStatus(alpha, store.StatusReady, "")
 	s.UpdateStatus(beta, store.StatusReady, "")
 
-	rep := Run(Job{
-		Store: s,
-		Include: func(id manifest.NamedResource) bool {
-			return id.Namespace == "alpha"
-		},
-	})
+	rep := runSelected(t, o, manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "alpha"})
 	if rep.Passed != 1 || len(rep.Cases) != 1 || rep.Cases[0].ID != alpha {
-		t.Errorf("Include predicate report = %+v, want only %s", rep, alpha)
+		t.Errorf("selected namespace report = %+v, want only %s", rep, alpha)
 	}
 }
 
 func TestWrite_ShowsSkippedByDefault(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	passed := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "changed"}
 	skipped := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "untouched"}
 	s.AddObject(&manifest.Kustomization{Name: passed.Name, Namespace: passed.Namespace})
@@ -161,7 +162,7 @@ func TestWrite_ShowsSkippedByDefault(t *testing.T) {
 	s.UpdateStatus(passed, store.StatusReady, "")
 	s.UpdateStatus(skipped, store.StatusReady, store.MsgUnchanged)
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 
 	var b bytes.Buffer
 	if err := rep.Write(&b, nil, nil, false, 0); err != nil {
@@ -184,12 +185,12 @@ func TestWrite_ShowsSkippedByDefault(t *testing.T) {
 }
 
 func TestWrite_FailedNeverHidden(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	failed := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "broken"}
 	s.AddObject(&manifest.Kustomization{Name: failed.Name, Namespace: failed.Namespace})
 	s.UpdateStatus(failed, store.StatusFailed, "boom")
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	var b bytes.Buffer
 	if err := rep.Write(&b, nil, nil, false, 0); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -202,14 +203,14 @@ func TestWrite_FailedNeverHidden(t *testing.T) {
 // TestWrite_Color: color=true emits ANSI codes (green pass, red fail); color=
 // false renders none, so piped / NO_COLOR output stays plain.
 func TestWrite_Color(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	pass := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "ok"}
 	fail := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "bad"}
 	s.AddObject(&manifest.Kustomization{Name: pass.Name, Namespace: pass.Namespace})
 	s.AddObject(&manifest.HelmRelease{Name: fail.Name, Namespace: fail.Namespace})
 	s.UpdateStatus(pass, store.StatusReady, "")
 	s.UpdateStatus(fail, store.StatusFailed, "boom")
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 
 	var colored, plain bytes.Buffer
 	if err := rep.Write(&colored, nil, nil, true, 0); err != nil {
@@ -227,7 +228,7 @@ func TestWrite_Color(t *testing.T) {
 }
 
 func TestRun_DeterministicOrderAndMatchCount(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	for _, id := range []manifest.NamedResource{
 		{Kind: manifest.KindKustomization, Namespace: "z", Name: "last"},
 		{Kind: manifest.KindKustomization, Namespace: "a", Name: "first"},
@@ -236,8 +237,13 @@ func TestRun_DeterministicOrderAndMatchCount(t *testing.T) {
 		s.AddObject(&manifest.Kustomization{Name: id.Name, Namespace: id.Namespace})
 		s.UpdateStatus(id, store.StatusReady, "")
 	}
+	for _, name := range []string{"extra-z", "extra-a"} {
+		rs := &manifest.ResourceSet{Name: name, Namespace: "ns"}
+		s.AddObject(rs)
+		s.UpdateStatus(rs.Named(), store.StatusFailed, "boom")
+	}
 
-	rep := Run(Job{Store: s, Kinds: []string{manifest.KindKustomization}})
+	rep := runSelected(t, o, manifest.NamedResource{Kind: manifest.KindKustomization})
 
 	if rep.Matched != 3 {
 		t.Fatalf("Matched = %d, want 3", rep.Matched)
@@ -252,6 +258,9 @@ func TestRun_DeterministicOrderAndMatchCount(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("case order = %v, want %v", got, want)
 		}
+	}
+	if len(rep.Cases) != 5 || rep.Cases[3].ID.Name != "extra-a" || rep.Cases[4].ID.Name != "extra-z" {
+		t.Fatalf("diagnostic cases must follow the roster in identity order: %+v", rep.Cases)
 	}
 }
 
@@ -277,16 +286,15 @@ func (w errWriter) Write(_ []byte) (int, error) {
 // and lands in Blocked as a "blocked by <root>" case naming the primary failure
 // it traces to — the verdict counting it as blocked, the run still non-zero.
 func TestRun_BlockedByPrimaryFailure(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	root := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "cluster-apps"}
 	child := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "media", Name: "plex"}
 	s.AddObject(&manifest.Kustomization{Name: root.Name, Namespace: root.Namespace})
 	s.AddObject(&manifest.Kustomization{Name: child.Name, Namespace: child.Namespace})
 	s.UpdateStatus(root, store.StatusFailed, "kustomize build boom") // primary
-	s.UpdateStatus(child, store.StatusFailed, "dependencies failed: cluster-apps")
-	s.SetBlocked(child, []manifest.NamedResource{root})
+	s.UpdateFailure(child, &manifest.DependencyFailedError{Parent: child, Failed: []manifest.NamedResource{root}})
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if rep.Failed != 1 || len(rep.Blocked) != 1 {
 		t.Fatalf("want 1 failed (root) + 1 blocked (child), got %+v", rep)
 	}
@@ -320,12 +328,9 @@ func TestRun_BlockedByPrimaryFailure(t *testing.T) {
 // TestRun_SurfacesNonRosterFailure pins the consolidation contract: a run-time
 // failure whose kind isn't in the roster (here a ResourceSet whose template
 // won't parse) must still appear as a failed row and count in the verdict.
-// Before the single-report consolidation this failure lived only in the
-// now-dropped stderr block; the testrunner scans Store.FailedResources for any
-// failed id the per-kind loop didn't cover and lists it so no primary fault is
-// silently dropped.
+// Diagnostic failures outside the roster do not count as matched roots.
 func TestRun_SurfacesNonRosterFailure(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	ks := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
 	rs := manifest.NamedResource{Kind: manifest.KindResourceSet, Namespace: "flux-system", Name: "broken-rs"}
 	s.AddObject(&manifest.Kustomization{Name: ks.Name, Namespace: ks.Namespace})
@@ -333,9 +338,9 @@ func TestRun_SurfacesNonRosterFailure(t *testing.T) {
 	s.UpdateStatus(ks, store.StatusReady, "")
 	s.UpdateStatus(rs, store.StatusFailed, `parse template: function "nope" not defined`)
 
-	rep := Run(Job{Store: s})
-	if rep.Passed != 1 || rep.Failed != 1 {
-		t.Fatalf("want 1 passed (KS) + 1 failed (ResourceSet), got %+v", rep)
+	rep := runSelected(t, o)
+	if rep.Matched != 1 || rep.Passed != 1 || rep.Failed != 1 {
+		t.Fatalf("want 1 matched, 1 passed (KS) + 1 failed (ResourceSet), got %+v", rep)
 	}
 	var found *Case
 	for i := range rep.Cases {
@@ -356,36 +361,68 @@ func TestRun_SurfacesNonRosterFailure(t *testing.T) {
 	}
 }
 
-// TestRun_SkipsSyntheticHelmChartFailure pins the dedup half of the scan: a
-// synthetic HelmChart (internal plumbing flate materializes to fetch an HR's
-// chart) is never a first-class tested kind, and its failure always re-surfaces
-// on the consuming HR's own row. Listing the hash-suffixed chart id again would
-// be pure duplication, so the scan skips KindHelmChart.
-func TestRun_SkipsSyntheticHelmChartFailure(t *testing.T) {
-	s := store.New()
-	hr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "nvidia", Name: "gpu-operator"}
-	chart := manifest.NamedResource{Kind: manifest.KindHelmChart, Namespace: "nvidia", Name: "nvidia-gpu-operator-16d855d"}
-	s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
-	s.AddObject(&manifest.HelmChartSource{Name: chart.Name, Namespace: chart.Namespace})
-	s.UpdateStatus(hr, store.StatusFailed, "chart source HelmChart/nvidia/nvidia-gpu-operator-16d855d not ready: 404 Not Found")
-	s.UpdateStatus(chart, store.StatusFailed, "download chart: 404 Not Found")
+func TestRun_SameNameDiagnosticDoesNotMatchRequestedKind(t *testing.T) {
+	o, s := newRunner(t)
+	hr := &manifest.HelmRelease{Name: "missing", Namespace: "ns"}
+	s.AddObject(hr)
+	s.UpdateStatus(hr.Named(), store.StatusFailed, "boom")
+	rep := runSelected(t, o, manifest.NamedResource{Kind: manifest.KindKustomization, Name: hr.Name})
+	if rep.Matched != 0 || rep.Failed != 1 || len(rep.Cases) != 1 || rep.Cases[0].ID != hr.Named() {
+		t.Fatalf("same-name diagnostic must not count as a requested root: %+v", rep)
+	}
+}
 
-	rep := Run(Job{Store: s})
-	if rep.Failed != 1 {
-		t.Fatalf("want only the HR counted as failed, got %+v", rep)
-	}
-	for _, c := range rep.Cases {
-		if c.ID.Kind == manifest.KindHelmChart {
-			t.Errorf("synthetic HelmChart must not get its own row: %+v", c)
-		}
-	}
-	// Write renders only Cases (+ blocked folds), so the Case-level check above
-	// already guarantees no separate HelmChart row; confirm the consuming HR
-	// row still carries the chart error so the failure isn't lost.
-	var b bytes.Buffer
-	_ = rep.Write(&b, nil, nil, false, 0)
-	if out := b.String(); !strings.Contains(out, "gpu-operator") || !strings.Contains(out, "404") {
-		t.Errorf("the consuming HR row must still carry the chart error:\n%s", out)
+func TestRun_BlockedRootReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		root       manifest.BaseManifest
+		namespace  string
+		wantFailed int
+		wantReason string
+	}{
+		{
+			name:       "synthetic HelmChart",
+			root:       &manifest.HelmChartSource{Name: "chart-16d855d", Namespace: "apps"},
+			wantReason: "blocked by apps/chart-16d855d: fetch artifact: 404 Not Found",
+		},
+		{
+			name:       "filtered-out OCIRepository",
+			root:       &manifest.OCIRepository{Name: "source", Namespace: "flux-system"},
+			namespace:  "apps",
+			wantReason: "blocked by flux-system/source: fetch artifact: 404 Not Found",
+		},
+		{
+			name:       "reported OCIRepository",
+			root:       &manifest.OCIRepository{Name: "source", Namespace: "flux-system"},
+			wantFailed: 1,
+			wantReason: "blocked by flux-system/source",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, s := newRunner(t)
+			hr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "demo"}
+			root := tc.root.Named()
+			s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
+			s.AddObject(tc.root)
+			s.UpdateFailure(hr, &manifest.DependencyFailedError{Parent: hr, Failed: []manifest.NamedResource{root}})
+			s.UpdateStatus(root, store.StatusFailed, "flux error: input error: fetch artifact: 404 Not Found")
+
+			rep := runSelected(t, o, manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: tc.namespace})
+			if rep.Matched != 1 || rep.Failed != tc.wantFailed || len(rep.Blocked) != 1 || !rep.AnyFailed() {
+				t.Fatalf("want %d failed + 1 blocked, got %+v", tc.wantFailed, rep)
+			}
+			want := []Case{{ID: hr, Outcome: OutcomeBlocked, Reason: tc.wantReason}}
+			if !reflect.DeepEqual(rep.Blocked, want) {
+				t.Fatalf("Blocked = %+v, want %+v", rep.Blocked, want)
+			}
+			var b bytes.Buffer
+			if err := rep.Write(&b, nil, nil, false, 0); err != nil {
+				t.Fatal(err)
+			}
+			if out := b.String(); !strings.Contains(out, "apps/demo") || strings.Count(out, "fetch artifact: 404 Not Found") != 1 || strings.Contains(out, "flux error:") {
+				t.Errorf("report must show the root error exactly once without sentinel prefixes:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -394,14 +431,13 @@ func TestRun_SkipsSyntheticHelmChartFailure(t *testing.T) {
 // counts as blocked even though no primary failure exists, keeping the run
 // non-zero.
 func TestRun_BlockedByMissingDep(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	child := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "volsync-system", Name: "kopiur-repository"}
 	missing := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "kopiur-system", Name: "kopiur"}
 	s.AddObject(&manifest.Kustomization{Name: child.Name, Namespace: child.Namespace})
-	s.UpdateStatus(child, store.StatusFailed, "dependencies failed: kopiur")
-	s.SetBlocked(child, []manifest.NamedResource{missing})
+	s.UpdateFailure(child, &manifest.DependencyFailedError{Parent: child, Failed: []manifest.NamedResource{missing}})
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if rep.Failed != 0 || len(rep.Blocked) != 1 {
 		t.Fatalf("want 0 failed + 1 blocked, got %+v", rep)
 	}
@@ -425,25 +461,23 @@ func TestRun_BlockedByMissingDep(t *testing.T) {
 // drop a failure and flip the run green. Each victim falls back to naming its
 // immediate blocker.
 func TestRun_BlockedByCycle(t *testing.T) {
-	s := store.New()
+	o, s := newRunner(t)
 	ks := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "ks-a"}
 	hr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "app", Name: "hr-b"}
 	s.AddObject(&manifest.Kustomization{Name: ks.Name, Namespace: ks.Namespace})
 	s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
 	// A ⇄ B: each blocked on the other, both terminally failed — a closed cycle.
-	s.UpdateStatus(ks, store.StatusFailed, "dependencies failed: hr-b")
-	s.UpdateStatus(hr, store.StatusFailed, "dependencies failed: ks-a")
-	s.SetBlocked(ks, []manifest.NamedResource{hr})
-	s.SetBlocked(hr, []manifest.NamedResource{ks})
+	s.UpdateFailure(ks, &manifest.DependencyFailedError{Parent: ks, Failed: []manifest.NamedResource{hr}})
+	s.UpdateFailure(hr, &manifest.DependencyFailedError{Parent: hr, Failed: []manifest.NamedResource{ks}})
 
-	rep := Run(Job{Store: s})
+	rep := runSelected(t, o)
 	if rep.Failed != 0 || len(rep.Blocked) != 2 {
 		t.Fatalf("want 0 failed + 2 blocked (neither victim dropped), got %+v", rep)
 	}
 	if !rep.AnyFailed() {
 		t.Error("a cyclic block must still flip the run to failed, not pass green")
 	}
-	// RootsOf reaches no root, so each victim names its immediate blocker; both
+	// Each cycle victim names its immediate blocker; both
 	// blockers carry a status, so neither is tagged "(not found)".
 	want := []Case{
 		{ID: hr, Outcome: OutcomeBlocked, Reason: "blocked by flux-system/ks-a"},
@@ -452,4 +486,34 @@ func TestRun_BlockedByCycle(t *testing.T) {
 	if !reflect.DeepEqual(rep.Blocked, want) {
 		t.Fatalf("Blocked = %+v, want %+v", rep.Blocked, want)
 	}
+}
+
+func newRunner(t *testing.T) (*orchestrator.Orchestrator, *store.Store) {
+	t.Helper()
+	o, err := orchestrator.New(orchestrator.Config{Path: t.TempDir(), Concurrency: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Stop)
+	return o, o.Store()
+}
+
+func runSelected(t *testing.T, o *orchestrator.Orchestrator, roots ...manifest.NamedResource) Report {
+	t.Helper()
+	if len(roots) == 0 {
+		roots = []manifest.NamedResource{{Kind: manifest.KindKustomization}, {Kind: manifest.KindHelmRelease}}
+	}
+	failed := o.Store().FailedResources()
+	blocked := make(map[manifest.NamedResource][]manifest.NamedResource)
+	for id, info := range failed {
+		if info.IsDependencyFailure() {
+			blocked[id] = info.BlockedBy()
+		}
+	}
+	raw := &orchestrator.Result{Failed: failed, Blocked: blocked}
+	selected, _, _ := orchestrator.Select([]orchestrator.Rendered{{Orchestrator: o, Result: raw}}, nil, roots, nil)
+	if len(selected) != 1 {
+		t.Fatalf("Select returned %d results, want 1", len(selected))
+	}
+	return Run(selected[0])
 }

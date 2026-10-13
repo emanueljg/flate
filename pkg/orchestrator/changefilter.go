@@ -6,13 +6,12 @@ import (
 
 	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/discovery"
-	"github.com/home-operations/flate/pkg/loader"
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
 // buildChangeFilter computes the file-level change set (if changed-only
 // mode is requested) and constructs the immutable change.Filter from
-// (changes, sourceFiles, repoRoot, store), then wires it onto every
+// (changes, discovery index, store), then wires it onto every
 // controller. When changed-only mode is off the filter remains nil and
 // controllers reconcile everything.
 func (o *Orchestrator) buildChangeFilter(repoRoot string) error {
@@ -27,54 +26,16 @@ func (o *Orchestrator) buildChangeFilter(repoRoot string) error {
 	if changes == nil {
 		return nil
 	}
-	// External-sourced KSes must not claim local paths in the ownership
-	// index — same exclusion the loader applies to the parent index via
-	// KSPathPrefixesLocalOnly (a `path: ./` on an OCI-sourced KS would
-	// otherwise own the repo root and cascade into every resolve).
-	f := change.NewFilterWithCache(changes, o.sourceFiles, repoRoot, o.store, o.componentCache, o.sourceRefs, loader.ExternalSourcedKSIDs(o.store, repoRoot), o.selfProduce.OwnersOfFile)
-	// Wire OnAdd so a runtime keep-set extension (KS controller's
-	// emitRenderedChildren → keepEmitted) refires any source whose
-	// listener already short-circuited via PreGate before the
-	// consuming KS joined keep. Without this hook, the source stays
-	// Ready/"unchanged" with no artifact and the KS's
-	// resolveSourceRoot surfaces "artifact not found" downstream.
-	// Issue #260. Refire owns the status reset that closes the
-	// depwait race — see Store.Refire.
-	//
-	// Kustomization is included for the symmetric substituteFrom
-	// producer case (#418): when a primary parent emits a child KS
-	// at render time and that child consumes a substituteFrom CM
-	// produced by an unchanged producer KS, addRecursive pulls the
-	// producer into keep dependency-only — but the producer's own
-	// listener already PreGate-skipped during Bootstrap, leaving no
-	// CM in the store. Refire re-runs the producer so the CM lands
-	// before the consuming KS's depwait expires.
-	//
-	// Kinds limited to the source-controller-managed set (those wired
-	// with a Fetcher in the constructor above) plus Kustomization.
-	// HelmChart resources are read directly by helm.storeResolver
-	// without a Fetcher, so Refire on a HelmChart id would write a
-	// Pending status that no controller transitions back to Ready.
-	f.OnAdd = func(id manifest.NamedResource) {
-		switch id.Kind {
-		case manifest.KindGitRepository,
-			manifest.KindOCIRepository,
-			manifest.KindHelmRepository,
-			manifest.KindBucket,
-			manifest.KindExternalArtifact,
-			manifest.KindKustomization:
-			o.store.Refire(id)
-		}
-	}
+	f := change.NewFilter(changes, o.index, o.store)
 	o.filter = f
-	slog.Debug("changed-only keep set", "size", o.filter.Size(), "items", o.filter.KeepNames())
+	slog.Debug("changed-only keep set", "filter", o.filter)
 	return nil
 }
 
 // computeChangeSet diffs the baseline source root (cfg.PathOrig) against
 // this side's source root (repoRoot) and returns the file-level change
 // set. Both are repo roots — the SAME coordinate system as repoRoot, so
-// the emitted paths line up with SourceFiles keys directly (no rerooting).
+// the emitted paths line up with discovery file coordinates directly (no rerooting).
 // Returns (nil, nil) when the two roots resolve to the same directory
 // (changed-only mode would diff a tree against itself); the caller skips
 // the filter build then. Only reached when cfg.PathOrig != "".
@@ -110,7 +71,7 @@ func (o *Orchestrator) computeChangeSet(repoRoot string) (*change.Set, error) {
 	if cs.Len() == 0 {
 		o.store.AddWarning(manifest.Warning{
 			Category: manifest.WarnPathConfig,
-			Message:  "no changes detected between --path and --path-orig — output will be empty; verify both paths reference distinct snapshots",
+			Message:  "no changes detected between --path and --path-orig; output will be empty; Flux-excluded files are not counted; verify both paths reference distinct snapshots",
 		})
 	}
 	return cs, nil

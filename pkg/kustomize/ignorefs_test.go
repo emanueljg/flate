@@ -2,12 +2,15 @@ package kustomize
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source/sourceignore"
@@ -23,7 +26,7 @@ func testIgnoreFS(t *testing.T, root string) ignoreFS {
 	if err != nil {
 		t.Fatalf("matcher: %v", err)
 	}
-	disk := testOverlayFS(t, root).(overlayFS).disk
+	disk := testTreeFS(t, root).(*treeFS).lower.(diskInput).FileSystem
 	return newIgnoreFS(disk, root, matcher).(ignoreFS)
 }
 
@@ -136,21 +139,21 @@ func TestRenderFlux_SourceignoreAllowlist(t *testing.T) {
 	}
 
 	t.Run("spec.path excluded", func(t *testing.T) {
-		_, err := RenderFlux(ctx, NewTreeCache(), root, true, "bundles/common", spec("./bundles/common"))
+		_, err := RenderFlux(ctx, NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: true, SubPath: "bundles/common", Spec: spec("./bundles/common")})
 		if !errors.Is(err, manifest.ErrInput) || !strings.Contains(err.Error(), "not a directory") {
 			t.Fatalf("expected the excluded spec.path to be reported missing, got %v", err)
 		}
 	})
 
 	t.Run("kustomization base excluded", func(t *testing.T) {
-		_, err := RenderFlux(ctx, NewTreeCache(), root, true, "clusters/dev/app", spec("./clusters/dev/app"))
+		_, err := RenderFlux(ctx, NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: true, SubPath: "clusters/dev/app", Spec: spec("./clusters/dev/app")})
 		if err == nil || !strings.Contains(err.Error(), "bundles/common") {
 			t.Fatalf("expected the build to fail resolving the excluded base, got %v", err)
 		}
 	})
 
 	t.Run("allowlisted path renders", func(t *testing.T) {
-		out, err := RenderFlux(ctx, NewTreeCache(), root, true, "clusters/dev/ok", spec("./clusters/dev/ok"))
+		out, err := RenderFlux(ctx, NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: true, SubPath: "clusters/dev/ok", Spec: spec("./clusters/dev/ok")})
 		if err != nil {
 			t.Fatalf("render: %v", err)
 		}
@@ -160,7 +163,7 @@ func TestRenderFlux_SourceignoreAllowlist(t *testing.T) {
 	})
 
 	t.Run("fetched artifact not refiltered", func(t *testing.T) {
-		out, err := RenderFlux(ctx, NewTreeCache(), root, false, "bundles/common", spec("./bundles/common"))
+		out, err := RenderFlux(ctx, NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: false, SubPath: "bundles/common", Spec: spec("./bundles/common")})
 		if err != nil {
 			t.Fatalf("render: %v", err)
 		}
@@ -184,7 +187,7 @@ func TestRenderFlux_SourceignoreCacheReplaysFilteredView(t *testing.T) {
 	cache.SetRenderCache(t.TempDir(), 1<<30)
 	ctx := context.Background()
 
-	out1, err := RenderFlux(ctx, cache, root, true, ".", demoRawSpec)
+	out1, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: true, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("first render: %v", err)
 	}
@@ -205,11 +208,62 @@ func TestRenderFlux_SourceignoreCacheReplaysFilteredView(t *testing.T) {
 		t.Fatal("first render did not populate the cache")
 	}
 	cache.render.put(key, snap, []byte("SENTINEL\n"))
-	out2, err := RenderFlux(ctx, cache, root, true, ".", demoRawSpec)
+	out2, err := RenderFlux(ctx, cache, RenderRequest{Label: root, ApplyIgnore: true, SubPath: ".", Spec: demoRawSpec})
 	if err != nil {
 		t.Fatalf("second render: %v", err)
 	}
 	if string(out2) != "SENTINEL\n" {
 		t.Errorf("expected a cache hit against the filtered view; got a re-render:\n%s", out2)
+	}
+}
+
+func TestRenderFlux_SourceignoreConfigMapGenerator(t *testing.T) {
+	const image = "\x89PNG\r\n\x1a\n"
+	cases := []struct {
+		name    string
+		ignore  *string
+		wantErr bool
+	}{
+		{name: "user patterns preserve image", ignore: new("*.tmp\n")},
+		{name: "no sourceignore excludes image", wantErr: true},
+		{name: "empty sourceignore excludes image", ignore: new(""), wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"app/icons/logo.png": image,
+				"app/kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+- name: icons
+  files:
+  - logo.png=icons/logo.png
+`,
+			}
+			if tc.ignore != nil {
+				files[".sourceignore"] = *tc.ignore
+			}
+			root := writeTree(t, files)
+			out, err := RenderFlux(t.Context(), NewTreeCache(), RenderRequest{Label: root, ApplyIgnore: true, SubPath: "app", Spec: ksDoc(map[string]any{"path": "./app"})})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "logo.png") {
+					t.Fatalf("expected excluded image to fail the build, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			var cm struct {
+				Kind       string            `json:"kind"`
+				BinaryData map[string]string `json:"binaryData"`
+			}
+			if err := yaml.Unmarshal(out, &cm); err != nil {
+				t.Fatalf("decode ConfigMap: %v", err)
+			}
+			if cm.Kind != "ConfigMap" || cm.BinaryData["logo.png"] != base64.StdEncoding.EncodeToString([]byte(image)) {
+				t.Fatalf("expected image bytes in generated ConfigMap, got:\n%s", out)
+			}
+		})
 	}
 }

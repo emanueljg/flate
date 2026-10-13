@@ -3,8 +3,8 @@ package orchestrator
 import (
 	"context"
 	"maps"
-	"slices"
 
+	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/controllers/base"
 	"github.com/home-operations/flate/pkg/controllers/helmrelease"
 	"github.com/home-operations/flate/pkg/controllers/kustomization"
@@ -16,26 +16,40 @@ import (
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// orchestratorExistence adapts the orchestrator's
-// loader.ExistenceIndex + Store + WipeSecrets config into the
-// depwait.ExistenceLookup interface that flows through controller
-// Options into every Waiter. Bundled so controllers don't each
-// reach into the orchestrator's private fields, and so future
-// existence-related signals land on one type instead of plumbing
-// new closures through three call layers.
+// orchestratorExistence applies runtime admission to immutable discovery locations.
 type orchestratorExistence struct {
-	idx         *loader.ExistenceIndex
 	store       *store.Store
+	index       *manifest.DiscoveryIndex
 	wipeSecrets bool
+	filter      *change.Filter
 }
 
 func (e *orchestratorExistence) Promote(id manifest.NamedResource) bool {
-	return e.idx.Promote(e.store, id, e.wipeSecrets)
+	record, _ := e.index.Lookup(id)
+	return loader.Promote(e.store, id, record.Path, loader.PromoteOptions{WipeSecrets: e.wipeSecrets, Admit: e.admit})
+}
+
+func (e *orchestratorExistence) admit(obj manifest.BaseManifest) bool {
+	switch obj.(type) {
+	case *manifest.ConfigMap, *manifest.Secret, *manifest.ResourceSetInputProvider,
+		*manifest.GitRepository, *manifest.HelmRepository, *manifest.OCIRepository,
+		*manifest.HelmChartSource, *manifest.Bucket, *manifest.ExternalArtifact:
+		return e.filter.ShouldReconcile(obj.Named())
+	}
+	return false
 }
 
 func (e *orchestratorExistence) IsFileIndexed(id manifest.NamedResource) bool {
-	_, ok := e.idx.Get(id)
-	return ok
+	if r, ok := e.index.Lookup(id); ok && r.Path != "" {
+		return true
+	}
+	if id.Namespace == "" {
+		return false
+	}
+	// Discovery retains bare identities until a parent stamps the namespace.
+	id.Namespace = ""
+	r, ok := e.index.Lookup(id)
+	return ok && r.Path != ""
 }
 
 // Run starts every controller, blocks until the task service drains,
@@ -85,17 +99,6 @@ func (o *Orchestrator) configureControllers() {
 		AllowMissingSecrets: o.cfg.AllowMissingSecrets,
 		Producers:           o.producers,
 	})
-	// parentResolver unifies the two sources of structural-parent
-	// info: (1) the pre-built file-path prefix index for file-loaded
-	// resources, and (2) the renderedSet for resources that arrive
-	// via a KS render's emitRenderedChildren (populated at Run-time,
-	// not at Bootstrap). Controllers query through this single seam.
-	parentResolver := func(id manifest.NamedResource) (manifest.NamedResource, bool) {
-		if parent, ok := o.parentOf[id]; ok {
-			return parent, true
-		}
-		return o.rendered.ParentOf(id)
-	}
 	// existence bundles the file-existence lookups depwait needs:
 	// Promote lazy-loads a file-indexed dep into the Store the
 	// moment a depwait edge asks for it (covering the bjw-s parent-
@@ -107,32 +110,30 @@ func (o *Orchestrator) configureControllers() {
 	// controllers and Waiter consume them via the single
 	// depwait.ExistenceLookup interface.
 	existence := &orchestratorExistence{
-		idx:         o.existence,
 		store:       o.store,
+		index:       o.index,
 		wipeSecrets: o.cfg.WipeSecrets,
-	}
-	// selfProduces reports whether consumer's OWN render emits cm — the
-	// graph-aware self-substitute signal collectDeps uses to drop a
-	// self-produced postBuild.substituteFrom ConfigMap from the dep set.
-	// Nil-safe: a nil index (no repoRoot) yields false, so the edge is
-	// kept (the pre-index always-add behavior).
-	selfProduces := func(cm, consumer manifest.NamedResource) bool {
-		return slices.Contains(o.selfProduce.ProducedBy(cm), consumer)
+		filter:      o.filter,
 	}
 	// The reconcile-shaping config common to all three render controllers,
 	// built once; each Configure adds its controller-specific fields.
 	common := base.Options{
 		Filter:           o.filter,
-		ParentOf:         parentResolver,
-		RenderTracker:    o.rendered,
+		ParentOf:         o.parentOf,
 		Existence:        existence,
 		PreflightFailure: o.preflightFailure,
+		AllowMissingCRDs: o.cfg.AllowMissingCRDs,
 	}
-	o.ksc.Configure(kustomization.Options{Options: common, SelfProduces: selfProduces})
+	o.ksc.Configure(kustomization.Options{
+		Options: common, Index: o.index,
+		SubstituteFrom: o.substitutionSources, Substitute: o.cfg.Substitute,
+		StrictSubstitutions: o.cfg.StrictSubstitutions,
+	})
 	o.hrc.Configure(helmrelease.ReconcileOptions{
 		Options:             common,
 		AllowMissingSecrets: o.cfg.AllowMissingSecrets,
 		Producers:           o.producers,
+		SubstituteFrom:      o.substitutionSources,
 	})
 	// The RS controller feeds each RawObject child it renders into
 	// rsRawSink keyed by the RS's parent KS; render() commits the sink
@@ -217,9 +218,9 @@ func (o *Orchestrator) render(ctx context.Context) (result *Result, err error) {
 	maps.Copy(res.Orphans, o.orphans)
 	// Tag the derived (dependency-blocked) failures so a consumer can collapse
 	// the cascade under its root cause. A failure with no blockers is primary.
-	for id := range res.Failed {
-		if b := o.store.BlockedBy(id); len(b) > 0 {
-			res.Blocked[id] = b
+	for id, info := range res.Failed {
+		if info.IsDependencyFailure() {
+			res.Blocked[id] = info.BlockedBy()
 		}
 	}
 	return res, runErr
@@ -278,5 +279,8 @@ func (o *Orchestrator) Stop() {
 		o.hrc.Close()
 		o.ksc.Close()
 		o.src.Close()
+		if o.cfg.Cache == nil && o.cache != nil {
+			_ = o.cache.Close()
+		}
 	})
 }

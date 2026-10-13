@@ -1,6 +1,7 @@
 package kustomize
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,22 +16,20 @@ import (
 	"github.com/home-operations/flate/pkg/source/sourceignore"
 )
 
-// testOverlayFS builds the same memory-over-disk overlay RenderFlux uses:
-// source files are read from a secure on-disk FS rooted at root; writes go to
-// memory.
-func testOverlayFS(t *testing.T, root string) filesys.FileSystem {
+// testTreeFS keeps construction writes private over a secure disk input.
+func testTreeFS(t *testing.T, root string) filesys.FileSystem {
 	t.Helper()
 	disk, err := fluxfilesys.MakeFsOnDiskSecure(root)
 	if err != nil {
 		t.Fatalf("secure fs: %v", err)
 	}
-	return newOverlayFS(disk, nil)
+	return newTreeFS(diskInput{FileSystem: disk, root: root, info: make(map[string]fs.FileInfo)}, root, nil)
 }
 
-// testIgnoreOverlayFS is testOverlayFS with the source-controller ignore
+// testIgnoreTreeFS is testTreeFS with the source-controller ignore
 // matcher loaded from root in front of the disk layer — the working-tree
 // (applyIgnore) view RenderFlux builds against.
-func testIgnoreOverlayFS(t *testing.T, root string) filesys.FileSystem {
+func testIgnoreTreeFS(t *testing.T, root string) filesys.FileSystem {
 	t.Helper()
 	disk, err := fluxfilesys.MakeFsOnDiskSecure(root)
 	if err != nil {
@@ -40,7 +39,7 @@ func testIgnoreOverlayFS(t *testing.T, root string) filesys.FileSystem {
 	if err != nil {
 		t.Fatalf("matcher: %v", err)
 	}
-	return newOverlayFS(newIgnoreFS(disk, root, matcher), nil)
+	return newTreeFS(diskInput{FileSystem: newIgnoreFS(disk, root, matcher), root: root, info: make(map[string]fs.FileInfo)}, root, nil)
 }
 
 // These tests pin flate's in-memory generateManifest to flux's real on-disk
@@ -197,6 +196,51 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 			}},
 		},
 		{
+			name: "image tag override preserves registry",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newName: mirror/nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "2.0"}}},
+		},
+		{
+			name: "image registry override preserves version",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newName: mirror/nginx\n  digest: sha256:old\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newName": "other/nginx"}}},
+		},
+		{
+			name: "image digest override clears tag",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "digest": "sha256:new"}}},
+		},
+		{
+			name: "image tag override clears digest",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  digest: sha256:old\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "2.0"}}},
+		},
+		{
+			name: "repeated spec image merges fields",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newName": "mirror/nginx"}, map[string]any{"name": "nginx", "newTag": "2.0"}}},
+		},
+		{
 			name: "components with ignoreMissing",
 			files: map[string]string{
 				"kustomization.yaml":      existingKustomization("deploy.yaml"),
@@ -242,7 +286,7 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 				t.Fatalf("flux GenerateManifest: %v", err)
 			}
 
-			got, _, err := generateManifest(testOverlayFS(t, root), filepath.Join(root, tc.subPath), deepCopyDoc(t, doc))
+			got, _, err := generateManifest(testTreeFS(t, root), filepath.Join(root, tc.subPath), deepCopyDoc(t, doc))
 			if err != nil {
 				t.Fatalf("generateManifest: %v", err)
 			}
@@ -259,7 +303,7 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 // fs, build. It returns the rendered resources as YAML.
 func renderInMemory(t *testing.T, root, subPath string, doc map[string]any) []byte {
 	t.Helper()
-	fsys := testOverlayFS(t, root)
+	fsys := testTreeFS(t, root)
 	absSub := filepath.Join(root, subPath)
 	data, kfile, err := generateManifest(fsys, absSub, doc)
 	if err != nil {
@@ -352,7 +396,7 @@ func TestBuild_InMemorySandbox(t *testing.T) {
 		root := writeTree(t, map[string]string{
 			"evil/kustomization.yaml": existingKustomization("../../../../../../../../etc/passwd"),
 		})
-		if _, err := fluxkustomize.Build(testOverlayFS(t, root), filepath.Join(root, "evil")); err == nil {
+		if _, err := fluxkustomize.Build(testTreeFS(t, root), filepath.Join(root, "evil")); err == nil {
 			t.Fatal("expected build to fail for an out-of-tree resource, got nil error")
 		}
 	})
@@ -384,7 +428,7 @@ func TestGenerateManifest_SourceIgnoreFiltersScan(t *testing.T) {
 
 	// Behind the ignore filesystem, scanManifests never sees .sops.yaml so a
 	// path:./ build over the working tree renders the ConfigMap.
-	fsys := testIgnoreOverlayFS(t, root)
+	fsys := testIgnoreTreeFS(t, root)
 	data, kfile, err := generateManifest(fsys, root, ksDoc(nil))
 	if err != nil {
 		t.Fatalf("generateManifest(ignore): %v", err)
@@ -407,20 +451,13 @@ func TestGenerateManifest_SourceIgnoreFiltersScan(t *testing.T) {
 	// Without the filter (a fetched artifact, already filtered, would not hit
 	// this), scanManifests includes .sops.yaml and fails to decode it — the bug
 	// the filter fixes.
-	if _, _, err := generateManifest(testOverlayFS(t, root), root, ksDoc(nil)); err == nil {
+	if _, _, err := generateManifest(testTreeFS(t, root), root, ksDoc(nil)); err == nil {
 		t.Fatal("expected generate/scan to fail on the unfiltered .sops.yaml, got nil")
 	}
 }
 
-// TestFindOrGenerate_MemoryPopulatedSubdirNotDescended is the zariel cnpg-system
-// regression. An auto-generated parent (no kustomization.yaml) over a subdir
-// that DOES carry a kustomization.yaml must list the subdir (./cnpg) as a
-// resource and never the subdir's kustomization.yaml file — even when preflight
-// has rewritten a remote resource under that subdir into the memory layer. That
-// memory write makes the subdir exist in both overlay layers; before the
-// overlayFS.Walk SkipDir fix, the disk walk re-descended the SkipDir'd subdir
-// and added ./cnpg/kustomization.yaml as a stray resource (which kustomize then
-// failed to decode: "missing metadata.name").
+// SkipDir must prune a subpackage from both layers after preflight writes into
+// it. The parent lists the subpackage once, never its kustomization.yaml.
 func TestFindOrGenerate_MemoryPopulatedSubdirNotDescended(t *testing.T) {
 	root := writeTree(t, map[string]string{
 		// Parent dir intentionally has NO kustomization.yaml -> auto-generate.
@@ -429,7 +466,7 @@ func TestFindOrGenerate_MemoryPopulatedSubdirNotDescended(t *testing.T) {
 		"other/kustomization.yaml": existingKustomization("./cm.yaml"),
 		"other/cm.yaml":            cmYAML("other-cm"),
 	})
-	fsys := testOverlayFS(t, root)
+	fsys := testTreeFS(t, root)
 	// Simulate preflightRemoteResources rewriting a remote resource under cnpg/
 	// into memory, so cnpg/ exists in BOTH the memory and disk layers.
 	seed := filepath.Join(root, "cnpg", "app", remoteResourcePrefix+"deadbeef.yaml")

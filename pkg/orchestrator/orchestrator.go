@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 	"sync"
 
 	"github.com/home-operations/flate/pkg/change"
@@ -15,14 +16,13 @@ import (
 	"github.com/home-operations/flate/pkg/discovery"
 	"github.com/home-operations/flate/pkg/helm"
 	"github.com/home-operations/flate/pkg/kustomize"
-	"github.com/home-operations/flate/pkg/loader"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
 	"github.com/home-operations/flate/pkg/source/bucket"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/source/cacheroot"
 	"github.com/home-operations/flate/pkg/source/external"
 	"github.com/home-operations/flate/pkg/source/git"
-	"github.com/home-operations/flate/pkg/source/git/mirror"
 	"github.com/home-operations/flate/pkg/source/helmchart"
 	"github.com/home-operations/flate/pkg/source/oci"
 	"github.com/home-operations/flate/pkg/source/ssrfguard"
@@ -41,6 +41,13 @@ var reconcilableKinds = []string{manifest.KindKustomization, manifest.KindHelmRe
 // and dependsOn edges.
 func isReconcilableKind(kind string) bool {
 	return kind == manifest.KindKustomization || kind == manifest.KindHelmRelease
+}
+
+// SubstitutionSource supplies a ConfigMap or Secret only for postBuild references.
+// Path identifies its input file in collision diagnostics; empty denotes SDK input.
+type SubstitutionSource struct {
+	Object manifest.BaseManifest
+	Path   string
 }
 
 // Config carries everything the orchestrator needs.
@@ -71,6 +78,11 @@ type Config struct {
 	// HelmOptions tunes templating (skip CRDs/secrets/tests, kube
 	// version, etc.).
 	HelmOptions helm.Options
+	// DisableChartDigestTracking selects chart digest tracking for the orchestrator.
+	// Bootstrap assigns HelmOptions.DisableChartDigestTracking and ignores any value
+	// supplied there. Nil selects automatic detection from file-loaded HelmRelease
+	// values; false forces tracking on. New copies the requested value.
+	DisableChartDigestTracking *bool
 	// WipeSecrets controls Secret cleartext placeholders.
 	WipeSecrets bool
 	// AllowMissingSecrets converts source auth-secret-not-found errors
@@ -79,6 +91,17 @@ type Config struct {
 	// resources mark Ready with a "skipped:" reason; omitted valuesFrom
 	// refs let HelmReleases render with the remaining values.
 	AllowMissingSecrets bool
+	// SubstituteFrom contains CI-side postBuild sources, never stored or emitted.
+	SubstituteFrom []SubstitutionSource
+	// Substitute overrides referenced and inline values when postBuild is present.
+	Substitute map[string]string
+	// StrictSubstitutions fails undefined postBuild variables without defaults.
+	StrictSubstitutions bool
+
+	// AllowMissingCRDs accepts CRD dependencies absent from the offline inputs
+	// because the cluster installs them at runtime, and reports each missing CRD
+	// with its dependent ResourceSets.
+	AllowMissingCRDs bool
 
 	// ForceGenericProvider sends non-generic spec.provider sources
 	// (GitRepository, OCIRepository, Bucket) down the generic SecretRef path
@@ -109,16 +132,11 @@ type Config struct {
 	// the cache survives reboots and OS tmpfs cleanups. Falls back to
 	// os.TempDir()/flate-cache only when UserCacheDir errors.
 	CacheDir string
-	// SourceCache, when non-nil, is shared across orchestrators. The
-	// `flate diff` flow constructs two orchestrators that point at the
-	// same on-disk source-cache root; they MUST share one *Cache so the
-	// internal mutex serializes concurrent slot allocation. When nil a
-	// per-orchestrator cache is constructed (fine for single-orchestrator
-	// commands like `build` / `get`).
-	SourceCache *source.Cache
+	// Cache, when injected, remains caller-owned and can be shared across runs.
+	Cache *sourcecache.Cache
 	// ExternalChanges, when non-nil, supplies the file-level diff so
 	// the orchestrator skips its built-in change.Detect step. The
-	// filter is still built from this set + the loaded SourceFiles
+	// filter is still built from this set and the discovery index
 	// during Bootstrap.
 	ExternalChanges *change.Set
 
@@ -182,41 +200,16 @@ type Orchestrator struct {
 	hrc    *helmrelease.Controller
 	rsc    *resourcesetctrl.Controller
 	filter *change.Filter
+	cache  *sourcecache.Cache
+	// Accepted identities are immutable after bootstrap, including for late consumers.
+	substitutionSources map[manifest.NamedResource]manifest.BaseManifest
 
-	// repoRoot is the resolved .git ancestor of cfg.Path (or
-	// cfg.Path when no .git exists). Populated during Bootstrap from
-	// discovery.Result.RepoRoot. Consumed by finalize.detectOrphans
-	// to feed loader.KSPathPrefixes the correct filesystem root for
-	// `components:` lookups (cfg.Path is the user-supplied --path,
-	// which may be a subdir of the actual repo root and produce
-	// wrong component prefixes — same bug fixed in pkg/discovery by
-	// PR #358).
+	// repoRoot anchors fresh claims for post-render orphan reporting, including
+	// Kustomizations admitted after static discovery is published.
 	repoRoot string
 
-	// sourceFiles tracks which file produced each loaded resource. It
-	// is populated during loadManifests and consumed once by Bootstrap
-	// to construct the immutable change.Filter.
-	sourceFiles map[manifest.NamedResource]string
-
-	// sourceRefs maps each loaded consumer (HelmRelease / Kustomization)
-	// to the source resources it references. Populated during discovery
-	// and consumed once by Bootstrap to give the change.Filter its
-	// reverse edge (changed source -> consuming HelmReleases).
-	sourceRefs map[manifest.NamedResource][]manifest.NamedResource
-
-	// parentOf is the structural-parent index Bootstrap computes after
-	// loadManifests + namespace inheritance — keyed by every
-	// reconcilable id that uses a parent gate (KS and HR). KS lookups
-	// only see KS entries and HR lookups only see HR entries because
-	// NamedResource includes Kind; the single map keeps controller
-	// wiring symmetric.
-	parentOf map[manifest.NamedResource]manifest.NamedResource
-
-	// selfProduce attributes each ConfigMap to the Kustomization(s) whose
-	// own render emits it (resolved across the bare-dir/component graph).
-	// The KS controller consults it to drop a self-produced
-	// postBuild.substituteFrom ConfigMap from the dependency set.
-	selfProduce *loader.SelfProduceIndex
+	// index is published once by Bootstrap and remains immutable during rendering.
+	index *manifest.DiscoveryIndex
 
 	// producers maps a target Secret to the in-repo ExternalSecret /
 	// SealedSecret declaring it (seeded at discovery, augmented at render).
@@ -224,33 +217,6 @@ type Orchestrator struct {
 	// valuesFrom Secret with a declared producer is skipped without
 	// --allow-missing-secrets. See manifest.ProducerIndex.
 	producers *manifest.ProducerIndex
-
-	// rendered tracks IDs the KS controller emitted from a parent
-	// render (vs. only loaded by the file walker). detectOrphans reads
-	// it to demote stale-on-disk resources to "orphan" rather than
-	// failing the run. Lives here, not on Store — iter-15 carved this
-	// orchestrator-internal bookkeeping out of the data substrate.
-	rendered *renderedSet
-
-	// existence is the file-indexed bookkeeping the DiscoveryOnly
-	// loader populated. Consumed by the depwait ResolveMissing
-	// closure to lazy-promote substituteFrom CMs/Secrets and any
-	// other file-indexed dep on demand.
-	existence *loader.ExistenceIndex
-
-	// componentCache memoizes manifest.ReadKustomizeComponents reads
-	// across every Bootstrap consumer that walks the KS list: the
-	// loader's FinalizeGenerators (KSPathPrefixes), discovery's
-	// parent-index builds and orphan-promotion pass, the change
-	// filter's buildOwnership, and finalize.detectOrphans. Without
-	// the shared cache each consumer re-reads every kustomization.yaml
-	// once — N consumers × K KSes file opens per Bootstrap; with it,
-	// each (repoRoot, base) pair is read exactly once. Live for the
-	// life of the orchestrator (cleared via GC when the Orchestrator
-	// is collected), instantiated fresh per New() so test harnesses
-	// that reuse an orchestrator across re-Bootstrap cycles still pick
-	// up on-disk edits.
-	componentCache *manifest.ComponentCache
 
 	// orphans records resources Run demoted from Failed → Ready because
 	// they aren't referenced by any parent KS. Populated during Run,
@@ -359,13 +325,38 @@ type Result struct {
 	// (submodule skips, cache resets) which stay on stderr. A consumer like
 	// konflate surfaces these alongside the diff.
 	Warnings []manifest.Warning
+	// Objects contains selected roots after metadata filtering, grouped by requested kind.
+	Objects []manifest.BaseManifest
+	// Counts records matched roots per requested kind before label filtering.
+	// It is nonnil only on completed snapshots returned by Select.
+	Counts map[string]int
+	// Statuses contains roster statuses and eligible diagnostic failures. Blocked
+	// messages are prepared for test reports without changing dependency identity.
+	Statuses map[manifest.NamedResource]store.StatusInfo
+	// ChartVersions contains versions resolved from selected HR chartRef sources.
+	ChartVersions map[manifest.NamedResource]string
+	// Causes maps prepared failure roots to sorted distinct blocked victims.
+	// Missing roots have no Failed entry; closed cycle roots carry prepared Failed messages.
+	Causes map[manifest.NamedResource][]manifest.NamedResource
+	// Unavailable contains canonical failure, soft-skip or suspension evidence for
+	// paired producer output, independently of fatal namespace scope.
+	Unavailable map[manifest.NamedResource]store.StatusInfo
+	// Unrelated contains prepared advisories for failures outside named fatal scope.
+	Unrelated []manifest.Warning
+	// External contains paired external-source skip disclosures, honoring explicit namespace scope.
+	External []manifest.Warning
 }
 
 // New constructs an Orchestrator. It allocates the Store and TaskService
 // but does not yet start any reconciliation — call Bootstrap then Run.
+// Substitution inputs are copied; callers MUST NOT mutate them during New.
 func New(cfg Config) (*Orchestrator, error) {
 	if cfg.Path == "" {
 		return nil, errors.New("orchestrator: path is required")
+	}
+
+	if err := snapshotSubstitutions(&cfg); err != nil {
+		return nil, err
 	}
 
 	// Arm (or disarm) the process-global SSRF egress guard before any fetcher
@@ -399,11 +390,6 @@ func New(cfg Config) (*Orchestrator, error) {
 
 	st := store.New()
 	ts := task.NewBounded(cfg.Concurrency)
-	cache := cmp.Or(cfg.SourceCache, source.NewCache(layout))
-	secretGet := func(ns, name string) *manifest.Secret {
-		s, _ := st.GetByName[*manifest.Secret](manifest.KindSecret, ns, name)
-		return s
-	}
 	// Route helm.Client's source-CR lookups straight through the canonical
 	// Store rather than maintaining a duplicate registry the HR controller
 	// would otherwise have to keep in sync via Add* push-API calls.
@@ -416,58 +402,19 @@ func New(cfg Config) (*Orchestrator, error) {
 	// payload at dispatch surfaces "<kind> fetcher: unexpected
 	// payload <T>" from the single adapter site rather than from
 	// four nearly-identical type assertions.
-	gitFetcher := &git.Fetcher{
-		Cache:           cache,
-		Secrets:         secretGet,
-		Mirrors:         mirror.New(layout),
-		Depth:           cfg.GitDepth,
-		RestrictSchemes: cfg.RestrictEgress,
-		ForceGeneric:    cfg.ForceGenericProvider,
-	}
-	// Resolve kustomize remote git bases (resources: URLs carrying ?ref= or a
-	// git marker) through the same clone/mirror/ref-resolution machinery as
-	// Flux GitRepository sources. The seam is a function value because
-	// pkg/kustomize cannot import pkg/source/git (import cycle via pkg/source).
-	treeCache.SetGitBaseFetcher(func(ctx context.Context, repoURL, ref string) (string, string, error) {
-		art, err := gitFetcher.FetchRemoteBase(ctx, repoURL, ref)
-		if err != nil {
-			return "", "", err
-		}
-		return art.LocalPath, art.Revision, nil
-	})
-	srcCtrl.Fetchers[manifest.KindGitRepository] = source.Wrap(
-		manifest.KindGitRepository, gitFetcher)
+	srcCtrl.Fetchers[manifest.KindGitRepository] = nil
 	srcCtrl.Fetchers[manifest.KindExternalArtifact] = source.Wrap(
 		manifest.KindExternalArtifact, &external.Fetcher{})
-	srcCtrl.Fetchers[manifest.KindBucket] = source.Wrap(
-		manifest.KindBucket, &bucket.Fetcher{Cache: cache, Secrets: secretGet, ForceGeneric: cfg.ForceGenericProvider})
+	// Nil entries reserve default fetchers until discovery fixes their policy.
+	srcCtrl.Fetchers[manifest.KindBucket] = nil
 	// HelmRepository: existence-only — the controller just needs the
 	// resource in Ready so HelmRelease deps unblock. The chart itself is
 	// fetched per (chart, version) through a synthesized HelmChart (see
 	// materializeHelmChartSource), so every chart kind routes through the
 	// source controller uniformly.
 	srcCtrl.Fetchers[manifest.KindHelmRepository] = source.ExistenceFetcher{}
-	// Bare OCI fetcher, used two ways: as the standalone OCIRepository
-	// fetcher, and as the HelmChart fetcher's OCI-branch delegate (so
-	// OCI-backed HelmRepository charts pull with the same auth/TLS/verify).
-	// Every OCIRepository real-fetches through the source controller, like
-	// every other source kind — there is no existence-only OCI path.
-	// Embedders that want one can still WithFetcher a source.ExistenceFetcher.
-	// Not separately retry-wrapped: each consuming fetcher's own WithRetry
-	// wrapper owns retries.
-	ociFetcher := &oci.Fetcher{Cache: cache, RegistryConfig: cfg.RegistryConfig, Secrets: secretGet, ForceGeneric: cfg.ForceGenericProvider}
-	srcCtrl.Fetchers[manifest.KindOCIRepository] = source.Wrap(
-		manifest.KindOCIRepository, ociFetcher)
-	// HelmChart: the single authoritative chart fetcher. The HR controller
-	// synthesizes a HelmChart per (chart, version, repo) for every
-	// HelmRepository-sourced chart; this fetcher pulls it — HTTP repos via
-	// helm's getter, OCI repos via the OCI fetcher above.
-	hcFetcher, err := helmchart.New(secretGet, resolver.HelmRepository, ociFetcher, cache, layout)
-	if err != nil {
-		return nil, err
-	}
-	srcCtrl.Fetchers[manifest.KindHelmChart] = source.Wrap(
-		manifest.KindHelmChart, hcFetcher)
+	srcCtrl.Fetchers[manifest.KindOCIRepository] = nil
+	srcCtrl.Fetchers[manifest.KindHelmChart] = nil
 	// Wrap every registered fetcher in the classified retry decorator so
 	// transient network failures (connection resets, refused connections,
 	// timeouts) get a bounded retry the same way across all source kinds,
@@ -476,19 +423,23 @@ func New(cfg Config) (*Orchestrator, error) {
 	// any future kind picks this up automatically. Reassigning existing
 	// map values during range is well-defined (no keys added/removed).
 	for kind, f := range srcCtrl.Fetchers {
-		srcCtrl.Fetchers[kind] = source.WithRetry(f, cfg.SourceRetry)
+		if f != nil {
+			srcCtrl.Fetchers[kind] = source.WithRetry(f, cfg.SourceRetry)
+		}
 	}
 	o := &Orchestrator{
-		cfg:            cfg,
-		store:          st,
-		tasks:          ts,
-		src:            srcCtrl,
-		ksc:            kustomization.New(st, ts, treeCache, cfg.WipeSecrets),
-		hrc:            helmrelease.New(st, ts, helmClient, cfg.HelmOptions, cfg.WipeSecrets),
-		rsc:            resourcesetctrl.New(st, ts, cfg.WipeSecrets),
-		rendered:       newRenderedSet(),
-		componentCache: manifest.NewComponentCache(),
-		depGraph:       newDependencyGraph(),
+		cfg:      cfg,
+		cache:    cfg.Cache,
+		store:    st,
+		tasks:    ts,
+		src:      srcCtrl,
+		ksc:      kustomization.New(st, ts, treeCache, cfg.WipeSecrets),
+		hrc:      helmrelease.New(st, ts, helmClient, cfg.HelmOptions, cfg.WipeSecrets),
+		rsc:      resourcesetctrl.New(st, ts, cfg.WipeSecrets),
+		depGraph: newDependencyGraph(),
+	}
+	if cfg.DisableChartDigestTracking != nil {
+		o.cfg.DisableChartDigestTracking = new(*cfg.DisableChartDigestTracking)
 	}
 	return o, nil
 }
@@ -523,8 +474,94 @@ func (o *Orchestrator) WithFetcher(kind string, f source.Fetcher) *Orchestrator 
 	return o
 }
 
-// Filter returns the change filter (may be nil-but-non-active).
-func (o *Orchestrator) Filter() *change.Filter { return o.filter }
+// parentOf returns the structural parent, falling back to rendered ownership.
+// Bootstrap must have completed; structural ownership is immutable thereafter.
+func (o *Orchestrator) parentOf(id manifest.NamedResource) (manifest.NamedResource, bool) {
+	if record, _ := o.index.Lookup(id); record.Parent != (manifest.NamedResource{}) {
+		return record.Parent, true
+	}
+	return o.store.EmittedParent(id)
+}
+
+// childrenByParent returns structural and rendered ownership, including children
+// whose structural parents failed before emission. Bootstrap must have completed
+// and Render must have returned; do not call concurrently with either. Returned
+// maps and sorted, deduplicated slices are independent of orchestrator state.
+func (o *Orchestrator) childrenByParent() map[manifest.NamedResource][]manifest.NamedResource {
+	children := o.store.EmittedChildrenByParent()
+	if o.index != nil {
+		for child, record := range o.index.Records {
+			if parent := record.Parent; parent != (manifest.NamedResource{}) {
+				children[parent] = append(children[parent], child)
+			}
+		}
+	}
+	for parent, ids := range children {
+		slices.SortFunc(ids, manifest.NamedResource.Compare)
+		children[parent] = slices.Compact(ids)
+	}
+	return children
+}
+
+// requiredDataDependencies returns authored HR/KS inputs and their known
+// producers and owners, including optional or unavailable inputs. Bootstrap
+// must have completed and Render must have returned; do not call concurrently
+// with either. The sorted, deduplicated slice is independent of stored state.
+func (o *Orchestrator) requiredDataDependencies(consumer manifest.NamedResource) []manifest.NamedResource {
+	deps := map[manifest.NamedResource]struct{}{}
+	addOwners := func(id manifest.NamedResource) {
+		record, _ := o.index.Lookup(id)
+		for _, owner := range record.Renderers {
+			deps[owner] = struct{}{}
+		}
+		for _, owner := range record.DeclarationOwners {
+			deps[owner] = struct{}{}
+		}
+		if record.Parent != (manifest.NamedResource{}) {
+			deps[record.Parent] = struct{}{}
+		}
+		if parent, ok := o.store.EmittedParent(id); ok {
+			deps[parent] = struct{}{}
+		}
+		file := record.File
+		if file == "" {
+			id.Namespace = ""
+			raw, _ := o.index.Lookup(id)
+			file = raw.File
+		}
+		for owner := range o.index.ReadersOfFile(file) {
+			deps[owner] = struct{}{}
+		}
+	}
+	addInput := func(kind, name string) {
+		if name == "" {
+			return
+		}
+		id := manifest.NamedResource{Kind: kind, Namespace: consumer.Namespace, Name: name}
+		deps[id] = struct{}{}
+		addOwners(id)
+		if producer, ok := o.producers.Producer(id); ok {
+			deps[producer] = struct{}{}
+			addOwners(producer)
+		}
+		for _, producer := range o.filter.ProducersFor(id) {
+			deps[producer] = struct{}{}
+		}
+	}
+	switch obj := o.store.GetObject(consumer).(type) {
+	case *manifest.HelmRelease:
+		for _, ref := range obj.ValuesFrom {
+			addInput(ref.Kind, ref.Name)
+		}
+	case *manifest.Kustomization:
+		for _, ref := range obj.PostBuildSubstituteFrom {
+			addInput(ref.Kind, ref.Name)
+		}
+	}
+	out := slices.Collect(maps.Keys(deps))
+	slices.SortFunc(out, manifest.NamedResource.Compare)
+	return out
+}
 
 // Bootstrap discovers manifests, applies namespace inheritance, primes
 // existence-only sources Ready, and prepares the change filter.
@@ -532,38 +569,64 @@ func (o *Orchestrator) Filter() *change.Filter { return o.filter }
 // remainder is dependency validation + change-filter construction.
 //
 // Idempotent: a second call returns nil without re-running discovery.
-// Bootstrap mutates orchestrator state (sourceFiles, parentOf,
-// existence, depGraph, componentCache, filter); replaying it would
-// rebuild the change.Filter from scratch, dropping any OnAdd hook
-// already wired into the store's listener set. Centralizing the
-// guard here means Render, embedders, and test harnesses all get
-// the invariant for free. A partial-failure path that returns before
-// flipping bootstrapped=true leaves the orchestrator eligible for a
-// clean retry on the next call.
+// Store listeners and runtime filter state MUST survive subsequent calls.
 func (o *Orchestrator) Bootstrap(ctx context.Context) error {
 	if o.bootstrapped {
 		return nil
+	}
+	if o.cache == nil {
+		var err error
+		o.cache, err = sourcecache.New(ctx, cacheroot.New(o.cfg.CacheDir))
+		if err != nil {
+			return err
+		}
 	}
 	res, err := discovery.Run(ctx, discovery.Config{
 		Path: o.cfg.Path, RepoRoot: o.cfg.RepoRoot, SelfURLs: o.cfg.SelfURLs,
 		KRMIgnoreFile: o.cfg.KRMIgnoreFile,
 		Store:         o.store, WipeSecrets: o.cfg.WipeSecrets,
-		ComponentCache: o.componentCache,
 	})
 	if err != nil {
 		return err
 	}
 	o.repoRoot = res.RepoRoot
-	o.sourceFiles = res.SourceFiles
-	o.sourceRefs = res.SourceRefs
-	o.parentOf = res.ParentOf
-	o.selfProduce = res.SelfProduce
+	o.index = res.Index
 	o.producers = res.Producers
-	o.existence = res.Existence
 
+	o.freezeSubstitutions()
 	o.failDependsOnCycles()
 	if err := o.buildChangeFilter(res.RepoRoot); err != nil {
 		return err
+	}
+	o.hrc.Options.DisableChartDigestTracking = res.DisableChartDigestTracking
+	if requested := o.cfg.DisableChartDigestTracking; requested != nil {
+		o.hrc.Options.DisableChartDigestTracking = *requested
+	}
+	secretGet := func(ns, name string) *manifest.Secret {
+		secret, _ := o.store.GetByName[*manifest.Secret](manifest.KindSecret, ns, name)
+		return secret
+	}
+	resolver := helm.NewStoreSourceResolver(o.store)
+	gitFetcher := &git.Fetcher{
+		Cache: o.cache, Secrets: secretGet, Depth: o.cfg.GitDepth,
+		RestrictSchemes: o.cfg.RestrictEgress, ForceGeneric: o.cfg.ForceGenericProvider,
+	}
+	o.ksc.Trees.SetGitBaseFetcher(func(ctx context.Context, request kustomize.GitBaseRequest) (*store.SourceArtifact, error) {
+		return gitFetcher.FetchRemoteBase(ctx, git.RemoteBaseRequest(request))
+	})
+	ociFetcher := &oci.Fetcher{Cache: o.cache, RegistryConfig: o.cfg.RegistryConfig, Secrets: secretGet, ForceGeneric: o.cfg.ForceGenericProvider}
+	for kind, f := range map[string]source.Fetcher{
+		manifest.KindGitRepository: source.Wrap(manifest.KindGitRepository, gitFetcher),
+		manifest.KindBucket: source.Wrap(manifest.KindBucket,
+			&bucket.Fetcher{Cache: o.cache, Secrets: secretGet, ForceGeneric: o.cfg.ForceGenericProvider}),
+		manifest.KindOCIRepository: source.Wrap(manifest.KindOCIRepository, ociFetcher),
+		manifest.KindHelmChart: source.Wrap(manifest.KindHelmChart,
+			helmchart.New(secretGet, resolver.HelmRepository, ociFetcher, helmchart.Config{
+				Cache: o.cache, DisableChartDigestTracking: o.hrc.Options.DisableChartDigestTracking})),
+	} {
+		if current, exists := o.src.Fetchers[kind]; exists && current == nil {
+			o.src.Fetchers[kind] = source.WithRetry(f, o.cfg.SourceRetry)
+		}
 	}
 	o.bootstrapped = true
 	return nil

@@ -2,19 +2,31 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/helm"
+	"github.com/home-operations/flate/pkg/loader"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/resourceset"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/cacheroot"
 	"github.com/home-operations/flate/pkg/store"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // TestDetectOrphans drives the orphan-detection logic in isolation —
@@ -44,21 +56,20 @@ func TestDetectOrphans(t *testing.T) {
 	}
 
 	o := &Orchestrator{
-		store:    store.New(),
-		rendered: newRenderedSet(),
-		sourceFiles: map[manifest.NamedResource]string{
+		store: store.New(),
+		index: indexForTest(map[manifest.NamedResource]string{
 			parent.Named():       "kubernetes/flux/cluster/ks.yaml",
 			orphan.Named():       "kubernetes/apps/orphan/ks.yaml",
 			emittedChild.Named(): "kubernetes/apps/wired/ks.yaml",
 			root.Named():         "kubernetes/standalone/ks.yaml",
-		},
+		}),
 	}
 	for _, ks := range []*manifest.Kustomization{parent, orphan, emittedChild, root} {
 		o.store.AddObject(ks)
 	}
 	// Mark emittedChild as rendered by its parent — simulates the
-	// AddObject + MarkRenderedBatch call cluster-apps's render would make.
-	o.rendered.MarkRenderedBatch(parent.Named(), []manifest.NamedResource{emittedChild.Named()})
+	// AddObject + RecordEmitted call cluster-apps's render would make.
+	o.store.RecordEmitted(parent.Named(), []manifest.NamedResource{emittedChild.Named()})
 
 	failed := map[manifest.NamedResource]store.StatusInfo{
 		orphan.Named():       {Status: store.StatusFailed, Message: "TIMEZONE undefined"},
@@ -66,7 +77,7 @@ func TestDetectOrphans(t *testing.T) {
 		root.Named():         {Status: store.StatusFailed, Message: "broken"},
 	}
 
-	orphans := o.detectOrphans(failed)
+	orphans := o.detectOrphans(failed, loader.Claims(o.store, o.repoRoot))
 
 	if _, ok := orphans[orphan.Named()]; !ok {
 		t.Errorf("expected orphan to be detected")
@@ -80,6 +91,12 @@ func TestDetectOrphans(t *testing.T) {
 	if got := len(orphans); got != 1 {
 		t.Errorf("expected exactly 1 orphan, got %d: %+v", got, orphans)
 	}
+	o.store.AddObject(&manifest.GitRepository{Name: "external", Namespace: "flux-system"})
+	o.store.AddObject(&manifest.Kustomization{
+		Name: "external", Namespace: "flux-system", Path: "./",
+		SourceKind: manifest.KindGitRepository, SourceName: "external", SourceNamespace: "flux-system",
+	})
+	assert.Diff(t, o.detectOrphans(failed, loader.Claims(o.store, o.repoRoot)), orphans)
 }
 
 // TestDetectOrphans_NonReconcilableKindsIgnored — ConfigMaps and
@@ -95,10 +112,10 @@ func TestDetectOrphans_NonReconcilableKindsIgnored(t *testing.T) {
 
 	o := &Orchestrator{
 		store: store.New(),
-		sourceFiles: map[manifest.NamedResource]string{
+		index: indexForTest(map[manifest.NamedResource]string{
 			parent.Named(): "ks.yaml",
 			cm.Named():     "apps/stuck/cm.yaml",
-		},
+		}),
 	}
 	o.store.AddObject(parent)
 	o.store.AddObject(cm)
@@ -106,7 +123,7 @@ func TestDetectOrphans_NonReconcilableKindsIgnored(t *testing.T) {
 	failed := map[manifest.NamedResource]store.StatusInfo{
 		cm.Named(): {Status: store.StatusFailed, Message: "bogus"},
 	}
-	orphans := o.detectOrphans(failed)
+	orphans := o.detectOrphans(failed, loader.Claims(o.store, o.repoRoot))
 	if len(orphans) != 0 {
 		t.Errorf("orphan detection should skip non-reconcilable kinds; got %+v", orphans)
 	}
@@ -129,12 +146,11 @@ func TestDetectOrphans_ParentFailedIsCascadeNotOrphan(t *testing.T) {
 	}
 
 	o := &Orchestrator{
-		store:    store.New(),
-		rendered: newRenderedSet(),
-		sourceFiles: map[manifest.NamedResource]string{
+		store: store.New(),
+		index: indexForTest(map[manifest.NamedResource]string{
 			parent.Named(): "kubernetes/flux/cluster/ks.yaml",
 			child.Named():  "kubernetes/apps/media/plex/ks.yaml",
-		},
+		}),
 	}
 	o.store.AddObject(parent)
 	o.store.AddObject(child)
@@ -143,7 +159,7 @@ func TestDetectOrphans_ParentFailedIsCascadeNotOrphan(t *testing.T) {
 		parent.Named(): {Status: store.StatusFailed, Message: "kustomize build boom"}, // the build that emitted nothing
 		child.Named():  {Status: store.StatusFailed, Message: "dependencies failed: cluster-apps"},
 	}
-	orphans := o.detectOrphans(failed)
+	orphans := o.detectOrphans(failed, loader.Claims(o.store, o.repoRoot))
 	if _, ok := orphans[child.Named()]; ok {
 		t.Errorf("child under a FAILED covering parent is a cascade victim, not an orphan: %+v", orphans)
 	}
@@ -311,9 +327,8 @@ data: {k: v}
 // same file and pointing at the SAME spec.path. They are peers (neither
 // renders the other), so they must not be wired as each other's
 // structural parent — a mutual parent edge deadlocks the pair in
-// collectDeps until the 30s per-dep timeout, cascading to anything that
-// dependsOn one of them. The run context is bounded so a regression
-// fails fast instead of riding the full DefaultTimeout.
+// collectDeps and stalls their dependents. The context timeout bounds
+// the run if a mutual parent edge regresses.
 func TestOrchestrator_TwoKSSameSpecPathNoSpuriousTimeout(t *testing.T) {
 	dir := t.TempDir()
 	// Two KSes, same spec.path ./flux, both defined in flux/repo.yaml so
@@ -368,8 +383,7 @@ data: {k: v}
 	if err := o.Bootstrap(context.Background()); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
-	// Bounded so a regressed mutual-parent deadlock fails in seconds, not
-	// the full 30s depwait.DefaultTimeout.
+	// The context timeout bounds a regressed mutual-parent deadlock.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := o.Run(ctx); err != nil {
@@ -560,7 +574,7 @@ spec:
 	if err := o.Bootstrap(context.Background()); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
-	// Bounded so a regressed self-deadlock fails fast, not at the full 30s cap.
+	// The context timeout bounds a regressed self-deadlock.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := o.Run(ctx); err != nil {
@@ -752,18 +766,12 @@ data: {k: v}
 	}
 }
 
-// TestOrchestrator_Render_RSExtensionAttributedToParentKS verifies
-// the post-Run ResourceSet expansion lands non-Flux RS children
-// (ExternalSecret, ConfigMap-as-data, etc.) in the manifest stream
-// of the structural-parent Kustomization. Without this, dragonfly-
-// acls-style RSes that emit ExternalSecrets from kustomize-substituted
-// RSIPs (the tholinka/home-ops `dragonfly-${APP}` pattern) would
-// silently drop their output — flate would render zero docs for the
-// RS even though the in-cluster controller would produce one.
 func TestOrchestrator_Render_RSExtensionAttributedToParentKS(t *testing.T) {
-	dir := t.TempDir()
-	// Parent KS at the repo root scans ./apps.
-	testutil.WriteFile(t, dir, "ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+	for _, workers := range []int{2, 4} {
+		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
+			dir := t.TempDir()
+			// Parent KS at the repo root scans ./apps.
+			testutil.WriteFile(t, dir, "ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
   name: apps
@@ -772,32 +780,39 @@ spec:
   path: ./apps
   sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
 `)
-	testutil.WriteFile(t, dir, "apps/kustomization.yaml", `resources:
-- rs.yaml
-- rsip.yaml
+			testutil.WriteFile(t, dir, "apps/kustomization.yaml", `resources: [rsip.yaml]
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: acl
+    literals: [seed=value]
+patches:
+  - target: {kind: ConfigMap, name: acl}
+    patch: |
+      - op: replace
+        path: /apiVersion
+        value: fluxcd.controlplane.io/v1
+      - op: replace
+        path: /kind
+        value: ResourceSet
+      - op: remove
+        path: /data
+      - op: add
+        path: /spec
+        value:
+          inputsFrom:
+            - apiVersion: fluxcd.controlplane.io/v1
+              kind: ResourceSetInputProvider
+              selector:
+                matchLabels: {role: db}
+          resourcesTemplate: |
+            apiVersion: external-secrets.io/v1
+            kind: ExternalSecret
+            metadata: {name: acl, namespace: flux-system}
+            spec:
+              target: {name: acl}
 `)
-	// RS with a selector-based inputsFrom emitting a RawObject
-	// (ExternalSecret) — the kind flate doesn't track natively.
-	testutil.WriteFile(t, dir, "apps/rs.yaml", `apiVersion: fluxcd.controlplane.io/v1
-kind: ResourceSet
-metadata: {name: acl, namespace: flux-system}
-spec:
-  inputsFrom:
-    - apiVersion: fluxcd.controlplane.io/v1
-      kind: ResourceSetInputProvider
-      selector:
-        matchLabels: {role: db}
-  resourcesTemplate: |
-    ---
-    apiVersion: external-secrets.io/v1
-    kind: ExternalSecret
-    metadata:
-      name: acl
-      namespace: flux-system
-    spec:
-      target: {name: acl}
-`)
-	testutil.WriteFile(t, dir, "apps/rsip.yaml", `apiVersion: fluxcd.controlplane.io/v1
+			testutil.WriteFile(t, dir, "apps/rsip.yaml", `apiVersion: fluxcd.controlplane.io/v1
 kind: ResourceSetInputProvider
 metadata:
   name: rsip
@@ -808,29 +823,41 @@ spec:
   defaultValues: {user: alice}
 `)
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	res, err := o.Render(context.Background())
-	if err != nil {
-		t.Fatalf("Render: %v", err)
-	}
-	ksID := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
-	mans := res.Manifests[ksID]
-	var found bool
-	for _, doc := range mans {
-		md, _ := doc["metadata"].(map[string]any)
-		name, _ := md["name"].(string)
-		kind, _ := doc["kind"].(string)
-		if kind == "ExternalSecret" && name == "acl" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected ExternalSecret/acl in res.Manifests[%s] (the RS-rendered child); kinds in stream: %v",
-			ksID, kindsOf(mans))
+			o, err := New(Config{Path: dir, WipeSecrets: true, Concurrency: workers})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if err := o.Bootstrap(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			rsID := manifest.NamedResource{Kind: manifest.KindResourceSet, Namespace: "flux-system", Name: "acl"}
+			if _, ok := o.index.Lookup(rsID); ok {
+				t.Fatal("fixture ResourceSet must only exist in render output")
+			}
+			res, err := o.Render(t.Context())
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			ksID := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
+			if owner, ok := o.Store().EmittedParent(rsID); !ok || owner != ksID {
+				t.Errorf("ResourceSet owner = (%v, %v), want %s", owner, ok, ksID)
+			}
+			mans := res.Manifests[ksID]
+			var found bool
+			for _, doc := range mans {
+				md, _ := doc["metadata"].(map[string]any)
+				name, _ := md["name"].(string)
+				kind, _ := doc["kind"].(string)
+				if kind == "ExternalSecret" && name == "acl" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected ExternalSecret/acl in res.Manifests[%s] (the RS-rendered child); kinds in stream: %v",
+					ksID, kindsOf(mans))
+			}
+		})
 	}
 }
 
@@ -1044,27 +1071,6 @@ func keysOf[V any](m map[manifest.NamedResource]V) []manifest.NamedResource {
 	return out
 }
 
-// TestOrchestrator_TypedListener verifies Store.OnStatus delivers a
-// typed StatusInfo payload (no `any` type-switching needed by the
-// embedder).
-func TestOrchestrator_TypedListener(t *testing.T) {
-	s := store.New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "k"}
-
-	var seen store.StatusInfo
-	unsub := s.OnStatus(func(other manifest.NamedResource, info store.StatusInfo) {
-		if other == id {
-			seen = info
-		}
-	}, false)
-	defer unsub()
-
-	s.UpdateStatus(id, store.StatusFailed, "boom")
-	if seen.Status != store.StatusFailed || seen.Message != "boom" {
-		t.Errorf("typed listener did not receive payload: %+v", seen)
-	}
-}
-
 // TestOrchestrator_ChangedOnlyKeepsSubstituteFromProducer is the
 // end-to-end regression fence for issue #418. A leaf HelmRelease
 // change under cluster-apps must NOT cause cluster-apps's reconcile
@@ -1187,9 +1193,9 @@ spec:
 	}
 
 	producerID := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "cluster-vars"}
-	f := o.Filter()
+	f := o.filter
 	if f == nil {
-		t.Fatalf("Filter() returned nil; ExternalChanges should have activated changed-only mode")
+		t.Fatalf("filter returned nil; ExternalChanges should have activated changed-only mode")
 	}
 	if !f.ShouldReconcile(producerID) {
 		t.Fatalf("producer %s must be in keep set; keep=%v", producerID, f.KeepNames())
@@ -1267,7 +1273,7 @@ data:
 	if err := o.Bootstrap(context.Background()); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
-	f := o.Filter()
+	f := o.filter
 	if f == nil {
 		t.Fatal("expected non-nil change filter when PathOrig differs from Path")
 	}
@@ -1290,7 +1296,7 @@ data:
 //     accumulation logic.
 //  2. The change.Filter pointer must be stable. Pre-fix,
 //     buildChangeFilter ran twice and replaced o.filter with a brand-
-//     new instance — the second filter dropped any OnAdd hook the
+//     new instance — the second filter dropped any runtime keep/refire configuration the
 //     first pass wired into the store's listener set.
 //  3. o.bootstrapped must already be true before the second call,
 //     pinning the guard's read site.
@@ -1346,7 +1352,7 @@ spec:
 	}
 	ksCount1 := len(o.Store().ListObjects(manifest.KindKustomization))
 	cmCount1 := len(o.Store().ListObjects(manifest.KindConfigMap))
-	filter1 := o.Filter()
+	filter1 := o.filter
 	if filter1 == nil {
 		t.Fatal("expected non-nil change filter when PathOrig differs from Path")
 	}
@@ -1356,7 +1362,7 @@ spec:
 	}
 	ksCount2 := len(o.Store().ListObjects(manifest.KindKustomization))
 	cmCount2 := len(o.Store().ListObjects(manifest.KindConfigMap))
-	filter2 := o.Filter()
+	filter2 := o.filter
 
 	if ksCount1 != ksCount2 {
 		t.Errorf("Kustomization count differs across Bootstrap calls: %d -> %d", ksCount1, ksCount2)
@@ -1494,4 +1500,348 @@ func TestOrchestrator_RenderErrorPathStopsCleanly(t *testing.T) {
 	// sync.Once guard composes safely with the deferred Stop above
 	// and any explicit caller Stop. No panic from double-Close.
 	o.Stop()
+}
+
+func writeDigestTrackingRelease(t *testing.T, root, rel, text string) {
+	t.Helper()
+	testutil.WriteFile(t, root, rel, `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata: {name: flux-instance, namespace: flux-system}
+spec:
+  suspend: true
+  chartRef: {kind: OCIRepository, name: fixture}
+  values:
+    instance:
+      kustomize:
+        patches:
+          - target: {name: helm-controller}
+            patch: "--feature-gates=DisableChartDigestTracking=`+text+`"
+`)
+}
+
+func writeDigestTrackingTree(t *testing.T, root string) {
+	t.Helper()
+	testutil.WriteFile(t, root, "flux/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: apps, namespace: flux-system}
+spec:
+  path: ./apps
+  sourceRef: {kind: GitRepository, name: flux-system}
+  postBuild:
+    substitute: {GATE: "true"}
+`)
+	testutil.WriteFile(t, root, "apps/kustomization.yaml", "resources: [hr.yaml]\n")
+}
+
+func TestOrchestrator_BootstrapChartDigestTracking(t *testing.T) {
+	for _, covered := range []bool{false, true} {
+		for _, override := range []struct {
+			name  string
+			value *bool
+		}{
+			{"auto", nil}, {"enabled", new(false)}, {"disabled", new(true)},
+		} {
+			for _, gate := range []bool{false, true} {
+				t.Run(fmt.Sprintf("covered_%t/%s/gate_%t", covered, override.name, gate), func(t *testing.T) {
+					root := t.TempDir()
+					writeDigestTrackingTree(t, root)
+					rel := "apps/hr.yaml"
+					if !covered {
+						rel = "flux/hr.yaml"
+						testutil.WriteFile(t, root, "apps/kustomization.yaml", "resources: []\n")
+					}
+					writeDigestTrackingRelease(t, root, rel, strconv.FormatBool(gate))
+					o, err := New(Config{Path: filepath.Join(root, "flux"), RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2,
+						DisableChartDigestTracking: override.value})
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(o.Stop)
+					if err := o.Bootstrap(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					want := gate
+					if override.value != nil {
+						want = *override.value
+						assert.Equal(t, o.cfg.DisableChartDigestTracking == override.value, false)
+						assert.Equal(t, *o.cfg.DisableChartDigestTracking, *override.value)
+					} else {
+						assert.Equal(t, o.cfg.DisableChartDigestTracking == nil, true)
+					}
+					assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, want)
+					id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "flux-system", Name: "flux-instance"}
+					assert.Equal(t, o.store.GetObject(id) == nil, covered)
+					_, indexed := o.index.Lookup(id)
+					assert.Equal(t, indexed, true)
+					writeDigestTrackingRelease(t, root, rel, strconv.FormatBool(!gate))
+					if err := o.Bootstrap(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, want)
+				})
+			}
+		}
+	}
+}
+
+func TestOrchestrator_BootstrapChartDigestTrackingFailureRetry(t *testing.T) {
+	for _, stage := range []string{"discovery", "change filter"} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			writeDigestTrackingTree(t, root)
+			writeDigestTrackingRelease(t, root, "apps/hr.yaml", "true")
+			cfg := Config{Path: filepath.Join(root, "flux"), RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2}
+			if stage == "discovery" {
+				if err := os.Remove(filepath.Join(root, "apps/kustomization.yaml")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("z-broken.yaml", filepath.Join(root, "apps/z-broken.yaml")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cfg.PathOrig = filepath.Join(root, "baseline-loop")
+				if err := os.Symlink("baseline-loop", cfg.PathOrig); err != nil {
+					t.Fatal(err)
+				}
+			}
+			o, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(o.Stop)
+			if err := o.Bootstrap(t.Context()); err == nil {
+				t.Fatal("expected Bootstrap failure")
+			}
+			assert.Equal(t, o.bootstrapped, false)
+			assert.Equal(t, o.cfg.DisableChartDigestTracking == nil, true)
+			assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, false)
+			writeDigestTrackingRelease(t, root, "apps/hr.yaml", "false")
+			if stage == "discovery" {
+				if err := os.Remove(filepath.Join(root, "apps/z-broken.yaml")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				o.cfg.PathOrig = ""
+			}
+			if err := o.Bootstrap(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, o.bootstrapped, true)
+			assert.Equal(t, o.cfg.DisableChartDigestTracking == nil, true)
+			assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, false)
+		})
+	}
+}
+
+func TestOrchestrator_ChartDigestTrackingRenderedBoundary(t *testing.T) {
+	for _, producer := range []string{"file", "kustomization", "resourceset"} {
+		t.Run(producer, func(t *testing.T) {
+			root := t.TempDir()
+			writeDigestTrackingTree(t, root)
+			switch producer {
+			case "file":
+				writeDigestTrackingRelease(t, root, "apps/hr.yaml", "true")
+			case "kustomization":
+				writeDigestTrackingRelease(t, root, "apps/hr.yaml", "${GATE}")
+			default:
+				testutil.WriteFile(t, root, "apps/hr.yaml", `apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSet
+metadata: {name: instance, namespace: flux-system}
+spec:
+  inputs: [{gate: "true"}]
+  resourcesTemplate: |
+    apiVersion: helm.toolkit.fluxcd.io/v2
+    kind: HelmRelease
+    metadata: {name: flux-instance, namespace: flux-system}
+    spec:
+      suspend: true
+      chartRef: {kind: OCIRepository, name: fixture}
+      values:
+        instance:
+          kustomize:
+            patches:
+              - patch: "DisableChartDigestTracking=<< inputs.gate >>"
+`)
+			}
+			testutil.WriteFile(t, root, "apps/cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: proof}\ndata: {value: stable}\n")
+			var previous []byte
+			for _, resources := range []string{"[hr.yaml, cm.yaml]", "[cm.yaml, hr.yaml]"} {
+				testutil.WriteFile(t, root, "apps/kustomization.yaml", "resources: "+resources+"\n")
+				o, err := New(Config{Path: filepath.Join(root, "flux"), RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(o.Stop)
+				if err := o.Bootstrap(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, producer == "file")
+				res, err := o.Render(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "flux-system", Name: "flux-instance"}
+				hr, ok := o.store.Get[*manifest.HelmRelease](id)
+				if !ok {
+					t.Fatal("qualifying rendered release missing")
+				}
+				instance := hr.Values["instance"].(map[string]any)
+				patches := instance["kustomize"].(map[string]any)["patches"].([]any)
+				assert.Equal(t, strings.Contains(patches[0].(map[string]any)["patch"].(string), "DisableChartDigestTracking=true"), true)
+				assert.Equal(t, o.cfg.DisableChartDigestTracking == nil, true)
+				assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, producer == "file")
+				ks := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
+				docs := slices.Clone(res.Manifests[ks])
+				slices.SortFunc(docs, func(a, b map[string]any) int {
+					return strings.Compare(a["kind"].(string), b["kind"].(string))
+				})
+				output, err := json.Marshal(docs)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if previous != nil {
+					assert.Equal(t, string(output), string(previous))
+				}
+				previous = output
+				o.Stop()
+			}
+		})
+	}
+}
+
+func TestRenderTrees_ChartDigestTrackingIndependent(t *testing.T) {
+	baseRoot, headRoot := t.TempDir(), t.TempDir()
+	for _, root := range []string{baseRoot, headRoot} {
+		writeDigestTrackingTree(t, root)
+	}
+	writeDigestTrackingRelease(t, baseRoot, "apps/hr.yaml", "false")
+	writeDigestTrackingRelease(t, headRoot, "apps/hr.yaml", "true")
+	for _, tc := range []struct {
+		name       string
+		supplied   *bool
+		base, head bool
+	}{
+		{name: "independent detection", head: true},
+		{name: "force tracking", supplied: new(false)},
+		{name: "force disabled", supplied: new(true), base: true, head: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, head, err := RenderTrees(t.Context(),
+				Tree{Path: filepath.Join(baseRoot, "flux"), RepoRoot: baseRoot},
+				Tree{Path: filepath.Join(headRoot, "flux"), RepoRoot: headRoot},
+				Config{CacheDir: t.TempDir(), Concurrency: 2, DisableChartDigestTracking: tc.supplied})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, base.hrc.Options.DisableChartDigestTracking, tc.base)
+			assert.Equal(t, head.hrc.Options.DisableChartDigestTracking, tc.head)
+			if tc.supplied != nil {
+				assert.Equal(t, *tc.supplied, tc.base)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_ChartDigestTrackingCallerOwnership(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(disabled), func(t *testing.T) {
+			root := t.TempDir()
+			writeDigestTrackingTree(t, root)
+			writeDigestTrackingRelease(t, root, "apps/hr.yaml", strconv.FormatBool(!disabled))
+			requested := disabled
+			cfg := Config{Path: filepath.Join(root, "flux"), RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2,
+				DisableChartDigestTracking: &requested}
+			first, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(first.Stop)
+			second, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(second.Stop)
+			requested = !disabled
+			for _, o := range []*Orchestrator{first, second} {
+				if err := o.Bootstrap(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, disabled)
+				assert.Equal(t, requested, !disabled)
+			}
+			assert.Equal(t, first.cfg.DisableChartDigestTracking == second.cfg.DisableChartDigestTracking, false)
+		})
+	}
+}
+
+func TestOrchestrator_BootstrapChartDigestTrackingInputOrder(t *testing.T) {
+	for _, gates := range [][]string{{"true", "false"}, {"false", "true"}} {
+		t.Run(strings.Join(gates, "/"), func(t *testing.T) {
+			root := t.TempDir()
+			writeDigestTrackingTree(t, root)
+			writeDigestTrackingRelease(t, root, "flux/a.yaml", gates[0])
+			writeDigestTrackingRelease(t, root, "flux/z.yaml", gates[1])
+			testutil.WriteFile(t, root, "apps/kustomization.yaml", "resources: []\n")
+			o, err := New(Config{Path: filepath.Join(root, "flux"), RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(o.Stop)
+			if err := o.Bootstrap(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, o.hrc.Options.DisableChartDigestTracking, true)
+		})
+	}
+}
+
+func TestRenderTrees_InjectedCacheRemainsCallerOwned(t *testing.T) {
+	for _, workers := range []int{2, 4} {
+		for _, backing := range []string{"memory", "disk"} {
+			t.Run(fmt.Sprintf("workers_%d/%s", workers, backing), func(t *testing.T) {
+				root := ""
+				if backing == "disk" {
+					root = t.TempDir()
+				}
+				c, err := sourcecache.New(t.Context(), cacheroot.New(root))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = c.Close() })
+				calls := 0
+				key := sourcecache.BlobKey{ID: "blob-owner-test"}
+				produce := func(w io.Writer) (ocispec.Descriptor, error) {
+					calls++
+					_, err := io.WriteString(w, "held")
+					return ocispec.Descriptor{}, err
+				}
+				reader, _, err := c.Blob(t.Context(), key, time.Hour, produce)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = reader.Close()
+				baseDir, headDir := t.TempDir(), t.TempDir()
+				for _, dir := range []string{baseDir, headDir} {
+					testutil.WriteFile(t, dir, "cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: input}\n")
+				}
+				base, head, err := RenderTrees(t.Context(), Tree{RepoRoot: baseDir}, Tree{RepoRoot: headDir},
+					Config{Cache: c, CacheDir: root, Concurrency: workers})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if base.cache != c || head.cache != c {
+					t.Fatal("diff sides have different acquisition owners")
+				}
+				reader, _, err = c.Blob(t.Context(), key, time.Hour, produce)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(reader)
+				_ = reader.Close()
+				if err != nil || string(data) != "held" || calls != 1 {
+					t.Fatalf("caller cache after both sides stop: data=%q calls=%d err=%v", data, calls, err)
+				}
+			})
+		}
+	}
 }

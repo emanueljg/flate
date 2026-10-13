@@ -2,26 +2,80 @@ package helmrelease
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/change"
+	"github.com/home-operations/flate/pkg/depwait"
 	"github.com/home-operations/flate/pkg/helm"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/schedule"
 	"github.com/home-operations/flate/pkg/source/cacheroot"
 	"github.com/home-operations/flate/pkg/store"
 	"github.com/home-operations/flate/pkg/task"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func newTestController(t *testing.T, filter *change.Filter) (*Controller, *store.Store) {
 	t.Helper()
 	return newTestControllerWithOptions(t, ReconcileOptions{Filter: filter})
+}
+
+type indexedOrderingDeps map[manifest.NamedResource]bool
+
+func (i indexedOrderingDeps) IsFileIndexed(id manifest.NamedResource) bool { return i[id] }
+func (indexedOrderingDeps) Promote(manifest.NamedResource) bool            { return false }
+
+func TestController_CollectHRDepsOrderingFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		active, selected, indexed bool
+		present                   bool
+		status                    store.Status
+		retain                    bool
+	}{
+		{name: "unfiltered missing", retain: true},
+		{name: "known file excluded", active: true, indexed: true},
+		{name: "render generated excluded", active: true, present: true},
+		{name: "unknown retained", active: true, retain: true},
+		{name: "selected ready", active: true, selected: true, present: true, status: store.StatusReady, retain: true},
+		{name: "selected failed", active: true, selected: true, present: true, status: store.StatusFailed, retain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := &manifest.HelmRelease{Name: "target", Namespace: "apps"}
+			var changes *change.Set
+			if tc.active {
+				files := []string{"consumer.yaml"}
+				if tc.selected {
+					files = append(files, "target.yaml")
+				}
+				changes = change.NewSet(files)
+			}
+			hr := &manifest.HelmRelease{Name: "consumer", Namespace: "apps", DependsOn: []manifest.DependencyRef{{NamedResource: target.Named(), ReadyExpr: "dep.spec.suspend == false"}}}
+			filter := change.NewFilter(changes, &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{hr.Named(): {File: "consumer.yaml"}, target.Named(): {File: "target.yaml"}}}, testutil.MapLister{})
+			c, st := newTestControllerWithOptions(t, ReconcileOptions{Filter: filter, Existence: indexedOrderingDeps{target.Named(): tc.indexed}})
+			if tc.present {
+				st.AddObject(target)
+				st.UpdateStatus(target.Named(), tc.status, "fixture")
+			}
+			size := len(filter.KeepNames())
+			deps := c.OrderingDeps(hr.DependsOn)
+			if got := slices.Contains(deps, hr.DependsOn[0]); got != tc.retain {
+				t.Errorf("ordering edge retained = %v, want %v; deps = %v", got, tc.retain, deps)
+			}
+			if len(filter.KeepNames()) != size || len(hr.DependsOn) != 1 {
+				t.Error("ordering collection must preserve keep and input edges")
+			}
+		})
+	}
 }
 
 func newTestControllerWithParentOf(t *testing.T, parentOf map[manifest.NamedResource]manifest.NamedResource) (*Controller, *store.Store) {
@@ -68,7 +122,7 @@ func newTestControllerWithOptions(t *testing.T, opts ReconcileOptions) (*Control
 // AddObject→listener→status-poll dispatch in unit tests.
 func dispatchToFixpoint(t *testing.T, c *Controller, st *store.Store, id manifest.NamedResource) store.StatusInfo {
 	t.Helper()
-	for _, drain := range []int{0, 1, 2} {
+	for _, drain := range []manifest.DrainLevel{manifest.DrainNone, manifest.DrainCascade, manifest.DrainForce} {
 		if blocked := c.ReconcileNode(context.Background(), id, drain); len(blocked) == 0 {
 			break
 		}
@@ -78,12 +132,6 @@ func dispatchToFixpoint(t *testing.T, c *Controller, st *store.Store, id manifes
 }
 
 func TestMaterializeHelmChartSource_RepointsAndRegisters(t *testing.T) {
-	c, st := newTestController(t, nil)
-	st.AddObject(&manifest.HelmRepository{
-		Name: "truecharts", Namespace: "flux-system",
-		URL:  "oci://oci.trueforge.org/truecharts",
-		Type: manifest.RepoTypeOCI,
-	})
 	hr := &manifest.HelmRelease{
 		Name: "kromgo", Namespace: "apps",
 		Chart: manifest.HelmChart{
@@ -94,6 +142,21 @@ func TestMaterializeHelmChartSource_RepointsAndRegisters(t *testing.T) {
 			Version:       "3.0.0",
 		},
 	}
+
+	filter := change.NewFilter(change.NewSet([]string{"release.yaml"}), &manifest.DiscoveryIndex{
+		Records: map[manifest.NamedResource]manifest.DiscoveryRecord{hr.Named(): {File: "release.yaml"}},
+	}, testutil.MapLister{})
+	c, st := newTestController(t, filter)
+	st.AddObject(&manifest.HelmRepository{
+		Name: "truecharts", Namespace: "flux-system",
+		URL:  "oci://oci.trueforge.org/truecharts",
+		Type: sourcev1.HelmRepositoryTypeOCI,
+	})
+	st.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
+		if id.Kind == manifest.KindHelmChart && !filter.ShouldReconcile(id) {
+			t.Error("synthetic HelmChart was published before entering the changed-only keep set")
+		}
+	}, false)
 
 	got, repointed := c.materializeHelmChartSource(hr.Named(), hr)
 	if !repointed {
@@ -111,8 +174,6 @@ func TestMaterializeHelmChartSource_RepointsAndRegisters(t *testing.T) {
 		t.Errorf("chart name/version = %q/%q, want kromgo/3.0.0", got.Chart.Name, got.Chart.Version)
 	}
 
-	// Synthetic HelmChart registered for the source controller, seeded
-	// Pending so the chart-source depwait never observes it as absent.
 	synID := manifest.NamedResource{Kind: manifest.KindHelmChart, Namespace: got.Chart.RepoNamespace, Name: got.Chart.RepoName}
 	obj := st.GetObjectByName(manifest.KindHelmChart, synID.Namespace, synID.Name)
 	if obj == nil {
@@ -124,67 +185,110 @@ func TestMaterializeHelmChartSource_RepointsAndRegisters(t *testing.T) {
 		hc.SourceRef.Kind != manifest.KindHelmRepository || hc.SourceRef.Name != "truecharts" {
 		t.Errorf("synthetic HelmChart = %+v, want chart kromgo@3.0.0 sourceRef HelmRepository/truecharts", hc)
 	}
-	if info, ok := st.GetStatus(synID); !ok || info.Status != store.StatusPending {
-		t.Errorf("synthetic status = %+v (ok=%v), want Pending", info, ok)
+	if owner, ok := st.EmittedParent(synID); ok {
+		t.Errorf("synthetic chart has render owner %v", owner)
+	}
+	if info, ok := st.GetStatus(synID); ok {
+		t.Errorf("consumer wrote synthetic status = %+v, want no Ready condition", info)
 	}
 }
 
-// TestMaterializeHelmChartSource_IdempotentReSeed pins the idempotency fix:
-// once the synthetic HelmChart has been fetched (Ready), re-running materialize
-// — a parent-KS re-emit, or a SECOND HelmRelease that shares the same
-// (repo, chart, version) synthetic id — must NOT flap it back to Pending. A
-// byte-identical AddObject fires no EventObjectAdded, so the source controller
-// would never re-fetch to restore Ready and the chart-source await would wedge
-// until timeout. The Pending seed therefore fires only when status is absent.
-func TestMaterializeHelmChartSource_IdempotentReSeed(t *testing.T) {
-	c, st := newTestController(t, nil)
-	st.AddObject(&manifest.HelmRepository{
-		Name: "bitnami", Namespace: "flux-system",
-		URL: "https://charts.example/bitnami",
-	})
-	mkHR := func(name string) *manifest.HelmRelease {
-		return &manifest.HelmRelease{
-			Name: name, Namespace: "apps",
-			Chart: manifest.HelmChart{
-				RepoKind: manifest.KindHelmRepository, RepoNamespace: "flux-system", RepoName: "bitnami",
-				Name: "redis", Version: "1.0.0",
-			},
-		}
-	}
+type chartSourceDispatcher func(context.Context, schedule.NodeID, manifest.DrainLevel) (schedule.Outcome, []schedule.NodeID, bool)
 
-	// First HR materializes the synthetic and seeds it Pending.
-	hrA := mkHR("redis-a")
-	got1, repointed := c.materializeHelmChartSource(hrA.Named(), hrA)
-	if !repointed {
-		t.Fatal("first materialize did not repoint")
-	}
-	synID := manifest.NamedResource{Kind: manifest.KindHelmChart, Namespace: got1.Chart.RepoNamespace, Name: got1.Chart.RepoName}
+func (d chartSourceDispatcher) Dispatch(ctx context.Context, id schedule.NodeID, level manifest.DrainLevel) (schedule.Outcome, []schedule.NodeID, bool) {
+	return d(ctx, id, level)
+}
 
-	// Source controller fetches it and marks it Ready.
-	st.UpdateStatus(synID, store.StatusReady, "")
-
-	// A second HR sharing the same (repo, chart, version) synthesizes the SAME
-	// id; re-materialize must leave the Ready status untouched.
-	hrB := mkHR("redis-b")
-	got2, repointed := c.materializeHelmChartSource(hrB.Named(), hrB)
-	if !repointed {
-		t.Fatal("second materialize did not repoint")
-	}
-	if got2.Chart.RepoName != synID.Name {
-		t.Fatalf("second HR synthesized id %q, want shared %q", got2.Chart.RepoName, synID.Name)
-	}
-	if info, ok := st.GetStatus(synID); !ok || info.Status != store.StatusReady {
-		t.Errorf("synthetic status flapped to %+v (ok=%v), want still Ready", info, ok)
-	}
-
-	// Re-emitting the SAME HR (a fresh reconcile snapshot, still
-	// HelmRepository-sourced) is likewise idempotent — no flap.
-	reHRA := mkHR("redis-a")
-	if _, repointed := c.materializeHelmChartSource(reHRA.Named(), reHRA); !repointed {
-		t.Fatal("re-materialize of the same HR did not repoint")
-	}
-	if info, ok := st.GetStatus(synID); !ok || info.Status != store.StatusReady {
-		t.Errorf("synthetic status flapped to %+v after re-emit, want still Ready", info)
+func TestMaterializeHelmChartSource_SharedSourceCompletes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status store.Status
+	}{
+		{"ready", store.StatusReady},
+		{"failed", store.StatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c, st := newTestController(t, nil)
+				st.AddObject(&manifest.HelmRepository{
+					Name: "bitnami", Namespace: "flux-system", URL: "https://charts.example/bitnami",
+				})
+				consumers := []*manifest.HelmRelease{
+					{Name: "redis-a", Namespace: "apps"},
+					{Name: "redis-b", Namespace: "apps"},
+				}
+				chart := manifest.HelmChart{
+					RepoKind: manifest.KindHelmRepository, RepoNamespace: "flux-system", RepoName: "bitnami",
+					Name: "redis", Version: "1.0.0",
+				}
+				for _, hr := range consumers {
+					hr.Chart = chart
+					st.AddObject(hr)
+				}
+				first := *consumers[0]
+				c.materializeHelmChartSource(first.Named(), &first)
+				source := chartSourceID(&first)
+				sourceStarted := make(chan struct{})
+				sourceRelease := make(chan struct{})
+				parked := make(chan manifest.NamedResource, len(consumers))
+				dispatch := chartSourceDispatcher(func(ctx context.Context, id schedule.NodeID, level manifest.DrainLevel) (schedule.Outcome, []schedule.NodeID, bool) {
+					if id == source {
+						close(sourceStarted)
+						<-sourceRelease
+						if tc.status == store.StatusReady {
+							st.SetArtifact(id, &store.SourceArtifact{})
+						}
+						st.UpdateStatus(id, tc.status, "source finished")
+						return schedule.OutcomeTerminal, nil, false
+					}
+					hr := *st.GetObject(id).(*manifest.HelmRelease)
+					c.materializeHelmChartSource(id, &hr)
+					err := c.awaitChartSource(ctx, &hr, level)
+					if blocked, ok := errors.AsType[*depwait.ErrBlocked](err); ok {
+						parked <- id
+						return schedule.OutcomeBlocked, blocked.Deps, false
+					}
+					if err != nil {
+						st.UpdateStatus(id, store.StatusFailed, err.Error())
+						return schedule.OutcomeDependencyFailed, []schedule.NodeID{source}, false
+					}
+					st.UpdateStatus(id, store.StatusReady, "")
+					return schedule.OutcomeTerminal, nil, false
+				})
+				s := schedule.New(task.NewBounded(2), dispatch)
+				s.Seed([]schedule.NodeID{source})
+				done := make(chan error, 1)
+				go func() { done <- s.Run(t.Context()) }()
+				<-sourceStarted
+				for _, hr := range consumers {
+					s.OnArrival(hr.Named(), true)
+				}
+				second := *consumers[1]
+				c.materializeHelmChartSource(second.Named(), &second)
+				if chartSourceID(&second) != source {
+					t.Errorf("second source = %s, want shared %s", chartSourceID(&second), source)
+				}
+				if info, ok := st.GetStatus(source); ok {
+					t.Errorf("consumer wrote synthetic status = %+v, want no Ready condition", info)
+				}
+				for range consumers {
+					<-parked
+				}
+				synctest.Wait()
+				close(sourceRelease)
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				if info, ok := st.GetStatus(source); !ok || info.Status != tc.status || info.Message != "source finished" {
+					t.Errorf("source status = %+v (ok=%v), want preserved %v", info, ok, tc.status)
+				}
+				for _, hr := range consumers {
+					if info, ok := st.GetStatus(hr.Named()); !ok || info.Status != tc.status {
+						t.Errorf("consumer %s status = %+v (ok=%v), want %v", hr.Named(), info, ok, tc.status)
+					}
+				}
+			})
+		})
 	}
 }
 
@@ -213,7 +317,7 @@ func TestMaterializeHelmChartSource_LateArrival(t *testing.T) {
 	st.AddObject(&manifest.HelmRepository{
 		Name: "truecharts", Namespace: "flux-system",
 		URL:  "oci://oci.trueforge.org/truecharts",
-		Type: manifest.RepoTypeOCI,
+		Type: sourcev1.HelmRepositoryTypeOCI,
 	})
 
 	// Pass 2: now present — must repoint to the synthetic HelmChart.
@@ -289,12 +393,7 @@ func TestController_SuspendedShortCircuitsToReady(t *testing.T) {
 }
 
 func TestController_FilterUnchangedShortCircuitsToReady(t *testing.T) {
-	filter := change.NewFilter(
-		change.NewSet(nil),
-		map[manifest.NamedResource]string{},
-		"",
-		testutil.MapLister{},
-	)
+	filter := change.NewFilter(change.NewSet(nil), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}}, testutil.MapLister{})
 	c, st := newTestController(t, filter)
 	hr := &manifest.HelmRelease{Name: "demo", Namespace: "default"}
 	st.AddObject(hr)
@@ -347,7 +446,6 @@ data:
 	hr := &manifest.HelmRelease{
 		Name: "demo", Namespace: "default",
 		Interval: metav1Duration(time.Hour),
-		Timeout:  ptrDuration(100 * time.Millisecond),
 		ValuesFrom: []manifest.ValuesReference{
 			{Kind: manifest.KindConfigMap, Name: "present-values"},
 			{Kind: manifest.KindSecret, Name: "app-values"},
@@ -378,6 +476,53 @@ data:
 	}
 	if got := renderedConfigMapValue(art.Manifests, "fallback"); got != "fallback" {
 		t.Fatalf("rendered fallback = %q, want fallback", got)
+	}
+	assert.Diff(t, st.Warnings(), []manifest.Warning{
+		{Resource: hr.Named(), Category: manifest.WarnOmittedValues, Message: "required valuesFrom ConfigMap/default/runtime-values omitted from offline render", Count: 1},
+		{Resource: hr.Named(), Category: manifest.WarnOmittedValues, Message: "required valuesFrom Secret/default/app-values omitted from offline render", Count: 1},
+	})
+	warnings := st.Warnings()
+	hr = hr.Clone()
+	hr.Labels = map[string]string{"owner": "re-emitted"}
+	st.AddObject(hr)
+	assert.Equal(t, dispatchToFixpoint(t, c, st, hr.Named()).Status, store.StatusReady)
+	assert.Equal(t, st.GetArtifact(hr.Named()), store.Artifact(art))
+	assert.Diff(t, st.Warnings(), warnings)
+	hr = hr.Clone()
+	hr.ValuesFrom = append(hr.ValuesFrom, manifest.ValuesReference{Kind: manifest.KindSecret, Name: "another-values"})
+	st.AddObject(hr)
+	assert.Equal(t, dispatchToFixpoint(t, c, st, hr.Named()).Status, store.StatusReady)
+	if !slices.ContainsFunc(st.Warnings(), func(w manifest.Warning) bool {
+		return w.Message == "required valuesFrom Secret/default/another-values omitted from offline render" && w.Count == 1
+	}) {
+		t.Fatalf("new omitted reference did not produce a Count 1 warning: %+v", st.Warnings())
+	}
+}
+
+func TestController_ValuesOmissionWaitsForBlockedReferences(t *testing.T) {
+	c, st := newTestControllerWithOptions(t, ReconcileOptions{AllowMissingSecrets: true})
+	chart := &manifest.HelmChartSource{Name: "chart", Namespace: "apps"}
+	st.AddObject(chart)
+	st.UpdateStatus(chart.Named(), store.StatusFailed, "chart failed")
+	hr := &manifest.HelmRelease{
+		Name: "consumer", Namespace: "apps",
+		Chart:      manifest.HelmChart{RepoKind: manifest.KindHelmChart, RepoNamespace: "apps", RepoName: chart.Name},
+		ValuesFrom: []manifest.ValuesReference{{Kind: manifest.KindSecret, Name: "values"}},
+	}
+	st.AddObject(hr)
+	values := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "apps", Name: "values"}
+	_, _, err := c.resolvePreRenderValuesFrom(t.Context(), hr, manifest.DrainNone)
+	blocked, ok := errors.AsType[*depwait.ErrBlocked](err)
+	if !ok || !slices.Equal(blocked.Deps, []manifest.NamedResource{values}) {
+		t.Fatalf("mixed gate = %v, want blocked values reference", err)
+	}
+	_, _, err = c.resolvePreRenderValuesFrom(t.Context(), hr, manifest.DrainCascade)
+	failed, ok := errors.AsType[*manifest.DependencyFailedError](err)
+	if !ok || !slices.Equal(failed.Failed, []manifest.NamedResource{chart.Named()}) || failed.Reasons[chart.Named()] != "chart failed" {
+		t.Fatalf("drained gate = %v, want chart failure after values omission", err)
+	}
+	if len(hr.ValuesFrom) != 1 || hr.ValuesFrom[0].Name != values.Name {
+		t.Fatal("omission mutated stored valuesFrom")
 	}
 }
 
@@ -419,7 +564,6 @@ data:
 	hr := &manifest.HelmRelease{
 		Name: "demo", Namespace: "default",
 		Interval: metav1Duration(time.Hour),
-		Timeout:  ptrDuration(100 * time.Millisecond),
 		ValuesFrom: []manifest.ValuesReference{
 			{Kind: manifest.KindConfigMap, Name: "present-values"},
 			{Kind: manifest.KindSecret, Name: "app-values"},
@@ -466,7 +610,6 @@ func TestController_MissingValuesFromNoProducerFailsWithoutFlag(t *testing.T) {
 	hr := &manifest.HelmRelease{
 		Name: "demo", Namespace: "default",
 		Interval:   metav1Duration(time.Hour),
-		Timeout:    ptrDuration(100 * time.Millisecond),
 		ValuesFrom: []manifest.ValuesReference{{Kind: manifest.KindSecret, Name: "no-producer"}},
 		Chart: manifest.HelmChart{
 			Name: "mychart", RepoName: "charts",
@@ -530,7 +673,7 @@ func TestHelmReleaseFingerprint_StableAcrossLabelStamping(t *testing.T) {
 	}
 	stamped.Annotations = map[string]string{"reconcile.fluxcd.io/requestedAt": "now"}
 
-	if got, want := helmReleaseFingerprint(stamped), helmReleaseFingerprint(base); got != want {
+	if got, want := helmReleaseFingerprint(stamped, "", nil), helmReleaseFingerprint(base, "", nil); got != want {
 		t.Errorf("fingerprint changed under label/annotation stamping; got %q want %q", got, want)
 	}
 }
@@ -549,8 +692,32 @@ func TestHelmReleaseFingerprint_DifferentOnSpecChange(t *testing.T) {
 	patched := base.Clone()
 	patched.DriftDetection = &helmv2.DriftDetection{Mode: helmv2.DriftDetectionEnabled}
 
-	if got := helmReleaseFingerprint(base); got == helmReleaseFingerprint(patched) {
+	if got := helmReleaseFingerprint(base, "", nil); got == helmReleaseFingerprint(patched, "", nil) {
 		t.Errorf("fingerprint should differ when spec.driftDetection mutates; both = %q", got)
+	}
+}
+
+func TestHelmReleaseFingerprint_SourceIdentity(t *testing.T) {
+	hr := &manifest.HelmRelease{Name: "demo", Namespace: "apps"}
+	const digest = "sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8"
+	art := &store.SourceArtifact{Digest: digest, Revision: "6.15.0@" + digest, LocalPath: "/chart"}
+	fp := helmReleaseFingerprint(hr, art.Digest+"\x00"+art.Revision, nil)
+	for _, tc := range []struct {
+		name     string
+		edit     func(*store.SourceArtifact)
+		wantSame bool
+	}{
+		{"digest", func(a *store.SourceArtifact) { a.Digest = digest[:len(digest)-1] + "9" }, false},
+		{"revision", func(a *store.SourceArtifact) { a.Revision = "invalid" }, false},
+		{"local path", func(a *store.SourceArtifact) { a.LocalPath = "/other" }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := *art
+			tc.edit(&changed)
+			if same := helmReleaseFingerprint(hr, changed.Digest+"\x00"+changed.Revision, nil) == fp; same != tc.wantSame {
+				t.Fatalf("fingerprint unchanged = %v, want %v", same, tc.wantSame)
+			}
+		})
 	}
 }
 
@@ -570,30 +737,7 @@ func renderedConfigMapValue(docs []map[string]any, key string) string {
 	return ""
 }
 
-// spyTracker records every emitted parent→child edge for inspection
-// in tests. Batch calls expand into one per-child record so assertions
-// that count individual parent→child emissions stay correct.
-type spyTracker struct {
-	calls []struct{ parent, child manifest.NamedResource }
-}
-
-func (s *spyTracker) MarkRenderedBatch(parent manifest.NamedResource, children []manifest.NamedResource) {
-	for _, child := range children {
-		if parent == child {
-			continue
-		}
-		s.calls = append(s.calls, struct{ parent, child manifest.NamedResource }{parent, child})
-	}
-}
-
-// TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered asserts
-// that emitRenderedChildren calls keepEmitted (via Filter.AddEmitted) and
-// markRendered for every source-kind child (isFluxSourceKind == true), and
-// does NOT call them for non-source kinds (which go through AddRendered).
-// This is the correctness contract for iter-11: HR-rendered source CRs
-// (tofu-controller's OCIRepository pattern) must get parent-provenance
-// tracking and filter keep-set extension, matching KS behavior.
-func TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered(t *testing.T) {
+func TestEmit_SourceOwnershipBeforeArrivals(t *testing.T) {
 	st := store.New()
 	ts := task.NewBounded(0)
 	hc, err := helm.NewClient(cacheroot.New(t.TempDir()))
@@ -601,8 +745,6 @@ func TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered(t *testin
 		t.Fatalf("helm.NewClient: %v", err)
 	}
 	hc.SetSourceResolver(helm.NewStoreSourceResolver(st))
-
-	tracker := &spyTracker{}
 
 	// Build a minimal filter with a non-nil keep set (so Enabled() == true
 	// and AddEmitted is exercised). Use a parent HR in the keep set as a
@@ -616,23 +758,16 @@ func TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered(t *testin
 	sourceFiles := map[manifest.NamedResource]string{
 		parent: "apps/tofu/helmrelease.yaml",
 	}
-	filter := change.NewFilter(
-		change.NewSet([]string{"apps/tofu/helmrelease.yaml"}),
-		sourceFiles,
-		"",
-		testutil.MapLister{},
-	)
+	filter := change.NewFilter(change.NewSet([]string{"apps/tofu/helmrelease.yaml"}), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{parent: {File: sourceFiles[parent]}}}, testutil.MapLister{})
 
 	c := New(st, ts, hc, helm.Options{}, false)
-	c.Configure(ReconcileOptions{
-		Filter:        filter,
-		RenderTracker: tracker})
+	c.Configure(ReconcileOptions{Filter: filter})
 	c.Start(context.Background())
 	t.Cleanup(func() { c.Close(); ts.BlockTillDone() })
 
 	// One source-kind doc (OCIRepository) and one non-source-kind (ConfigMap).
-	// emitRenderedChildren should call keepEmitted+markRendered for the source
-	// only, and route the ConfigMap through AddRendered without either call.
+	// Emit must extend keep and ownership for the source
+	// only, and route the ConfigMap through AddObject without either call.
 	ociDoc := map[string]any{
 		"apiVersion": "source.toolkit.fluxcd.io/v1beta2",
 		"kind":       "OCIRepository",
@@ -646,18 +781,17 @@ func TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered(t *testin
 		"data":       map[string]any{"key": "value"},
 	}
 
-	c.emitRenderedChildren(parent, []map[string]any{ociDoc, cmDoc}, true)
-
-	// markRendered must have been called exactly once, for the OCIRepository.
-	if got := len(tracker.calls); got != 1 {
-		t.Fatalf("MarkRendered called %d times, want 1", got)
-	}
-	call := tracker.calls[0]
-	if call.parent != parent {
-		t.Errorf("MarkRendered parent = %v, want %v", call.parent, parent)
-	}
-	if call.child.Kind != manifest.KindOCIRepository || call.child.Name != "tofu-oci" {
-		t.Errorf("MarkRendered child = %v, want OCIRepository/flux-system/tofu-oci", call.child)
+	var arrivals int
+	st.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
+		arrivals++
+		source := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "tofu-oci"}
+		if got, ok := st.EmittedParent(source); !ok || got != parent {
+			t.Errorf("source owner at arrival of %s = (%v, %v), want %s", id, got, ok, parent)
+		}
+	}, false)
+	c.Emit(parent, []map[string]any{cmDoc, ociDoc}, c.WipeSecrets, true)
+	if arrivals != 2 {
+		t.Fatalf("arrivals = %d, want 2", arrivals)
 	}
 
 	// The OCIRepository must have been added to the store (AddObject path).
@@ -676,21 +810,22 @@ func TestEmitRenderedChildren_SourceKindGetsKeepEmittedAndMarkRendered(t *testin
 		t.Error("keepEmitted did not add OCIRepository to filter keep set")
 	}
 
-	// The ConfigMap must NOT have triggered MarkRendered.
-	for _, c := range tracker.calls {
-		if c.child.Kind == manifest.KindConfigMap {
-			t.Errorf("MarkRendered unexpectedly called for ConfigMap child: %v", c.child)
-		}
+	if got, ok := st.EmittedParent(ociID); !ok || got != parent {
+		t.Errorf("source owner = (%v, %v), want (%v, true)", got, ok, parent)
+	}
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "tofu-config"}
+	if _, ok := st.EmittedParent(cmID); ok {
+		t.Error("ConfigMap must not receive HelmRelease render ownership")
 	}
 }
 
-// TestEmitRenderedChildren_DedupReplay_NoStoreWrites pins the publish gate
+// TestEmit_DedupReplay_NoStoreWrites pins the publish gate
 // (mirrors the KS TestEmitRenderedChildren_DedupSkip_NoStoreWrites): the
 // fingerprint-dedup replay (publish=false) must NOT re-AddObject the
 // chart-emitted source CRs — re-emit is a DeepEqual no-op anyway, and gating it
 // makes that explicit. The idempotent side-effects the replay exists for —
-// KeepEmitted (keep-set) + ReportRendered (provenance) — MUST still fire.
-func TestEmitRenderedChildren_DedupReplay_NoStoreWrites(t *testing.T) {
+// KeepEmitted (keep-set) + Store.RecordEmitted (provenance) — MUST still fire.
+func TestEmit_DedupReplay_NoStoreWrites(t *testing.T) {
 	st := store.New()
 	ts := task.NewBounded(0)
 	hc, err := helm.NewClient(cacheroot.New(t.TempDir()))
@@ -699,16 +834,10 @@ func TestEmitRenderedChildren_DedupReplay_NoStoreWrites(t *testing.T) {
 	}
 	hc.SetSourceResolver(helm.NewStoreSourceResolver(st))
 
-	tracker := &spyTracker{}
 	parent := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "flux-system", Name: "tofu"}
-	filter := change.NewFilter(
-		change.NewSet([]string{"apps/tofu/helmrelease.yaml"}),
-		map[manifest.NamedResource]string{parent: "apps/tofu/helmrelease.yaml"},
-		"",
-		testutil.MapLister{},
-	)
+	filter := change.NewFilter(change.NewSet([]string{"apps/tofu/helmrelease.yaml"}), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{parent: {File: "apps/tofu/helmrelease.yaml"}}}, testutil.MapLister{})
 	c := New(st, ts, hc, helm.Options{}, false)
-	c.Configure(ReconcileOptions{Filter: filter, RenderTracker: tracker})
+	c.Configure(ReconcileOptions{Filter: filter})
 	c.Start(context.Background())
 	t.Cleanup(func() { c.Close(); ts.BlockTillDone() })
 
@@ -725,7 +854,7 @@ func TestEmitRenderedChildren_DedupReplay_NoStoreWrites(t *testing.T) {
 
 	// Dedup replay: no AddObject, no event, store untouched — but the keep-set
 	// and provenance side-effects still fire.
-	c.emitRenderedChildren(parent, []map[string]any{ociDoc}, false)
+	c.Emit(parent, []map[string]any{ociDoc}, c.WipeSecrets, false)
 
 	if events != 0 {
 		t.Errorf("publish=false fired %d EventObjectAdded; want 0 (no source re-emit)", events)
@@ -733,58 +862,20 @@ func TestEmitRenderedChildren_DedupReplay_NoStoreWrites(t *testing.T) {
 	if obj := st.GetObject(ociID); obj != nil {
 		t.Error("publish=false AddObject'd a source CR; want the store left untouched")
 	}
-	if len(tracker.calls) != 1 || tracker.calls[0].child != ociID {
-		t.Errorf("publish=false provenance = %v; want one MarkRendered for %v", tracker.calls, ociID)
+	if got, ok := st.EmittedParent(ociID); !ok || got != parent {
+		t.Errorf("publish=false owner = (%v, %v), want (%v, true)", got, ok, parent)
 	}
 	if !filter.ShouldReconcile(ociID) {
 		t.Error("publish=false did not extend the keep set (KeepEmitted must still run)")
 	}
 
 	// Fresh render publishes: event fires and the source lands in the store.
-	c.emitRenderedChildren(parent, []map[string]any{ociDoc}, true)
+	c.Emit(parent, []map[string]any{ociDoc}, c.WipeSecrets, true)
 	if events != 1 {
 		t.Errorf("publish=true fired %d EventObjectAdded; want 1", events)
 	}
 	if obj := st.GetObject(ociID); obj == nil {
 		t.Error("publish=true did not store the source CR")
-	}
-}
-
-func TestEmitRenderedChildren_NilTrackerAndNilFilterAreNoops(t *testing.T) {
-	st := store.New()
-	ts := task.NewBounded(0)
-	hc, err := helm.NewClient(cacheroot.New(t.TempDir()))
-	if err != nil {
-		t.Fatalf("helm.NewClient: %v", err)
-	}
-	hc.SetSourceResolver(helm.NewStoreSourceResolver(st))
-
-	c := New(st, ts, hc, helm.Options{}, false)
-	// No RenderTracker, no Filter — configure with zero opts.
-	c.Configure(ReconcileOptions{})
-	c.Start(context.Background())
-	t.Cleanup(func() { c.Close(); ts.BlockTillDone() })
-
-	parent := manifest.NamedResource{
-		Kind: manifest.KindHelmRelease, Namespace: "flux-system", Name: "chart",
-	}
-	ociDoc := map[string]any{
-		"apiVersion": "source.toolkit.fluxcd.io/v1beta2",
-		"kind":       "OCIRepository",
-		"metadata":   map[string]any{"name": "chart-oci", "namespace": "flux-system"},
-		"spec":       map[string]any{"url": "oci://ghcr.io/example"},
-	}
-	// Must not panic when tracker and filter are nil.
-	c.emitRenderedChildren(parent, []map[string]any{ociDoc}, true)
-
-	// OCIRepository is still added to the store even without tracker/filter.
-	ociID := manifest.NamedResource{
-		Kind:      manifest.KindOCIRepository,
-		Namespace: "flux-system",
-		Name:      "chart-oci",
-	}
-	if obj := st.GetObject(ociID); obj == nil {
-		t.Error("OCIRepository was not added to store when tracker/filter are nil")
 	}
 }
 
@@ -937,14 +1028,14 @@ func TestController_CollectHRDepsClone(t *testing.T) {
 			{Kind: manifest.KindHelmRelease, Namespace: "default", Name: "other"},
 		},
 	}
-	got := c.collectHRDeps(hr)
+	got := c.OrderingDeps(hr.DependsOn)
 	if len(got) != 1 || got[0].Name != "other" {
-		t.Fatalf("collectHRDeps = %+v", got)
+		t.Fatalf("OrderingDeps = %+v", got)
 	}
 	// Mutating the returned slice must not affect hr.DependsOn.
 	got[0].Name = "mutated"
 	if hr.DependsOn[0].Name == "mutated" {
-		t.Errorf("collectHRDeps did not return a defensive copy")
+		t.Errorf("OrderingDeps did not return a defensive copy")
 	}
 }
 
@@ -957,26 +1048,22 @@ func TestController_CollectHRDepsPrunesUnchangedDeps(t *testing.T) {
 	// prowlarr (unchanged): only the in-keep dep survives.
 	qbit := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "downloads", Name: "qbittorrent"}
 	prowlarr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "downloads", Name: "prowlarr"}
-	filter := change.NewFilter(
-		change.NewSet([]string{"qbittorrent.yaml"}),
-		map[manifest.NamedResource]string{qbit: "qbittorrent.yaml", prowlarr: "prowlarr.yaml"},
-		"",
-		testutil.MapLister{},
-	)
-	c, _ := newTestController(t, filter)
+	filter := change.NewFilter(change.NewSet([]string{"qbittorrent.yaml"}), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{qbit: {File: "qbittorrent.yaml"}, prowlarr: {File: "prowlarr.yaml"}}}, testutil.MapLister{})
+	c, st := newTestController(t, filter)
+	st.AddObject(&manifest.HelmRelease{Name: prowlarr.Name, Namespace: prowlarr.Namespace})
 	hr := &manifest.HelmRelease{
 		Name: "lidarr", Namespace: "downloads",
 		DependsOn: []manifest.DependencyRef{{NamedResource: qbit}, {NamedResource: prowlarr}},
 	}
-	got := c.collectHRDeps(hr)
+	got := c.OrderingDeps(hr.DependsOn)
 	if len(got) != 1 || got[0].NamedResource != qbit {
-		t.Fatalf("collectHRDeps = %+v; want only the in-keep qbittorrent dep", got)
+		t.Fatalf("OrderingDeps = %+v; want only the in-keep qbittorrent dep", got)
 	}
 
 	// Sanity: a disabled filter (full mode) prunes nothing.
 	cFull, _ := newTestController(t, nil)
-	if got := cFull.collectHRDeps(hr); len(got) != 2 {
-		t.Errorf("disabled filter must not prune; collectHRDeps = %+v", got)
+	if got := cFull.OrderingDeps(hr.DependsOn); len(got) != 2 {
+		t.Errorf("disabled filter must not prune; OrderingDeps = %+v", got)
 	}
 }
 
@@ -1007,7 +1094,6 @@ func TestController_AlreadyReady_NoTransientPending(t *testing.T) {
 	hr := &manifest.HelmRelease{
 		Name: "demo", Namespace: "default",
 		Interval: metav1Duration(time.Hour),
-		Timeout:  ptrDuration(100 * time.Millisecond),
 		Chart: manifest.HelmChart{
 			Name: "mychart", RepoName: "charts", RepoNamespace: "flux-system",
 			RepoKind: manifest.KindGitRepository,

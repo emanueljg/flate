@@ -1,7 +1,9 @@
 package manifest
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,13 +56,9 @@ func DocAPIVersion(doc map[string]any) string {
 	return v
 }
 
-// DropKinds returns docs with every entry whose `kind` appears in drop
-// removed. drop=nil is a no-op (returns docs unchanged). Used by the
-// orchestrator's Render and the CLI's build/diff paths to honor
-// --skip-secrets / --skip-crds / --skip-kinds against both
-// HelmRelease and Kustomization sources uniformly. helm.TemplateDocs
-// already filters HR output upstream; this is the canonical helper
-// for downstream code that needs the same operation.
+// DropKinds returns docs with every entry whose kind appears in drop removed.
+// drop=nil returns docs unchanged. Orchestrator Render and the stream emitter
+// use it to apply skipped kinds to HelmRelease and Kustomization output.
 func DropKinds(docs []map[string]any, drop []string) []map[string]any {
 	if len(drop) == 0 || len(docs) == 0 {
 		return docs
@@ -102,12 +100,14 @@ func DocMetadata(doc map[string]any) (name, namespace string) {
 
 // ParseDocOptions tunes ParseDoc behavior.
 type ParseDocOptions struct {
-	// WipeSecrets controls Secret cleartext replacement. Default true.
+	// WipeSecrets replaces SOPS ciphertext with offline placeholders.
 	WipeSecrets bool
 }
 
 // ParseDoc dispatches on kind + apiVersion to the appropriate concrete
-// parser. Unknown kinds become a RawObject; kustomize.config.k8s.io
+// parser and returns the authoritative document and whether sanitation changed it,
+// including on errors.
+// Unknown kinds become a RawObject; kustomize.config.k8s.io
 // build directives and bare data files are silently dropped.
 //
 // Every case matches BOTH kind and API group: a kind name is not unique
@@ -115,52 +115,97 @@ type ParseDocOptions struct {
 // (seaweed.seaweedfs.com Bucket, s3.services.k8s.aws Bucket) is an
 // ordinary cluster resource, so it falls through to RawObject rather
 // than being decoded as — and reconciled as — the Flux CR it isn't.
-func ParseDoc(doc map[string]any, opts ParseDocOptions) (BaseManifest, error) {
+func ParseDoc(doc map[string]any, opts ParseDocOptions) (BaseManifest, map[string]any, bool, error) {
 	kind := DocKind(doc)
 	apiVersion := DocAPIVersion(doc)
 	// kustomize.config.k8s.io build directives (Kustomization,
 	// Component) aren't k8s resources — they're build inputs we
 	// already follow via spec.path discovery. Drop them silently.
-	if strings.HasPrefix(apiVersion, KustomizeDomain) {
-		return &RawObject{Kind: kind, APIVersion: apiVersion}, nil
+	if inGroup(apiVersion, KustomizeDomain) {
+		return &RawObject{Kind: kind, APIVersion: apiVersion}, doc, false, nil
 	}
 	// Documents without a kind are bare data files (helm values,
 	// arbitrary YAML configs). Treat them as RawObjects so the
 	// loader drops them without surfacing as parse errors.
 	if kind == "" {
-		return &RawObject{APIVersion: apiVersion}, nil
+		return &RawObject{APIVersion: apiVersion}, doc, false, nil
 	}
 	if apiVersion == "" {
-		return nil, inputf("missing apiVersion for %s", kind)
+		return nil, doc, false, inputf("missing apiVersion for %s", kind)
 	}
 
+	changed := false
+	if opts.WipeSecrets && apiVersion == CoreAPIVersion && (kind == KindConfigMap || kind == KindSecret) {
+		encrypted := IsEncryptedSecret(doc)
+		var sanitized map[string]any
+		for _, field := range []string{"data", "stringData", "binaryData"} {
+			var encoding *base64.Encoding
+			if field == "binaryData" || (kind == KindSecret && field == "data") {
+				encoding = base64.StdEncoding
+			}
+			data, _ := doc[field].(map[string]any)
+			var replaced map[string]any
+			for key, raw := range data {
+				// Base64 decoding cannot lengthen a scalar to contain a longer marker.
+				if value, ok := raw.(string); !encrypted && ok && len(value) < len(sopsCiphertextPrefix) {
+					continue
+				}
+				value, err := scalarString(raw)
+				if err != nil && !encrypted {
+					continue
+				}
+				wiped := WipeValue(key, value, encoding, encrypted)
+				if wiped == value {
+					continue
+				}
+				if replaced == nil {
+					replaced = maps.Clone(data)
+				}
+				replaced[key] = wiped
+			}
+			if replaced != nil {
+				if sanitized == nil {
+					sanitized = maps.Clone(doc)
+				}
+				sanitized[field] = replaced
+			}
+		}
+		if sanitized != nil {
+			doc = sanitized
+			changed = true
+		}
+	}
+	var obj BaseManifest
+	var err error
 	switch {
 	case kind == KindKustomization && inGroup(apiVersion, FluxKustomizeDomain):
-		return parseKustomization(doc)
+		obj, err = parseKustomization(doc)
 	case kind == KindHelmRelease && inGroup(apiVersion, HelmReleaseDomain):
-		return parseHelmRelease(doc)
+		obj, err = parseHelmRelease(doc)
 	case kind == KindHelmRepository && inGroup(apiVersion, SourceDomain):
-		return parseHelmRepository(doc)
+		obj, err = parseHelmRepository(doc)
 	case kind == KindHelmChart && inGroup(apiVersion, SourceDomain):
-		return parseHelmChartSource(doc)
+		obj, err = parseHelmChartSource(doc)
 	case kind == KindGitRepository && inGroup(apiVersion, SourceDomain):
-		return parseGitRepository(doc)
+		obj, err = parseGitRepository(doc)
 	case kind == KindOCIRepository && inGroup(apiVersion, SourceDomain):
-		return ParseOCIRepository(doc)
+		obj, err = ParseOCIRepository(doc)
 	case kind == KindExternalArtifact && inGroup(apiVersion, SourceDomain):
-		return parseExternalArtifact(doc)
+		obj, err = parseExternalArtifact(doc)
 	case kind == KindBucket && inGroup(apiVersion, SourceDomain):
-		return parseBucket(doc)
+		obj, err = parseBucket(doc)
 	case kind == KindResourceSet && inGroup(apiVersion, FluxOperatorDomain):
-		return parseResourceSet(doc)
+		obj, err = parseResourceSet(doc)
 	case kind == KindResourceSetInputProvider && inGroup(apiVersion, FluxOperatorDomain):
-		return parseResourceSetInputProvider(doc)
+		obj, err = parseResourceSetInputProvider(doc)
 	case kind == KindConfigMap && apiVersion == CoreAPIVersion:
-		return parseConfigMap(doc, opts.WipeSecrets)
+		obj, err = parseConfigMap(doc)
 	case kind == KindSecret && apiVersion == CoreAPIVersion:
-		return parseSecret(doc, opts.WipeSecrets)
+		obj, err = parseSecret(doc)
+	default:
+		obj, err = parseRawObject(doc)
 	}
-	return parseRawObject(doc)
+	return obj, doc, changed, err
 }
 
 // IsKustomizeBuildDirective reports whether obj is a kustomize.config.k8s.io
@@ -172,7 +217,7 @@ func ParseDoc(doc map[string]any, opts ParseDocOptions) (BaseManifest, error) {
 // nameless object (id "<kind>//") that no controller ever reconciles.
 func IsKustomizeBuildDirective(obj BaseManifest) bool {
 	raw, ok := obj.(*RawObject)
-	return ok && strings.HasPrefix(raw.APIVersion, KustomizeDomain)
+	return ok && inGroup(raw.APIVersion, KustomizeDomain)
 }
 
 // inGroup reports whether apiVersion belongs to the API group group.
@@ -184,13 +229,13 @@ func inGroup(apiVersion, group string) bool {
 	return g == group
 }
 
-// checkAPIVersion enforces an api group prefix on a raw document.
+// checkAPIVersion requires an exact API group match on a raw document.
 func checkAPIVersion(doc map[string]any, want string) error {
 	v := DocAPIVersion(doc)
 	if v == "" {
 		return inputf("missing apiVersion")
 	}
-	if !strings.HasPrefix(v, want) {
+	if !inGroup(v, want) {
 		return inputf("expected apiVersion %q, got %q", want, v)
 	}
 	return nil

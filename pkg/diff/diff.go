@@ -1,20 +1,31 @@
 package diff
 
-import "fmt"
+import (
+	"cmp"
+	"fmt"
+
+	"github.com/home-operations/flate/pkg/manifest"
+)
 
 // Parent identifies the Flux Kustomization or HelmRelease that rendered a
-// manifest. It never appears in the output — it's a pairing discriminator
-// (see pairKey) so a Deployment rendered by HelmRelease A never diffs
-// against the same-named Deployment from HelmRelease B.
+// manifest. It is a pairing discriminator so resources from different
+// producers never match, and identifies the producer in structured output.
 type Parent struct {
-	Kind      string
-	Namespace string
-	Name      string
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
 	// Path is the Flux Kustomization spec.path (only set for KS
-	// parents). Slash-normalized, with the conventional `./` prefix
-	// stripped. Disambiguates two KS parents that share a (kind, ns,
-	// name) but render from different overlays.
-	Path string
+	// parents), with the conventional `./` prefix stripped. It is display
+	// metadata, not part of producer identity.
+	Path string `json:"path"`
+}
+
+func (p Parent) label() string {
+	s := p.Kind + " " + (manifest.NamedResource{Namespace: p.Namespace, Name: p.Name}).NamespacedName()
+	if p.Path != "" {
+		s += " (" + p.Path + ")"
+	}
+	return s
 }
 
 // Doc pairs a rendered manifest with its parent.
@@ -23,7 +34,7 @@ type Doc struct {
 	Parent   Parent
 }
 
-// Options tunes RenderDocs behavior.
+// Options tunes Compare and RenderDocs behavior.
 type Options struct {
 	// StripAttrs lists annotation/label keys removed from each
 	// manifest's metadata (and pod-template metadata) before the diff
@@ -53,9 +64,10 @@ type Options struct {
 	// Format selects the output style (see the Format constants). The
 	// zero value renders the human default.
 	Format Format
-	// Suppressed lists the producers SuppressFailed withheld from the two
-	// doc sets. Every format discloses them in a leading note block so a
-	// one-sided render failure is never mistaken for a wholesale change.
+	// Suppressed lists additional producer disclosures. Compare appends its
+	// selected suppression notes without modifying this slice. Text and HTML
+	// formats disclose them in a leading note block; JSON includes them in its
+	// suppressed array.
 	Suppressed []Suppression
 }
 
@@ -65,14 +77,18 @@ type Options struct {
 // set through dyff for native per-resource labels; FormatDiff takes the
 // per-resource unified-diff path.
 func RenderDocs(left, right []Doc, opts Options) ([]byte, error) {
-	switch {
-	case opts.Format == "" || opts.Format.isDyffText():
-		return renderNative(left, right, opts)
-	case opts.Format == FormatDiff:
+	opts.Format = cmp.Or(opts.Format, FormatHuman)
+	switch opts.Format {
+	case FormatDiff:
 		return renderUnified(left, right, opts)
-	case opts.Format == FormatHTML:
+	case FormatHTML:
 		return renderHTML(left, right, opts)
+	case FormatJSON:
+		return renderJSON(left, right, opts)
 	default:
+		if diffStyles[opts.Format].writer != nil {
+			return renderNative(left, right, opts)
+		}
 		return nil, fmt.Errorf("unsupported diff format %q", opts.Format)
 	}
 }

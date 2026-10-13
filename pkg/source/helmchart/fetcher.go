@@ -1,19 +1,12 @@
-// Package helmchart implements the source.Fetcher for KindHelmChart —
-// the single authoritative path that fetches a Helm chart (by name +
-// version) from its backing HelmRepository. OCI registries are pulled via
-// the OCI fetcher; classic HTTP repositories via helm's getter. The
-// HelmRelease controller synthesizes a HelmChart per (chart, version,
-// repo) and the source controller fetches it here, so every chart pull
-// gains retry, the content-addressed Store, and depwait uniformly with
-// every other source kind.
+// Package helmchart resolves HelmRepository charts through the shared acquisition cache.
 package helmchart
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -23,7 +16,7 @@ import (
 	"github.com/home-operations/flate/internal/keylock"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
-	"github.com/home-operations/flate/pkg/source/cacheroot"
+	"github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/store"
 )
 
@@ -37,42 +30,35 @@ type RepoLookup func(namespace, name string) *manifest.HelmRepository
 // package doesn't import pkg/source/oci.
 type ociFetcher = source.TypedFetcher[*manifest.OCIRepository]
 
-// Fetcher resolves a HelmChart into an on-disk chart artifact.
+// Fetcher resolves a HelmChart into an immutable source artifact.
 type Fetcher struct {
 	secrets source.SecretGetter // HTTP-branch SecretRef/CertSecretRef auth
 	repos   RepoLookup          // resolves the chart's backing HelmRepository
 	oci     ociFetcher          // OCI-backed charts (a synthesized OCIRepository)
-	cache   *source.Cache       // content-addressed store for HTTP chart tarballs
+	cache   *cache.Cache        // content-addressed store for HTTP chart tarballs
 
-	indexCache    sync.Map                // map[string]*repo.IndexFile (process lifetime)
-	indexLocks    *keylock.KeyMap[string] // coalesce one index.yaml fetch per repo
-	downloadLocks *keylock.KeyMap[string] // coalesce one download per chart
-	tmpDir        string                  // index/TLS temp files
+	indexCache                 sync.Map                // map[string]*repo.IndexFile (process lifetime)
+	indexLocks                 *keylock.KeyMap[string] // coalesce one index.yaml fetch per repo
+	disableChartDigestTracking bool
 }
 
-// New constructs a HelmChart fetcher. cache is the shared content-addressed
-// store HTTP chart tarballs land in (so they dedup with the rest of the cache
-// and the GC sweep sees them); layout supplies the helm tmp dir for index/TLS
-// temp files.
-func New(secrets source.SecretGetter, repos RepoLookup, oci ociFetcher, cache *source.Cache, layout cacheroot.Layout) (*Fetcher, error) {
-	tmpDir := layout.HelmTmp()
-	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
-		return nil, fmt.Errorf("helmchart: tmp dir: %w", err)
-	}
-	return &Fetcher{
-		secrets:       secrets,
-		repos:         repos,
-		oci:           oci,
-		cache:         cache,
-		indexLocks:    keylock.New[string](),
-		downloadLocks: keylock.New[string](),
-		tmpDir:        tmpDir,
-	}, nil
+// Config fixes acquisition and chart identity policy before reconciliation.
+type Config struct {
+	// Cache remains caller-owned and MUST outlive acquired artifacts.
+	Cache *cache.Cache
+	// DisableChartDigestTracking makes exact chart versions immutable cache pins.
+	DisableChartDigestTracking bool
+}
+
+// New constructs a fetcher using the caller-owned acquisition cache.
+func New(secrets source.SecretGetter, repos RepoLookup, oci ociFetcher, cfg Config) *Fetcher {
+	return &Fetcher{secrets: secrets, repos: repos, oci: oci, cache: cfg.Cache,
+		disableChartDigestTracking: cfg.DisableChartDigestTracking, indexLocks: keylock.New[string]()}
 }
 
 // Fetch implements source.TypedFetcher[*manifest.HelmChartSource]. It
 // resolves the backing HelmRepository, then pulls the chart: OCI repos via
-// the OCI fetcher (a synthesized OCIRepository), HTTP repos via the getter.
+// the OCI fetcher (a synthesized OCIRepository), HTTP repos by streaming chart tarballs.
 func (f *Fetcher) Fetch(ctx context.Context, hc *manifest.HelmChartSource) (*store.SourceArtifact, error) {
 	// Only HelmRepository-backed charts need a dedicated chart fetch. A
 	// HelmChart whose sourceRef is a GitRepository/Bucket is resolved by the
@@ -95,7 +81,24 @@ func (f *Fetcher) Fetch(ctx context.Context, hc *manifest.HelmChartSource) (*sto
 		// the synthetic HelmChart's identity. Retry is owned by the
 		// source.WithRetry wrapper around THIS fetcher — the inner OCI
 		// fetcher is bare (not separately wrapped).
-		art, err := f.oci.Fetch(ctx, synthesizeOCIRepository(r, hc.Chart, hc.Version))
+		syn := synthesizeOCIRepository(r, hc.Chart, hc.Version)
+		syn.Interval = r.Interval
+		if f.disableChartDigestTracking && isExactSemver(hc.Version) {
+			syn.Interval.Duration = cache.Forever
+		}
+		art, err := f.oci.Fetch(ctx, syn)
+		if missing, ok := errors.AsType[*source.MissingSecretError](err); ok && missing.RetryWithRegistryConfig != nil {
+			retry := missing.RetryWithRegistryConfig
+			wrapped := *missing
+			wrapped.RetryWithRegistryConfig = func(ctx context.Context, configPath string) (*store.SourceArtifact, error) {
+				art, err := retry(ctx, configPath)
+				if art != nil {
+					art.Kind = manifest.KindHelmChart
+				}
+				return art, err
+			}
+			return nil, &wrapped
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -140,7 +143,7 @@ func normalizeChartURL(url, chartName string) string {
 // registry (spec.type: oci, or an oci:// URL) rather than a classic HTTP
 // index.yaml.
 func isOCIHelmRepo(r *manifest.HelmRepository) bool {
-	return r.Type == manifest.RepoTypeOCI || strings.HasPrefix(r.URL, "oci://")
+	return r.Type == sourcev1.HelmRepositoryTypeOCI || strings.HasPrefix(r.URL, "oci://")
 }
 
 // synthesizeOCIRepository builds an in-memory OCIRepository for a single

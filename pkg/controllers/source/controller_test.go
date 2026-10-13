@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/manifest"
 	src "github.com/home-operations/flate/pkg/source"
 	"github.com/home-operations/flate/pkg/store"
 	"github.com/home-operations/flate/pkg/task"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type fakeFetcher struct {
@@ -46,7 +45,7 @@ func newConfiguredController(t *testing.T, fetchers map[string]src.Fetcher, opts
 	c := New(st, ts)
 	maps.Copy(c.Fetchers, fetchers)
 	c.Configure(opts)
-	c.Start(context.Background())
+	c.StartLifecycle()
 	t.Cleanup(func() {
 		c.Close()
 		ts.BlockTillDone()
@@ -67,8 +66,8 @@ func newConfiguredController(t *testing.T, fetchers map[string]src.Fetcher, opts
 // and we block on its completion to keep the drive synchronous.
 func dispatchToFixpoint(t *testing.T, c *Controller, st *store.Store, id manifest.NamedResource) store.StatusInfo {
 	t.Helper()
-	for _, drain := range []int{0, 1, 2} {
-		if reconcileNode(c, id, drain) {
+	for _, drain := range []manifest.DrainLevel{manifest.DrainNone, manifest.DrainCascade, manifest.DrainForce} {
+		if reconcileNode(t, c, id, drain) {
 			break
 		}
 	}
@@ -79,9 +78,11 @@ func dispatchToFixpoint(t *testing.T, c *Controller, st *store.Store, id manifes
 // reconcileNode runs one ReconcileNode pass for id inside a Tasks.Go worker
 // (so the body's YieldSlot has a slot to release) and reports whether the node
 // terminalized (no blocked deps).
-func reconcileNode(c *Controller, id manifest.NamedResource, drain int) (terminal bool) {
+func reconcileNode(t *testing.T, c *Controller, id manifest.NamedResource, drain manifest.DrainLevel) bool {
+	t.Helper()
+	var terminal bool
 	done := make(chan struct{})
-	c.Tasks.Go(context.Background(), "test/"+id.String(), func(ctx context.Context) {
+	c.Tasks.Go(t.Context(), "test/"+id.String(), func(ctx context.Context) {
 		blocked := c.ReconcileNode(ctx, id, drain)
 		terminal = len(blocked) == 0
 		close(done)
@@ -156,7 +157,7 @@ func TestController_SuspendedShortCircuitsToReady(t *testing.T) {
 func TestController_UnregisteredKindIgnored(t *testing.T) {
 	// Register an OCIRepository fetcher so the controller is alive but has no
 	// entry for KindGitRepository. Under the dag scheduler the source controller
-	// only exposes ReconcileNode for registered kinds (HasFetcher), so the
+	// only exposes ReconcileNode for registered kinds (Owns), so the
 	// scheduler never dispatches the GitRepository — it must therefore carry no
 	// status once the registered kind has been reconciled.
 	registered := &fakeFetcher{artifact: &store.SourceArtifact{Kind: manifest.KindOCIRepository}}
@@ -198,7 +199,7 @@ func TestController_OwnsExcludesForeignKind(t *testing.T) {
 		APIVersion: "seaweed.seaweedfs.com/v1",
 		Name:       "greptimedb", Namespace: "observability",
 	}
-	st.AddRendered(foreign)
+	st.AddObject(foreign)
 	if c.Owns(foreign.Named()) {
 		t.Fatalf("Owns(%s) = true for a foreign %s CRD", foreign.Named(), foreign.APIVersion)
 	}
@@ -316,17 +317,219 @@ func TestController_MissingSecretNoProducerFailsWithoutFlag(t *testing.T) {
 	}
 }
 
+func TestController_MissingSecretWaitsForRender(t *testing.T) {
+	tests := []struct {
+		name         string
+		allowMissing bool
+	}{
+		{name: "strict"},
+		{name: "allow missing", allowMissing: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeFetcher{err: src.MissingSecretErr(manifest.KindOCIRepository, "ns", "r", "ca", "not found")}
+			c, st := newConfiguredController(t,
+				map[string]src.Fetcher{manifest.KindOCIRepository: f},
+				FetchOptions{AllowMissingSecrets: tt.allowMissing})
+			repo := &manifest.OCIRepository{Name: "r", Namespace: "ns"}
+			st.AddObject(repo)
+
+			if reconcileNode(t, c, repo.Named(), 0) {
+				t.Fatal("missing Secret must block while renders can still produce it")
+			}
+			if info, _ := st.GetStatus(repo.Named()); info.Status != store.StatusPending {
+				t.Fatalf("status = %+v, want Pending", info)
+			}
+
+			st.AddObject(&manifest.Secret{Name: "ca", Namespace: "ns"})
+			f.err = nil
+			f.artifact = &store.SourceArtifact{Kind: manifest.KindOCIRepository}
+			if !reconcileNode(t, c, repo.Named(), 0) {
+				t.Fatal("source must finish after the Secret arrives")
+			}
+			if info, _ := st.GetStatus(repo.Named()); info.Status != store.StatusReady || store.IsSkipped(info) {
+				t.Fatalf("status = %+v, want Ready without a skip", info)
+			}
+			if st.GetArtifact(repo.Named()) == nil {
+				t.Fatal("source artifact missing after retry")
+			}
+		})
+	}
+}
+
+func TestController_UnavailableSecretAtFixpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		present      bool
+		allowMissing bool
+		producer     bool
+		wantSkip     bool
+	}{
+		{name: "missing"},
+		{name: "missing allowed", allowMissing: true, wantSkip: true},
+		{name: "missing producer backed", producer: true, wantSkip: true},
+		{name: "missing keys", present: true},
+		{name: "missing keys allowed", present: true, allowMissing: true, wantSkip: true},
+		{name: "missing keys producer backed", present: true, producer: true, wantSkip: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := &manifest.Secret{Name: "auth", Namespace: "ns"}
+			detail := "not found"
+			if tt.present {
+				detail = "missing username/password"
+			}
+			f := &fakeFetcher{err: src.MissingSecretErr(manifest.KindOCIRepository, "ns", "r", secret.Name, detail)}
+			producers := &manifest.ProducerIndex{}
+			if tt.producer {
+				producers.Record(secret.Named(), manifest.NamedResource{Kind: "ExternalSecret", Namespace: "ns", Name: "auth"})
+			}
+			c, st := newConfiguredController(t,
+				map[string]src.Fetcher{manifest.KindOCIRepository: f},
+				FetchOptions{AllowMissingSecrets: tt.allowMissing, Producers: producers})
+			if tt.present {
+				st.AddObject(secret)
+			}
+			repo := &manifest.OCIRepository{Name: "r", Namespace: "ns"}
+			st.AddObject(repo)
+			if reconcileNode(t, c, repo.Named(), 0) {
+				t.Fatal("must wait while renders can still supply Secret contents")
+			}
+			if !reconcileNode(t, c, repo.Named(), 1) {
+				t.Fatal("unavailable Secret must terminalize at the fixpoint")
+			}
+			info, _ := st.GetStatus(repo.Named())
+			wantStatus := store.StatusFailed
+			if tt.wantSkip {
+				wantStatus = store.StatusReady
+			}
+			if info.Status != wantStatus || store.IsSkipped(info) != tt.wantSkip || !strings.Contains(info.Message, detail) {
+				t.Fatalf("status = %+v, want %v (skip=%t) preserving %q", info, wantStatus, tt.wantSkip, detail)
+			}
+			if f.calls != 2 {
+				t.Errorf("fetch calls = %d, want 2", f.calls)
+			}
+		})
+	}
+}
+
+// fallbackFetcher fails with a missing Secret until rendered is set, and
+// carries a registry-fallback retry.
+type fallbackFetcher struct {
+	rendered      bool
+	fallbackCalls int
+	fallbackErr   error
+}
+
+func (f *fallbackFetcher) Fetch(_ context.Context, _ manifest.BaseManifest) (*store.SourceArtifact, error) {
+	if f.rendered {
+		return &store.SourceArtifact{Kind: manifest.KindOCIRepository}, nil
+	}
+	missing, _ := errors.AsType[*src.MissingSecretError](src.MissingSecretErr(manifest.KindOCIRepository, "ns", "r", "ghcr-creds", "not found"))
+	missing.RegistryConfig = "/registry/config.json"
+	missing.RetryWithRegistryConfig = func(_ context.Context, configPath string) (*store.SourceArtifact, error) {
+		f.fallbackCalls++
+		if configPath != missing.RegistryConfig {
+			return nil, fmt.Errorf("unexpected registry config %q", configPath)
+		}
+		if f.fallbackErr != nil {
+			return nil, f.fallbackErr
+		}
+		return &store.SourceArtifact{Kind: manifest.KindOCIRepository}, nil
+	}
+	return nil, missing
+}
+
+func TestController_MissingSecretRegistryFallback(t *testing.T) {
+	tests := []struct {
+		name         string
+		rendered     bool
+		wantFallback int
+	}{
+		{name: "rendered Secret takes precedence", rendered: true},
+		{name: "unrendered Secret falls back at fixpoint", wantFallback: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fallbackFetcher{}
+			c, st := newController(t, map[string]src.Fetcher{manifest.KindOCIRepository: f})
+			repo := &manifest.OCIRepository{Name: "r", Namespace: "ns", URL: "oci://example/img"}
+			st.AddObject(repo)
+
+			if reconcileNode(t, c, repo.Named(), 0) {
+				t.Fatal("missing Secret must block before any registry fallback")
+			}
+			if f.fallbackCalls != 0 {
+				t.Fatalf("fallback calls = %d while renders can still produce the Secret, want 0", f.fallbackCalls)
+			}
+
+			drain := manifest.DrainCascade
+			if tt.rendered {
+				st.AddObject(&manifest.Secret{Name: "ghcr-creds", Namespace: "ns"})
+				f.rendered = true
+				drain = manifest.DrainNone
+			}
+			if !reconcileNode(t, c, repo.Named(), drain) {
+				t.Fatal("source must terminalize")
+			}
+			if info, _ := st.GetStatus(repo.Named()); info.Status != store.StatusReady || store.IsSkipped(info) {
+				t.Fatalf("status = %+v, want Ready without a skip", info)
+			}
+			if st.GetArtifact(repo.Named()) == nil {
+				t.Error("fetch must store its artifact")
+			}
+			if f.fallbackCalls != tt.wantFallback {
+				t.Errorf("fallback calls = %d, want %d", f.fallbackCalls, tt.wantFallback)
+			}
+		})
+	}
+}
+
+func TestController_ProducerBackedSecretSkipsRegistryFallback(t *testing.T) {
+	f := &fallbackFetcher{}
+	producers := &manifest.ProducerIndex{}
+	producers.Record(manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "ns", Name: "ghcr-creds"},
+		manifest.NamedResource{Kind: "ExternalSecret", Namespace: "ns", Name: "auth"})
+	c, st := newConfiguredController(t,
+		map[string]src.Fetcher{manifest.KindOCIRepository: f}, FetchOptions{Producers: producers})
+	repo := &manifest.OCIRepository{Name: "r", Namespace: "ns", URL: "oci://example/img"}
+	st.AddObject(repo)
+
+	if info := dispatchToFixpoint(t, c, st, repo.Named()); info.Status != store.StatusReady || !store.IsSkipped(info) {
+		t.Fatalf("status = %+v, want Ready with a skip", info)
+	}
+	if f.fallbackCalls != 0 {
+		t.Errorf("fallback calls = %d, want 0 for a producer-backed Secret", f.fallbackCalls)
+	}
+	if st.GetArtifact(repo.Named()) != nil {
+		t.Error("skipped source must not store an artifact")
+	}
+}
+
+func TestController_AllowMissingSecretsSkipsFailedRegistryFallback(t *testing.T) {
+	f := &fallbackFetcher{fallbackErr: fmt.Errorf("%w: registry authentication failed", manifest.ErrInput)}
+	c, st := newConfiguredController(t,
+		map[string]src.Fetcher{manifest.KindOCIRepository: f}, FetchOptions{AllowMissingSecrets: true})
+	repo := &manifest.OCIRepository{Name: "r", Namespace: "ns", URL: "oci://example/img"}
+	st.AddObject(repo)
+
+	if info := dispatchToFixpoint(t, c, st, repo.Named()); info.Status != store.StatusReady || !store.IsSkipped(info) {
+		t.Fatalf("status = %+v, want Ready with a skip", info)
+	}
+	if f.fallbackCalls != 1 {
+		t.Errorf("fallback calls = %d, want 1 before skipping", f.fallbackCalls)
+	}
+	if st.GetArtifact(repo.Named()) != nil {
+		t.Error("failed fallback must not store an artifact")
+	}
+}
+
 func TestController_ChangeFilterSkipsUnaffected(t *testing.T) {
 	f := &fakeFetcher{artifact: &store.SourceArtifact{Kind: manifest.KindGitRepository}}
 
 	// Filter that marks our repo as "no changes" — should short-circuit
 	// to Ready without fetching.
-	filter := change.NewFilter(
-		change.NewSet(nil), // no changed files
-		map[manifest.NamedResource]string{},
-		"",
-		testutil.MapLister{},
-	)
+	filter := change.NewFilter(change.NewSet(nil), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}}, testutil.MapLister{})
 	c, st := newConfiguredController(t,
 		map[string]src.Fetcher{manifest.KindGitRepository: f},
 		FetchOptions{Filter: filter})
@@ -394,7 +597,7 @@ func TestController_ExistenceFetcher_NoTransientPendingOnReemit(t *testing.T) {
 		Interval: metav1.Duration{Duration: time.Hour},
 	}
 	st.AddObject(reemit)
-	reconcileNode(c, repo.Named(), 0)
+	reconcileNode(t, c, repo.Named(), 0)
 
 	mu.Lock()
 	defer mu.Unlock()

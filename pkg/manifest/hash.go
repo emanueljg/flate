@@ -4,31 +4,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 )
 
-// SHA256Hex returns the hex-encoded SHA-256 digest of data. It is the
-// one-shot full-buffer digest the controllers' render-input
-// fingerprints use (kustomizationFingerprint / helmReleaseFingerprint)
-// to dedup re-renders whose effective inputs are byte-identical.
-//
-// This is deliberately NOT for streaming/incremental hashing (e.g. a
-// file-tree walk that feeds bytes into a running sha256.Hash) — those
-// callers keep their own hasher.
+// SHA256Hex returns the hex-encoded SHA-256 identity of buffered bytes.
 func SHA256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], sum[:])
+	return string(encoded[:])
 }
 
-// Fingerprint returns a stable content hash of payload — json.Marshal
-// followed by SHA256Hex. It returns "" when marshaling fails: an empty
-// fingerprint never matches a dedup comparison, so callers degrade safely
-// into a re-render rather than a false cache hit. Used by the controllers'
-// render-input fingerprints (kustomizationFingerprint / helmReleaseFingerprint),
-// which differ only in their payload struct.
+// Fingerprint hashes structured content with stable JSON framing. Cache owners
+// MUST bypass lookup and publication when marshaling returns an empty key.
 func Fingerprint(payload any) string {
-	raw, err := json.Marshal(payload)
-	if err != nil {
+	h := sha256.New()
+	if err := jsonv2.MarshalWrite(h, payload, json.DefaultOptionsV1()); err != nil {
 		return ""
 	}
-	return SHA256Hex(raw)
+	var sum [sha256.Size]byte
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], h.Sum(sum[:0]))
+	return string(encoded[:])
 }

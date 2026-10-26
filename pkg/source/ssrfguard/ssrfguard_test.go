@@ -1,13 +1,13 @@
-package ssrfguard_test
+package ssrfguard
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
-
-	"github.com/home-operations/flate/pkg/source/ssrfguard"
+	"time"
 )
 
 // TestBlocked is the pure classifier matrix — the unit-testable core of the
@@ -58,7 +58,7 @@ func TestBlocked(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.addr, err)
 			}
-			if got := ssrfguard.Blocked(a); got != tc.want {
+			if got := blocked(a); got != tc.want {
 				t.Errorf("Blocked(%s) = %v; want %v", tc.addr, got, tc.want)
 			}
 		})
@@ -75,14 +75,14 @@ func TestWrapTransport_GatesDialByToggle(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 	t.Cleanup(srv.Close)
-	t.Cleanup(func() { ssrfguard.Restrict(false) })
+	t.Cleanup(func() { Restrict(false) })
 
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	ssrfguard.WrapTransport(tr)
+	WrapTransport(tr, &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second})
 	client := &http.Client{Transport: tr}
 
 	// Guard ON: the loopback dial must be refused with the block error.
-	ssrfguard.Restrict(true)
+	Restrict(true)
 	if _, err := client.Get(srv.URL); err == nil {
 		t.Fatal("guard ON: expected the loopback dial to be blocked, got success")
 	} else if !strings.Contains(err.Error(), "blocked") {
@@ -90,7 +90,7 @@ func TestWrapTransport_GatesDialByToggle(t *testing.T) {
 	}
 
 	// Guard OFF (default): the same request must succeed.
-	ssrfguard.Restrict(false)
+	Restrict(false)
 	resp, err := client.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("guard OFF: expected success, got %v", err)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
@@ -42,7 +43,7 @@ func BenchmarkAddObject_Warm(b *testing.B) {
 	}
 }
 
-// BenchmarkListObjects_Sorted measures ListObjects(KindKustomization)
+// BenchmarkListObjects_Sorted measures an exact Kustomization group/kind listing
 // against a 1000-KS store. The sort dominates; the byName-index walk
 // supplies the inputs.
 func BenchmarkListObjects_Sorted(b *testing.B) {
@@ -56,7 +57,7 @@ func BenchmarkListObjects_Sorted(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out := s.ListObjects(manifest.KindKustomization)
+		out := s.ListObjects(manifest.FluxKustomizeDomain, manifest.KindKustomization)
 		if len(out) != 1000 {
 			b.Fatalf("expected 1000, got %d", len(out))
 		}
@@ -77,7 +78,7 @@ func BenchmarkListObjects_Sorted(b *testing.B) {
 // maps) is measured by BenchmarkSetArtifact_DistinctDedup below.
 func BenchmarkSetArtifact_DeepEqual(b *testing.B) {
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
+	id := testutil.KustomizationID("flux-system", "apps")
 	// Build a rendered-style artifact with realistic shape so DeepEqual
 	// has actual work to do (not a one-field comparison).
 	manifests := make([]map[string]any, 0, 20)
@@ -94,7 +95,7 @@ func BenchmarkSetArtifact_DeepEqual(b *testing.B) {
 			},
 		})
 	}
-	art := &KustomizationArtifact{Path: "./apps", Manifests: manifests}
+	art := &Emission{Manifests: manifests}
 	s.SetArtifact(id, art)
 
 	b.ReportAllocs()
@@ -112,7 +113,7 @@ func BenchmarkSetArtifact_DeepEqual(b *testing.B) {
 // fast path.
 func BenchmarkSetArtifact_DistinctDedup(b *testing.B) {
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
+	id := testutil.KustomizationID("flux-system", "apps")
 	manifests := make([]map[string]any, 0, 20)
 	for i := range 20 {
 		manifests = append(manifests, map[string]any{
@@ -127,16 +128,99 @@ func BenchmarkSetArtifact_DistinctDedup(b *testing.B) {
 			},
 		})
 	}
-	art := &KustomizationArtifact{Path: "./apps", Manifests: manifests}
+	art := &Emission{Manifests: manifests}
 	s.SetArtifact(id, art)
 	// Distinct-pointer twin with shared sub-slice — matches the
 	// re-emit shape where docs are decoded into fresh outer
 	// structs but their backing maps survive across reconciles.
-	twin := &KustomizationArtifact{Path: art.Path, Manifests: art.Manifests}
+	twin := &Emission{Manifests: art.Manifests}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		s.SetArtifact(id, twin)
+	}
+}
+
+func BenchmarkUpdateFailure_Write(b *testing.B) {
+	id := testutil.HelmReleaseID("", "consumer")
+	dep := testutil.HelmReleaseID("", "dep")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"Primary", manifest.ErrInput},
+		{"Dependency", &manifest.DependencyFailedError{Parent: id, Failed: []manifest.NamedResource{dep}}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			st := New()
+			st.UpdateFailure(id, tc.err)
+			b.ReportAllocs()
+			for b.Loop() {
+				st.UpdateStatus(id, StatusInfo{Status: StatusPending, Reason: "", Message: "retrying"})
+				st.UpdateFailure(id, tc.err)
+			}
+		})
+	}
+}
+
+func BenchmarkStatusInfo_Read(b *testing.B) {
+	id := testutil.HelmReleaseID("", "consumer")
+	dep := testutil.HelmReleaseID("", "dep")
+	for _, tc := range []struct {
+		name  string
+		write func(*Store)
+	}{
+		{"Ready", func(st *Store) { st.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: "", Message: "done"}) }},
+		{"Primary", func(st *Store) { st.UpdateFailure(id, manifest.ErrInput) }},
+		{"Dependency", func(st *Store) {
+			st.UpdateFailure(id, &manifest.DependencyFailedError{Parent: id, Failed: []manifest.NamedResource{dep}})
+		}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			st := New()
+			tc.write(st)
+			b.ReportAllocs()
+			for b.Loop() {
+				info, _ := st.GetStatus(id)
+				_ = info.IsDependencyFailure()
+			}
+		})
+	}
+}
+
+func BenchmarkStatusFlip(b *testing.B) {
+	for _, withListener := range []bool{false, true} {
+		name := "NoListener"
+		if withListener {
+			name = "OneListener"
+		}
+		b.Run(name, func(b *testing.B) {
+			st := New()
+			id := testutil.HelmReleaseID("a", "b")
+			st.AddObject(&manifest.HelmRelease{Name: id.Name, Namespace: id.Namespace})
+			if withListener {
+				st.AddListener(EventStatusUpdated, func(manifest.NamedResource, any) {}, false)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				st.UpdateStatus(id, StatusInfo{Status: StatusPending, Reason: "", Message: "x"})
+				st.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: "", Message: "y"})
+			}
+		})
+	}
+}
+
+func BenchmarkGetStatus(b *testing.B) {
+	st := New()
+	id := testutil.HelmReleaseID("a", "b")
+	st.AddObject(&manifest.HelmRelease{Name: id.Name, Namespace: id.Namespace})
+	st.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: "", Message: "y"})
+	b.ReportAllocs()
+	for b.Loop() {
+		info, _ := st.GetStatus(id)
+		if info.Status != StatusReady {
+			b.Fatal("expected ready status")
+		}
 	}
 }

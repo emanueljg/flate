@@ -1,39 +1,23 @@
 package diff
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"strings"
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// normalize applies o's strip/normalize config to a doc set — the
-// shared pre-diff scrub every render path runs on both its inputs.
-func (o Options) normalize(docs []Doc) []Doc {
-	return normalizeDocs(docs, o.StripAttrs, o.StripFields, o.Normalize)
-}
-
-// normalizeDocs clones each Doc's manifest and rewrites fields that
-// should not participate verbatim in human-facing diffs: the listed
-// annotation/label keys (chart-bump noise like helm.sh/chart,
-// checksum/config, …) and ConfigMap.binaryData values (opaque base64
-// blobs whose verbatim diff is gibberish to a reviewer and
-// pathologically expensive for dyff to render on large hook payloads
-// like kube-prometheus-stack's CRD upgrade bundle). Deep-copies so
-// the original tree (shared with other consumers in the same
-// orchestrator run) is untouched.
-func normalizeDocs(docs []Doc, attrs, fields []string, hook func(map[string]any)) []Doc {
+// The copy flag is true only when every manifest on the side was deep-copied.
+func normalizeDocs(docs []Doc, attrs, fields []string, hook func(map[string]any)) ([]Doc, bool) {
 	if len(attrs) == 0 && len(fields) == 0 && hook == nil && !docsContainBinaryData(docs) {
-		return docs
+		return docs, false
 	}
 	out := make([]Doc, len(docs))
 	for i, d := range docs {
 		out[i] = Doc{Manifest: normalizeManifest(d.Manifest, attrs, fields, hook), Parent: d.Parent}
 	}
-	return out
+	return out, true
 }
 
 // normalizeManifest returns a normalized deep copy of m: strip the listed
@@ -55,11 +39,7 @@ func normalizeManifest(m map[string]any, attrs, fields []string, hook func(map[s
 	return c
 }
 
-// docsContainBinaryData reports whether any doc is a ConfigMap
-// carrying a non-empty binaryData field — the only shape
-// redactBinaryData would touch. Used so the zero-input fast path in
-// normalizeDocs stays allocation-free when neither strip attrs nor
-// binary payloads are present.
+// Empty binaryData maps also require normalization copies.
 func docsContainBinaryData(docs []Doc) bool {
 	for _, d := range docs {
 		if _, ok := configMapBinaryData(d.Manifest); ok {
@@ -94,6 +74,11 @@ func configMapBinaryData(m map[string]any) (map[string]any, bool) {
 	return bd, ok
 }
 
+const (
+	binaryDataRawSummaryFormat = "<redacted binary data: %d base64 chars sha256:%s>"
+	binaryDataSummaryFormat    = "<redacted binary data: %d bytes sha256:%s>"
+)
+
 // binaryDataSummary returns a stable, content-derived placeholder for
 // a single binaryData value. base64-decode is the happy path
 // (binaryData is spec'd as base64); the trim handles YAML's trailing
@@ -107,9 +92,7 @@ func binaryDataSummary(v any) string {
 	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
 	if err != nil {
-		sum := sha256.Sum256([]byte(s))
-		return fmt.Sprintf("<redacted binary data: %d base64 chars sha256:%s>", len(s), hex.EncodeToString(sum[:8]))
+		return fmt.Sprintf(binaryDataRawSummaryFormat, len(s), manifest.SHA256Hex([]byte(s))[:16])
 	}
-	sum := sha256.Sum256(decoded)
-	return fmt.Sprintf("<redacted binary data: %d bytes sha256:%s>", len(decoded), hex.EncodeToString(sum[:8]))
+	return fmt.Sprintf(binaryDataSummaryFormat, len(decoded), manifest.SHA256Hex(decoded)[:16])
 }

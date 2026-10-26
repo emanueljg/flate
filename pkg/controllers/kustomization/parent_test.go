@@ -1,225 +1,93 @@
 package kustomization
 
 import (
-	"testing"
-
-	"github.com/home-operations/flate/internal/testutil"
-	"github.com/home-operations/flate/pkg/change"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	"github.com/home-operations/flate/internal/testutil/controllertest"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/schedule"
 	"github.com/home-operations/flate/pkg/store"
+	"slices"
+	"testing"
 )
 
-// TestCollectDeps_AppendsStructuralParent locks the contract that
-// when ParentOf records an enclosing KS, that parent is appended to
-// the dependency list so the reconcile waits for the parent's Ready
-// before rendering. See #102.
-func TestCollectDeps_AppendsStructuralParent(t *testing.T) {
-	parent := manifest.NamedResource{
-		Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "cluster-apps",
-	}
-	child := &manifest.Kustomization{Name: "karma", Namespace: "observability"}
-
-	c := New(store.New(), nil, nil, false)
-	c.Configure(Options{ParentOf: mapResolver(map[manifest.NamedResource]manifest.NamedResource{
-		child.Named(): parent,
-	})})
-	deps := c.collectDeps(child)
-	for _, d := range deps {
-		if d.NamedResource == parent {
-			return
-		}
-	}
-	t.Errorf("parent %+v missing from deps %+v", parent, deps)
-}
-
-// TestCollectDeps_NoParentNoExtraDep guards against ParentOf-less
-// controllers (e.g. unit-test setups) panicking on a nil resolver.
-func TestCollectDeps_NoParentNoExtraDep(t *testing.T) {
-	child := &manifest.Kustomization{Name: "karma", Namespace: "observability"}
-	c := New(store.New(), nil, nil, false) // ParentOf nil
-	deps := c.collectDeps(child)
-	if len(deps) != 0 {
-		t.Errorf("expected no deps for KS without sourceRef/dependsOn/parent; got %+v", deps)
-	}
-}
-
-// TestCollectDeps_AppendsSubstituteFromConfigMap locks the
-// substituteFrom→ConfigMap depwait edge: every non-Optional ref
-// becomes a real dependency. Without this, KS-A would race the CM
-// that KS-B's render emits, and Prepare would silently expand with
-// empty values for any var that should have come from KS-B's CM.
-func TestCollectDeps_AppendsSubstituteFromConfigMap(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindConfigMap, Name: "cluster-settings"},
-			{Kind: manifest.KindConfigMap, Name: "maybe-missing", Optional: true},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	deps := c.collectDeps(ks)
-
-	wantID := manifest.NamedResource{
-		Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings",
-	}
-	var found bool
-	for _, d := range deps {
-		if d.NamedResource == wantID {
-			found = true
-		}
-		if d.Kind == manifest.KindConfigMap && d.Name == "maybe-missing" {
-			t.Errorf("Optional substituteFrom ref must not gate reconcile; got %+v", d)
-		}
-	}
-	if !found {
-		t.Errorf("expected substituteFrom dep %+v in deps %+v", wantID, deps)
+func TestReconcile_OptionalMaterializerAbsence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		status   store.Status
+		required bool
+	}{
+		{name: "failed optional", status: store.StatusFailed},
+		{name: "exhausted optional", status: store.StatusPending},
+		{name: "required cause only", status: store.StatusFailed, required: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, s, _ := newControllerWithFixture(t)
+			producer := &manifest.Kustomization{Name: "optional-owner", Namespace: "flux-system"}
+			s.AddObject(producer)
+			s.UpdateStatus(producer.Named(), store.StatusInfo{Status: tc.status, Reason: "", Message: "optional materializer unavailable"})
+			optional := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: producer.Namespace, Name: "optional"}
+			required := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: producer.Namespace, Name: "required"}
+			index := &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{optional: {Productions: []manifest.Production{{Owner: producer.Named()}}}}}
+			c.Store.SetDiscoveryIndex(index)
+			ks := &manifest.Kustomization{Name: "reader", Namespace: producer.Namespace, Path: "./apps", PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: optional.Kind, Name: optional.Name, Optional: true}}}}
+			if tc.required {
+				ks.PostBuild.SubstituteFrom = append(ks.PostBuild.SubstituteFrom, manifest.SubstituteReference{Kind: required.Kind, Name: required.Name})
+			}
+			s.AddObject(ks)
+			assessment := c.ReconcileNode(t.Context(), ks.Named(), manifest.DrainNone)
+			defer assessment.Close()
+			if tc.status == store.StatusPending || tc.required {
+				if assessment.Outcome() != schedule.Blocked || s.GetArtifact(ks.Named()) != nil {
+					t.Fatal("reader did not wait for its unresolved input")
+				}
+				assessment.Settle(t.Context(), manifest.DrainForce)
+			}
+			info, _ := s.GetStatus(ks.Named())
+			if tc.required {
+				if info.Status != store.StatusFailed || !slices.Equal(info.BlockedBy(), []manifest.NamedResource{required}) {
+					t.Fatalf("required diagnostic causes=%+v blocked=%v", info, info.BlockedBy())
+				}
+			} else {
+				art, _ := s.GetArtifact(ks.Named()).(*store.Emission)
+				if info.Status != store.StatusReady || art == nil || len(art.Manifests) != 1 {
+					t.Fatalf("absent optional input prevented render: status=%+v artifact=%+v", info, art)
+				}
+			}
+			for id := range assessment.Reads.Required() {
+				if id == optional || id == producer.Named() {
+					t.Fatalf("optional input entered required footprint: %s", id)
+				}
+			}
+		})
 	}
 }
 
-// TestCollectDeps_SubstituteFromSkipsSecrets locks the
-// SOPS/ExternalSecret carve-out: substituteFrom Secret refs are
-// resolved by values.ExpandPostBuildSubstituteReference at Prepare
-// time and gracefully degrade on missing entries. Adding a depwait
-// edge for them would regress every offline render against a Flux
-// repo using secret-substitute patterns (e.g. cnpg-objectstore,
-// cloudflare-tunnel-substitute) because those Secrets live in
-// cluster state flate cannot materialize.
-func TestCollectDeps_SubstituteFromSkipsSecrets(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindSecret, Name: "cluster-secrets"},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	if deps := c.collectDeps(ks); len(deps) != 0 {
-		t.Errorf("Secret substituteFrom refs must NOT gate reconcile; got %+v", deps)
-	}
-}
-
-// TestCollectDeps_SubstituteFromIgnoresMalformedRefs covers the
-// defensive branches in collectDeps: refs with an unknown Kind or
-// empty Name must be skipped rather than producing meaningless
-// depwait edges that would never resolve.
-func TestCollectDeps_SubstituteFromIgnoresMalformedRefs(t *testing.T) {
-	ks := &manifest.Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: "Junk", Name: "x"},
-			{Kind: manifest.KindConfigMap, Name: ""},
-		},
-	}
-	c := New(store.New(), nil, nil, false)
-	if deps := c.collectDeps(ks); len(deps) != 0 {
-		t.Errorf("expected no deps from malformed substituteFrom refs; got %+v", deps)
-	}
-}
-
-// TestCollectDeps_AppendsSubstituteFromConfigMapAndProducer pins the
-// changed-only producer-KS depwait edge: when the substituteFrom
-// ConfigMap is rendered by another Flux Kustomization, that producer
-// is appended as its own dep so the consumer waits for the producer's
-// reconcile (which materializes the CM) before rendering. See #418.
-func TestCollectDeps_AppendsSubstituteFromConfigMapAndProducer(t *testing.T) {
-	consumerObj := &manifest.Kustomization{
-		Name: "cluster-apps", Namespace: "flux-system",
-		Path: "kubernetes/apps",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindConfigMap, Name: "cluster-settings"},
-		},
-	}
-	producerObj := &manifest.Kustomization{
-		Name: "cluster-vars", Namespace: "flux-system",
-		Path: "kubernetes/flux/vars",
-	}
-	consumer := consumerObj.Named()
-	producer := producerObj.Named()
-	// DiscoveryOnly-indexed CM (Namespace="") — kustomize's namespace
-	// directive hasn't run yet at file-walk time.
-	cmObj := &manifest.ConfigMap{Name: "cluster-settings", Namespace: ""}
-	cmID := cmObj.Named()
-
-	f := change.NewFilter(
-		change.NewSet([]string{"kubernetes/apps/changed.yaml"}),
-		map[manifest.NamedResource]string{
-			consumer: "kubernetes/flux/cluster-apps.yaml",
-			producer: "kubernetes/flux/cluster-vars.yaml",
-			cmID:     "kubernetes/flux/vars/cluster-settings.yaml",
-		},
-		"",
-		testutil.MapLister{consumer: consumerObj, producer: producerObj, cmID: cmObj},
-	)
-
-	c := New(store.New(), nil, nil, false)
-	c.Configure(Options{Filter: f})
-	deps := c.collectDeps(consumerObj)
-
-	wantCM := manifest.NamedResource{
-		Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings",
-	}
-	var sawCM, sawProducer bool
-	for _, d := range deps {
-		if d.NamedResource == wantCM {
-			sawCM = true
-		}
-		if d.NamedResource == producer {
-			sawProducer = true
-		}
-	}
-	if !sawCM {
-		t.Errorf("expected substituteFrom CM dep %+v in deps %+v", wantCM, deps)
-	}
-	if !sawProducer {
-		t.Errorf("expected producer KS dep %+v in deps %+v", producer, deps)
-	}
-}
-
-// TestCollectDeps_SkipsSelfProducer pins the bjw-s self-substitute
-// pattern: a KS that produces its own substituteFrom ConfigMap must
-// NOT be appended as a dep on itself (would self-loop in depwait).
-// See #418.
-func TestCollectDeps_SkipsSelfProducer(t *testing.T) {
-	selfObj := &manifest.Kustomization{
-		Name: "app", Namespace: "foo",
-		Path: "kubernetes/foo/app",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
-			{Kind: manifest.KindConfigMap, Name: "settings"},
-		},
-	}
-	self := selfObj.Named()
-	// CM rendered by self — file lives under self's spec.path so
-	// ownersOf returns self in the producer index.
-	cmObj := &manifest.ConfigMap{Name: "settings", Namespace: ""}
-	cmID := cmObj.Named()
-
-	f := change.NewFilter(
-		change.NewSet([]string{"kubernetes/foo/app/changed.yaml"}),
-		map[manifest.NamedResource]string{
-			self: "kubernetes/foo/app/ks.yaml",
-			cmID: "kubernetes/foo/app/settings.yaml",
-		},
-		"",
-		testutil.MapLister{self: selfObj, cmID: cmObj},
-	)
-
-	c := New(store.New(), nil, nil, false)
-	c.Configure(Options{Filter: f})
-	deps := c.collectDeps(selfObj)
-
-	for _, d := range deps {
-		if d.NamedResource == self {
-			t.Errorf("self-producer must not appear as its own dep; got %+v", deps)
-		}
-	}
-}
-
-// mapResolver wraps a static parent map into the func resolver shape
-// the controllers consume. Used by tests that want to verify
-// behavior on a known parent index without standing up the full
-// orchestrator wiring (which combines this with the renderedSet).
-func mapResolver(m map[manifest.NamedResource]manifest.NamedResource) func(manifest.NamedResource) (manifest.NamedResource, bool) {
-	return func(id manifest.NamedResource) (manifest.NamedResource, bool) {
-		parent, ok := m[id]
-		return parent, ok
+func TestReconcile_OwnerDoesNotEraseReadyExpr(t *testing.T) {
+	t.Parallel()
+	for _, expr := range []string{"false", "true"} {
+		t.Run(expr, func(t *testing.T) {
+			t.Parallel()
+			c, s, _ := newControllerWithFixture(t)
+			owner := &manifest.Kustomization{Name: "owner", Namespace: "flux-system"}
+			child := &manifest.Kustomization{
+				Name: "child", Namespace: owner.Namespace, Path: "./apps",
+				DependsOn: []kustomizev1.DependencyReference{{Name: owner.Name, ReadyExpr: expr}},
+			}
+			s.AddObject(owner)
+			c.Emit(owner.Named(), &store.Emission{Children: []store.Child{{Obj: child}}, Complete: true}, nil)
+			s.UpdateStatus(owner.Named(), store.StatusInfo{Status: store.StatusReady, Reason: "", Message: ""})
+			info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: child.Named(), ReconcileNode: c.ReconcileNode})
+			output, _ := s.GetArtifact(child.Named()).(*store.Emission)
+			rendered := s.GetObject(manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "default", Name: "hello"})
+			if expr == "false" {
+				if info.Status != store.StatusFailed || !info.IsDependencyFailure() || !slices.Equal(info.BlockedBy(), []manifest.NamedResource{owner.Named()}) || output != nil && len(output.Manifests) != 0 || rendered != nil {
+					t.Fatalf("false owner gate permitted output: status=%+v artifact=%+v rendered=%v", info, output, rendered)
+				}
+			} else if info.Status != store.StatusReady || output == nil || len(output.Manifests) != 1 || rendered == nil {
+				t.Fatalf("true owner gate prevented output: status=%+v artifact=%+v rendered=%v", info, output, rendered)
+			}
+		})
 	}
 }

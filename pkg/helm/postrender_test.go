@@ -3,16 +3,23 @@ package helm
 import (
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	"github.com/fluxcd/pkg/apis/kustomize"
+	"sigs.k8s.io/kustomize/kyaml/filesys"
+	"sigs.k8s.io/kustomize/kyaml/openapi"
+	"sigs.k8s.io/kustomize/kyaml/yaml"
 
-	flatekustomize "github.com/home-operations/flate/pkg/kustomize"
+	"github.com/home-operations/flate/internal/assert"
+
+	kustomizestate "github.com/home-operations/flate/internal/kustomize"
 )
 
 func TestNewPostRenderer_NilWhenNoKustomize(t *testing.T) {
+	t.Parallel()
 	if pr := newPostRenderer(nil); pr != nil {
 		t.Errorf("expected nil for empty list, got %T", pr)
 	}
@@ -22,6 +29,7 @@ func TestNewPostRenderer_NilWhenNoKustomize(t *testing.T) {
 }
 
 func TestKustomizePostRenderer_PatchAppliesToHelmOutput(t *testing.T) {
+	t.Parallel()
 	in := bytes.NewBufferString(`apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -56,13 +64,6 @@ data:
 	}
 }
 
-// TestKustomizePostRenderer_HoldsBuildMutex pins the serialization contract
-// behind the non-determinism fix: the helm kustomize post-render runs krusty,
-// which mutates kustomize's process-global state, so it MUST hold the shared
-// kustomize.BuildMutex — otherwise it races a Kustomization's SecureBuild and
-// corrupts renders run-to-run. With the mutex held, Run blocks; once released
-// it completes. A regression (missing lock) lets a trivial post-render finish
-// while the mutex is held, tripping the first select.
 func TestKustomizePostRenderer_HoldsBuildMutex(t *testing.T) {
 	pr := newPostRenderer([]helmv2.PostRenderer{{
 		Kustomize: &helmv2.Kustomize{
@@ -79,21 +80,19 @@ func TestKustomizePostRenderer_HoldsBuildMutex(t *testing.T) {
 	}
 	in := bytes.NewBufferString("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: app, namespace: default}\ndata: {greeting: hello}\n")
 
-	flatekustomize.BuildMutex.Lock()
+	kustomizestate.BuildMutex.Lock()
 	done := make(chan struct{})
 	go func() {
 		_, _ = pr.Run(in)
 		close(done)
 	}()
-	// Mutex held → the krusty build must block (pre-lock work is fast; a
-	// no-lock regression would let this trivial post-render complete here).
 	select {
 	case <-done:
-		flatekustomize.BuildMutex.Unlock()
-		t.Fatal("post-render completed while BuildMutex was held — it does not serialize on the shared krusty lock")
+		kustomizestate.BuildMutex.Unlock()
+		t.Fatal("post-render completed while BuildMutex was held: it does not serialize on the shared krusty lock")
 	case <-time.After(300 * time.Millisecond):
 	}
-	flatekustomize.BuildMutex.Unlock()
+	kustomizestate.BuildMutex.Unlock()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -102,7 +101,7 @@ func TestKustomizePostRenderer_HoldsBuildMutex(t *testing.T) {
 }
 
 func TestKustomizePostRenderer_ImageOverride(t *testing.T) {
-	in := bytes.NewBufferString(`apiVersion: apps/v1
+	const input = `apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: app
@@ -113,20 +112,56 @@ spec:
       containers:
       - name: c
         image: nginx:1.19
-`)
+`
+	fs := filesys.MakeFsInMemory()
+	assert.NoError(t, fs.WriteFile("/kustomization.yaml", []byte("resources: [deployment.yaml]\n")))
+	assert.NoError(t, fs.WriteFile("/deployment.yaml", []byte(input)))
+	kustomizestate.BuildMutex.Lock()
+	openapi.ResetOpenAPI()
+	definition := openapi.SchemaForResourceType(yaml.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}).Schema
+	kustomizestate.BuildMutex.Unlock()
+	t.Cleanup(func() {
+		kustomizestate.BuildMutex.Lock()
+		defer kustomizestate.BuildMutex.Unlock()
+		openapi.ResetOpenAPI()
+	})
 	pr := newPostRenderer([]helmv2.PostRenderer{{
 		Kustomize: &helmv2.Kustomize{
-			Images: []kustomize.Image{{
-				Name:   "nginx",
-				NewTag: "1.25",
-			}},
+			Images: []kustomize.Image{{Name: "nginx", NewTag: "1.25"}},
 		},
 	}})
-	out, err := pr.Run(in)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := range 2 {
+		wg.Go(func() {
+			<-start
+			for range 4 {
+				if worker == 0 {
+					kustomizestate.BuildMutex.Lock()
+					rm, err := kustomizestate.Build(fs, "/")
+					if err != nil {
+						t.Errorf("Build: %v", err)
+					} else {
+						out, err := rm.AsYaml()
+						if err != nil || !strings.Contains(string(out), "nginx:1.19") {
+							t.Errorf("Build output: %s; error: %v", out, err)
+						}
+					}
+					kustomizestate.BuildMutex.Unlock()
+				} else {
+					out, err := pr.Run(bytes.NewBufferString(input))
+					if err != nil {
+						t.Errorf("Run: %v", err)
+					} else if !strings.Contains(out.String(), "nginx:1.25") {
+						t.Errorf("image not overridden:\n%s", out.String())
+					}
+				}
+				kustomizestate.BuildMutex.Lock()
+				assert.Equal(t, openapi.SchemaForResourceType(yaml.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}).Schema, definition)
+				kustomizestate.BuildMutex.Unlock()
+			}
+		})
 	}
-	if !strings.Contains(out.String(), "nginx:1.25") {
-		t.Errorf("image not overridden:\n%s", out.String())
-	}
+	close(start)
+	wg.Wait()
 }

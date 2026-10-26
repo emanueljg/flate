@@ -2,12 +2,15 @@ package keylock
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 func TestKeyMap_SerializesSameKey(t *testing.T) {
+	t.Parallel()
 	m := New[string]()
 	var concurrent atomic.Int32
 	var peak atomic.Int32
@@ -44,7 +47,8 @@ func TestKeyMap_SerializesSameKey(t *testing.T) {
 	}
 }
 
-func TestKeyMap_DistinctKeysRunParallel(_ *testing.T) {
+func TestKeyMap_DistinctKeysRunParallel(t *testing.T) {
+	t.Parallel()
 	m := New[string]()
 	a, _ := m.Acquire(context.Background(), "a")
 	defer a()
@@ -53,6 +57,7 @@ func TestKeyMap_DistinctKeysRunParallel(_ *testing.T) {
 }
 
 func TestKeyMap_CancelledCtxReturnsErr(t *testing.T) {
+	t.Parallel()
 	m := New[string]()
 	release1, _ := m.Acquire(context.Background(), "k")
 	defer release1()
@@ -66,27 +71,40 @@ func TestKeyMap_CancelledCtxReturnsErr(t *testing.T) {
 	}
 }
 
-func TestKeyMap_CancelUnblocksWaiter(t *testing.T) {
+func TestKeyMap_PreCancelledUncontendedReturnsErr(t *testing.T) {
+	t.Parallel()
 	m := New[string]()
-	first, _ := m.Acquire(context.Background(), "k")
-	defer first()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		release, err := m.Acquire(ctx, "k")
-		defer release()
-		done <- err
-	}()
-
-	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	select {
-	case err := <-done:
-		if err == nil {
+	for range 100 {
+		release, err := m.Acquire(ctx, "k")
+		release()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Acquire: got %v, want context.Canceled", err)
+		}
+	}
+}
+
+func TestKeyMap_CancelUnblocksWaiter(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		m := New[string]()
+		first, _ := m.Acquire(t.Context(), "k")
+		defer first()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			release, err := m.Acquire(ctx, "k")
+			defer release()
+			done <- err
+		}()
+
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		if err := <-done; err == nil {
 			t.Errorf("expected non-nil err on cancelled acquire")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("cancel did not unblock waiter")
-	}
+	})
 }

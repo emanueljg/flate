@@ -23,8 +23,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/home-operations/flate/internal/output"
+	"github.com/home-operations/flate/pkg/manifest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 	"github.com/spf13/cobra"
 )
+
+var renderPersistenceDisabledReason = sourcecache.RenderPersistenceDisabledReason()
 
 // New constructs the root command and wires every subcommand into it.
 // Callers that want full control over I/O streams should use Run.
@@ -38,39 +43,36 @@ func New(version string) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().String("log-level", "info", "log level (debug, info, warn, error)")
+	root.PersistentFlags().String("log-level", "error", "log level (debug, info, warn, error)")
 	root.PersistentFlags().Bool("no-progress", false, "disable the live per-resource progress lines on stderr")
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		// Env binding runs first so FLATE_LOG_LEVEL is honored by the
-		// validation below, and downstream RunE bodies see flags that
-		// reflect the merged (CLI > env > default) view.
 		if err := applyEnvVars(cmd); err != nil {
 			return err
 		}
 		// The live status bar paints to stderr only when it is an
 		// interactive terminal (pipes/CI/e2e buffers stay clean), --no-progress
-		// is unset, and a --stream build isn't sharing that terminal with its
-		// stdout output (the sticky bar and raw streamed YAML would interleave —
-		// see progressBarEnabled). When active, slog is routed through the same
-		// stderrRouter so log records interleave above the bar instead of
-		// corrupting it; otherwise slog writes straight to stderr.
-		//
-		// `stream` is a build-subcommand flag, absent on other commands —
-		// GetBool then returns (false, err), which is the correct "no stream".
-		noProgress, _ := cmd.Flags().GetBool("no-progress")
-		stream, _ := cmd.Flags().GetBool("stream")
+		// is unset. Logs share the progress renderer when it is active.
 		barSink = nil
 		logSink := cmd.ErrOrStderr()
-		if progressBarEnabled(noProgress, stream, writerIsTTY(cmd.OutOrStdout()), writerIsTTY(cmd.ErrOrStderr())) {
+		noProgress, _ := cmd.Flags().GetBool("no-progress")
+		if progressBarEnabled(noProgress, writerIsTTY(cmd.ErrOrStderr())) {
 			barSink = newBarWriter(cmd.ErrOrStderr())
 			logSink = barSink
 		}
 		lvl, _ := cmd.Flags().GetString("log-level")
-		// Changed reports whether --log-level (or its FLATE_LOG_LEVEL env
-		// binding) was set explicitly. If so the user asked for logs: stream
-		// them live to stderr on every command. Left at the default, chatter is
-		// deferred into the notes buffer that only `flate test` renders.
-		return setLogLevel(lvl, cmd.Flags().Changed("log-level"), logSink)
+		if err := setLogLevel(lvl, logSink); err != nil {
+			return err
+		}
+		if cmd.Flags().Lookup("path") != nil && renderPersistenceDisabledReason != "" {
+			dir, _ := cmd.Flags().GetString("cache-dir")
+			if dir != "" {
+				return (output.Encoder{Writer: logSink, Color: output.ColorEnabled(logSink)}).Report(output.Model{Warnings: []manifest.Warning{{
+					Category: manifest.WarnRenderPersistenceDisabled,
+					Message:  "render persistence is disabled: " + renderPersistenceDisabledReason + "; source caching remains available",
+				}}})
+			}
+		}
+		return nil
 	}
 
 	root.AddCommand(
@@ -80,6 +82,24 @@ func New(version string) *cobra.Command {
 		newTestCmd(),
 		newCacheCmd(),
 	)
+	var wrapProfiles func(*cobra.Command)
+	wrapProfiles = func(cmd *cobra.Command) {
+		if cmd.RunE != nil && cmd.Flags().Lookup("path") != nil {
+			run := cmd.RunE
+			cmd.RunE = func(cmd *cobra.Command, args []string) error {
+				stopProfile, err := startProfile()
+				if err != nil {
+					return err
+				}
+				defer stopProfile()
+				return run(cmd, args)
+			}
+		}
+		for _, child := range cmd.Commands() {
+			wrapProfiles(child)
+		}
+	}
+	wrapProfiles(root)
 	annotateEnvUsage(root)
 	return root
 }
@@ -110,14 +130,7 @@ func run(version string, args []string, stdout, stderr io.Writer) int {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	err := root.ExecuteContext(ctx)
-	// Deferred log notes (and Result.Warnings) are surfaced ONLY by `flate
-	// test`, the diagnostic command — a data-producing verb (build/get/diff/
-	// cache) stays quiet. So there is no end-of-run flush: anything buffered by
-	// a non-test verb is intentionally dropped (it has already been drained and
-	// rendered by `test`, or it belongs to a verb that doesn't report it).
 	if err != nil {
-		// reportFailures already rendered a styled report for this error; don't
-		// reprint it as a flat "flate error: …" line.
 		if _, ok := errors.AsType[reportedError](err); !ok {
 			_, _ = io.WriteString(stderr, "flate error: "+err.Error()+"\n")
 		}
@@ -126,12 +139,7 @@ func run(version string, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// setLogLevel validates lvl against the published enum and installs
-// the slog default. Unknown values are rejected up-front so
-// `--log-level bogus` fails clearly instead of silently degrading to
-// info — the previous behavior misled users who typo'd `--log-level
-// dbug` and assumed Debug output was simply quiet.
-func setLogLevel(lvl string, explicit bool, w io.Writer) error {
+func setLogLevel(lvl string, w io.Writer) error {
 	var l slog.Level
 	switch lvl {
 	case "debug":
@@ -145,29 +153,8 @@ func setLogLevel(lvl string, explicit bool, w io.Writer) error {
 	default:
 		return fmt.Errorf("invalid --log-level %q: must be one of debug, info, warn, error", lvl)
 	}
-	// Wrap the text handler in a deferring sink so the Warn/Info chatter a
-	// failing run emits (chiefly "resource orphaned") is held back rather than
-	// interleaving with output; Error records still pass straight through. Only
-	// `flate test` drains and renders the held-back notes — a data-producing
-	// verb (build/get/diff) leaves them buffered, so its output stays clean.
-	//
-	// But an explicitly chosen --log-level is the user asking for logs: turn the
-	// buffering OFF so records stream live to stderr on every command, the
-	// behavior a normal logger would give. Without this, raising the log level
-	// on a build/get/diff would be silently swallowed (the footer is test-only).
-	logBuffer = newDeferSink(slog.NewTextHandler(w, &slog.HandlerOptions{Level: l}), !explicit)
-	slog.SetDefault(slog.New(logBuffer))
-	// slog.SetDefault also reroutes the standard library `log` package through
-	// this handler. A dependency's log.Printf — chiefly Helm's values-coalesce
-	// "destination … is a table" warnings (chart/common/util/coalesce.go uses
-	// log.Printf, not slog) — would then land in the notes footer, but ONLY on a
-	// render-cache miss: a cache hit never re-runs the code that logs it, so the
-	// footer differs between otherwise-identical runs depending on cache state
-	// (looks like a race). flate's own diagnostics all use slog, never the
-	// stdlib logger, so detach `log` from the footer: discard it by default
-	// (notes stay deterministic and free of dependency render-noise), or pass it
-	// straight to the sink under --log-level debug, where determinism isn't
-	// promised and the dependency chatter aids troubleshooting.
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: l})))
+	// Dependency log.Printf records vary with render-cache hits.
 	if l <= slog.LevelDebug {
 		log.SetOutput(w)
 	} else {

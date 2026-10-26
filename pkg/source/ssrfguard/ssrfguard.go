@@ -17,17 +17,17 @@
 // hosts (self-hosted Gitea, in-cluster registries), so an always-on private
 // block would break the common case. A consumer rendering untrusted input
 // (konflate fork mode, or the `flate --restrict-egress` flag) turns it on. The
-// toggle is process-global, not per-render, because go-git v5 installs its HTTPS
-// transport on a process-global protocol map with no per-clone hook — so a
-// per-render git egress policy is impossible, and a process-global toggle is the
-// honest model. Set it once at process init; last writer wins.
+// policy is process-global: every transport reads the same toggle at dial time.
+// go-git's installed HTTPS client retains the guard when it clones its concrete
+// transport for per-operation TLS and proxy settings. Set the policy once at
+// process init; last writer wins.
 //
 // Boundaries (deliberately NOT covered):
 //   - A configured HTTP proxy is a trust boundary the operator owns: with
 //     Transport.Proxy set, the dial (and thus Control) sees the proxy IP, not
 //     the CONNECT target.
-//   - SSH git (ssh://) dials via ssh.Dial, outside this HTTP transport; SSH to a
-//     metadata/RFC1918 endpoint is implausible and out of scope.
+//   - SSH git (ssh:// and scp-style) uses go-git's SSH transport, outside this
+//     HTTP dial guard.
 //   - This blocks reaching INTERNAL addresses; full egress-deny (incl. public
 //     hosts) is the consumer's NetworkPolicy job.
 package ssrfguard
@@ -39,7 +39,6 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"syscall"
-	"time"
 )
 
 // restrict is the process-global on/off toggle, read at dial time by control.
@@ -50,9 +49,6 @@ var restrict atomic.Bool
 // but it is a single process-level setting (last writer wins) — see the package
 // doc on why per-render is not possible.
 func Restrict(on bool) { restrict.Store(on) }
-
-// Restricted reports whether the guard is currently enabled.
-func Restricted() bool { return restrict.Load() }
 
 // Ranges netip.Addr.IsPrivate does NOT cover but that are not legitimate fetch
 // targets: carrier-grade NAT, the IETF protocol-assignments /24 (holds
@@ -69,11 +65,11 @@ var (
 	broadcastV4 = netip.AddrFrom4([4]byte{255, 255, 255, 255})
 )
 
-// Blocked reports whether a resolved address must not be dialed. It is pure (no
+// blocked reports whether a resolved address must not be dialed. It is pure (no
 // I/O) and is the unit-testable core of the guard. The standard SSRF set
 // (loopback, RFC1918+ULA, link-local incl. 169.254.169.254, multicast,
 // unspecified) plus the ranges and IPv6-embedded-IPv4 forms net/netip misses.
-func Blocked(a netip.Addr) bool {
+func blocked(a netip.Addr) bool {
 	a = a.Unmap()
 	switch {
 	case !a.IsValid(),
@@ -113,7 +109,7 @@ func embeddedV4Blocked(a netip.Addr) bool {
 	default:
 		return false
 	}
-	return Blocked(v4)
+	return blocked(v4)
 }
 
 // isV4Compatible matches the deprecated ::a.b.c.d form: the top 96 bits are zero
@@ -153,20 +149,14 @@ func control(_, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return &blockedError{address: address, reason: err.Error()}
 	}
-	if Blocked(ap.Addr()) {
+	if blocked(ap.Addr()) {
 		return &blockedError{address: address}
 	}
 	return nil
 }
 
-// WrapTransport installs the guard's Control hook on tr's dialer. It mirrors
-// http.DefaultTransport's dialer settings (Timeout/KeepAlive) so that with the
-// guard off the transport behaves identically to an unwrapped one. Idempotent
-// and safe to call on every transport flate builds.
-func WrapTransport(tr *http.Transport) {
-	tr.DialContext = (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control:   control,
-	}).DialContext
+// WrapTransport attaches the egress control hook to the supplied source-owned dialer.
+func WrapTransport(tr *http.Transport, dialer *net.Dialer) {
+	dialer.Control = control
+	tr.DialContext = dialer.DialContext
 }

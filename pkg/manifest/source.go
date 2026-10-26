@@ -2,31 +2,10 @@ package manifest
 
 import (
 	"cmp"
+	"time"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 )
-
-// GitRepositoryRef is the Flux GitRepositoryRef from source-controller.
-type GitRepositoryRef = sourcev1.GitRepositoryRef
-
-// GitRefString returns "branch:main", "tag:v1.2.3", etc., or empty when
-// the ref is empty. Precedence matches Flux source-controller:
-// commit > name > semver > tag > branch.
-func GitRefString(r GitRepositoryRef) string {
-	switch {
-	case r.Commit != "":
-		return "commit:" + r.Commit
-	case r.Name != "":
-		return "name:" + r.Name
-	case r.SemVer != "":
-		return "semver:" + r.SemVer
-	case r.Tag != "":
-		return "tag:" + r.Tag
-	case r.Branch != "":
-		return "branch:" + r.Branch
-	}
-	return ""
-}
 
 // GitRepository is the Flux GitRepository CRD. The embedded
 // sourcev1.GitRepositorySpec promotes URL, Reference, Verification,
@@ -41,59 +20,68 @@ type GitRepository struct {
 
 // Named identifies the GitRepository.
 func (g *GitRepository) Named() NamedResource {
-	return NamedResource{Kind: KindGitRepository, Namespace: g.Namespace, Name: g.Name}
+	return NamedResource{Group: kindTable[kindGitRepository].Group, Kind: KindGitRepository, Namespace: g.Namespace, Name: g.Name}
 }
+
+// BootstrapAlias returns a local copy and the borrowed immutable Git descriptor.
+// A non-nil descriptor selects repository-root policy and supplies ref/view inputs.
+func (g *GitRepository) BootstrapAlias(root string) (BaseManifest, *GitRepository) {
+	out := *g
+	out.URL = "file://" + root
+	return &out, g
+}
+
+// Content returns the source inputs that define the selected Git content.
+func (g *GitRepository) Content(ref sourcev1.GitRepositoryRef) any {
+	var auth []NamedResource
+	g.references(func(ref Reference) bool {
+		if ref.Content && ref.Name != "" {
+			auth = append(auth, ref.NamedResource)
+		}
+		return true
+	})
+	ignore := ""
+	if g.Ignore != nil {
+		ignore = *g.Ignore
+	}
+	return struct {
+		URL               string
+		Ref               sourcev1.GitRepositoryRef
+		Auth              []NamedResource
+		Ignore            string
+		SparseCheckout    []string `json:",omitempty"`
+		RecurseSubmodules bool
+	}{g.URL, ref, auth, ignore, g.SparseCheckout, g.RecurseSubmodules}
+}
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (g *GitRepository) WithNamespace(namespace string) BaseManifest {
+	out := *g
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (g *GitRepository) ProjectionCompatible(BaseManifest) bool { return true }
 
 // Suspended reports whether reconciliation is paused on this resource.
 func (g *GitRepository) Suspended() bool { return g.Suspend }
 
-// RepoName delegates to the canonical NamedResource helper so all
-// three source kinds (Git, OCI, Helm) produce identical strings on
-// the same id.
-func (g *GitRepository) RepoName() string { return g.Named().FluxResourceName() }
+// ExistenceOnly reports whether readiness requires no artifact acquisition.
+func (g *GitRepository) ExistenceOnly() bool { return false }
 
-// validateSecretRefName rejects a Secret/LocalObjectReference whose
-// Name is empty. Without this check, a typo'd YAML like
-// `secretRef: {}` would fall through to a runtime lookup of
-// "<ns>/" — and with --allow-missing-secrets enabled, would silently
-// soft-skip the source. That converts a schema typo into invisible
-// behavior change. Reject upfront with a clear pointer to the field.
-//
-// kind/owner/field are formatted into the error: e.g. ("OCIRepository",
-// "default/private-app", "spec.secretRef").
-func validateSecretRefName(kind, owner, field, name string) error {
-	if name == "" {
-		return inputf("%s %s: %s.name is empty", kind, owner, field)
-	}
-	return nil
-}
+// SourceInterval returns the authored source refresh interval.
+func (g *GitRepository) SourceInterval() time.Duration { return g.Interval.Duration }
 
-// secretRefCheck pairs a spec.field path with a pointer to the
-// LocalObjectReference at that path. Used in slice form with
-// validateOptionalRefs to batch every Secret-ref validation at the
-// edge of a parser.
-type secretRefCheck struct {
-	Field string
-	Ref   *LocalObjectReference
-}
-
-// validateOptionalRefs runs validateSecretRefName for each non-nil
-// ref in checks. Caller hands the parser's full list of pointer-to-
-// LocalObjectReference fields in one shot so adding a new ref to a
-// source kind's schema is a one-line edit rather than 3-5 new
-// boilerplate blocks. Value-type refs (e.g. Verification.SecretRef,
-// nested inside a *Verification) stay inline since they don't
-// share the nil-pointer-guard shape.
-func validateOptionalRefs(kind, owner string, checks ...secretRefCheck) error {
-	for _, c := range checks {
-		if c.Ref == nil {
-			continue
+// Active source credentials MUST name a Secret, even when missing secrets are allowed.
+func validateSecretReference(id NamedResource, err *error) func(Reference) bool {
+	return func(ref Reference) bool {
+		if ref.Kind == KindSecret && ref.Name == "" {
+			*err = inputf("%s %s/%s: spec.%s.name is empty", id.Kind, id.Namespace, id.Name, ref.Use)
+			return false
 		}
-		if err := validateSecretRefName(kind, owner, c.Field, c.Ref.Name); err != nil {
-			return err
-		}
+		return true
 	}
-	return nil
 }
 
 // parseGitRepository decodes a GitRepository CR via the Flux typed
@@ -108,31 +96,32 @@ func parseGitRepository(doc map[string]any) (*GitRepository, error) {
 		return nil, inputf("GitRepository missing spec.url")
 	}
 	cr.Spec.Provider = cmp.Or(cr.Spec.Provider, sourcev1.GitProviderGeneric)
-	cr.Spec.URL = ResolveEnvsubstDefaults(cr.Spec.URL)
+	cr.Spec.URL = resolveEnvsubstDefaults(cr.Spec.URL)
 	if r := cr.Spec.Reference; r != nil {
-		r.Branch = ResolveEnvsubstDefaults(r.Branch)
-		r.Tag = ResolveEnvsubstDefaults(r.Tag)
-		r.SemVer = ResolveEnvsubstDefaults(r.SemVer)
-		r.Commit = ResolveEnvsubstDefaults(r.Commit)
-		r.Name = ResolveEnvsubstDefaults(r.Name)
+		r.Branch = resolveEnvsubstDefaults(r.Branch)
+		r.Tag = resolveEnvsubstDefaults(r.Tag)
+		r.SemVer = resolveEnvsubstDefaults(r.SemVer)
+		r.Commit = resolveEnvsubstDefaults(r.Commit)
+		r.Name = resolveEnvsubstDefaults(r.Name)
 	}
-	owner := cr.Namespace + "/" + cr.Name
-	if err := validateOptionalRefs("GitRepository", owner,
-		secretRefCheck{Field: "spec.secretRef", Ref: cr.Spec.SecretRef},
-		secretRefCheck{Field: "spec.proxySecretRef", Ref: cr.Spec.ProxySecretRef},
-	); err != nil {
-		return nil, err
-	}
-	// flate does not verify signatures: spec.verify is ignored, not validated.
-	return &GitRepository{
+	out := &GitRepository{
 		Name:              cr.Name,
 		Namespace:         cr.Namespace,
 		GitRepositorySpec: cr.Spec,
-	}, nil
+	}
+	var err error
+	out.references(validateSecretReference(out.Named(), &err))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// OCIRepositoryRef is the Flux OCIRepositoryRef from source-controller.
-type OCIRepositoryRef = sourcev1.OCIRepositoryRef
+// OCIRepositoryRef holds the Flux OCI reference and its cache-retention fact.
+type OCIRepositoryRef sourcev1.OCIRepositoryRef
+
+// Pinned reports whether a digest fixes the selected content.
+func (r *OCIRepositoryRef) Pinned() bool { return r != nil && r.Digest != "" }
 
 // OCIRepository is the Flux OCIRepository CRD. The embedded
 // sourcev1.OCIRepositorySpec promotes URL, Reference, LayerSelector,
@@ -145,42 +134,86 @@ type OCIRepository struct {
 	sourcev1.OCIRepositorySpec `json:",inline" yaml:",inline"`
 }
 
+// LayerOperation returns the Flux layer operation, defaulting to extraction.
+func (o *OCIRepository) LayerOperation() string {
+	return (&sourcev1.OCIRepository{Spec: o.OCIRepositorySpec}).GetLayerOperation()
+}
+
+// LayerMediaType returns the authored layer media type selector.
+func (o *OCIRepository) LayerMediaType() string {
+	return (&sourcev1.OCIRepository{Spec: o.OCIRepositorySpec}).GetLayerMediaType()
+}
+
 // OCILayerSelector is the Flux OCILayerSelector from source-controller.
 // "extract" (default) unpacks the layer's tarball into the artifact
 // directory; "copy" persists the compressed blob verbatim under the
 // filename "layer.tar.gz".
 type OCILayerSelector = sourcev1.OCILayerSelector
 
-// OCILayerOperationExtract and OCILayerOperationCopy are the two
-// values source-controller accepts on LayerSelector.Operation.
-const (
-	OCILayerOperationExtract = "extract"
-	OCILayerOperationCopy    = "copy"
-)
-
 // Named identifies the OCIRepository.
 func (o *OCIRepository) Named() NamedResource {
-	return NamedResource{Kind: KindOCIRepository, Namespace: o.Namespace, Name: o.Name}
+	return NamedResource{Group: kindTable[kindOCIRepository].Group, Kind: KindOCIRepository, Namespace: o.Namespace, Name: o.Name}
 }
+
+// BootstrapAlias returns a local copy; a nil Git descriptor selects a derived frozen root.
+func (o *OCIRepository) BootstrapAlias(root string) (BaseManifest, *GitRepository) {
+	out := *o
+	out.URL = "file://" + root
+	return &out, nil
+}
+
+// Content returns the source inputs that define the selected OCI content.
+func (o *OCIRepository) Content(ref sourcev1.OCIRepositoryRef) any {
+	var auth []NamedResource
+	o.references(func(ref Reference) bool {
+		if ref.Content && ref.Name != "" {
+			auth = append(auth, ref.NamedResource)
+		}
+		return true
+	})
+	ignore := ""
+	if o.Ignore != nil {
+		ignore = *o.Ignore
+	}
+	return struct {
+		URL           string
+		Ref           sourcev1.OCIRepositoryRef
+		Auth          []NamedResource
+		Insecure      bool
+		LayerSelector *OCILayerSelector
+		Ignore        string
+	}{o.URL, ref, auth, o.Insecure, o.LayerSelector, ignore}
+}
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (o *OCIRepository) WithNamespace(namespace string) BaseManifest {
+	out := *o
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (o *OCIRepository) ProjectionCompatible(BaseManifest) bool { return true }
 
 // Suspended reports whether reconciliation is paused on this resource.
 func (o *OCIRepository) Suspended() bool { return o.Suspend }
 
-// RepoName delegates to the canonical NamedResource helper.
-func (o *OCIRepository) RepoName() string { return o.Named().FluxResourceName() }
+// ExistenceOnly reports whether readiness requires no artifact acquisition.
+func (o *OCIRepository) ExistenceOnly() bool { return false }
 
-// Version returns the digest, semver expression, or tag in that order.
-// A semver expression is returned verbatim — callers wanting a concrete
-// tag must resolve it against remote tag listing (pkg/source).
-func (o *OCIRepository) Version() string {
+// SourceInterval returns the authored source refresh interval.
+func (o *OCIRepository) SourceInterval() time.Duration { return o.Interval.Duration }
+
+// ChartVersion returns the digest, semver constraint or tag declared by the source.
+func (o *OCIRepository) ChartVersion() string {
 	if o.Reference == nil {
 		return ""
 	}
 	return cmp.Or(o.Reference.Digest, o.Reference.SemVer, o.Reference.Tag)
 }
 
-// ParseOCIRepository decodes an OCIRepository CR.
-func ParseOCIRepository(doc map[string]any) (*OCIRepository, error) {
+// parseOCIRepository decodes an OCIRepository CR.
+func parseOCIRepository(doc map[string]any) (*OCIRepository, error) {
 	var cr sourcev1.OCIRepository
 	if err := decodeCR(doc, &cr, "OCIRepository", SourceDomain); err != nil {
 		return nil, err
@@ -193,36 +226,26 @@ func ParseOCIRepository(doc map[string]any) (*OCIRepository, error) {
 	// `tag: "${FLUXCD_VERSION:=v2.8.5}"` becomes "v2.8.5" before the
 	// fetcher tries to resolve it. Bare ${VAR} (no default) is left
 	// for postBuild substitution.
-	cr.Spec.URL = ResolveEnvsubstDefaults(cr.Spec.URL)
+	cr.Spec.URL = resolveEnvsubstDefaults(cr.Spec.URL)
 	if r := cr.Spec.Reference; r != nil {
-		r.Tag = ResolveEnvsubstDefaults(r.Tag)
-		r.SemVer = ResolveEnvsubstDefaults(r.SemVer)
-		r.Digest = ResolveEnvsubstDefaults(r.Digest)
+		r.Tag = resolveEnvsubstDefaults(r.Tag)
+		r.SemVer = resolveEnvsubstDefaults(r.SemVer)
+		r.Digest = resolveEnvsubstDefaults(r.Digest)
 	}
-	owner := cr.Namespace + "/" + cr.Name
-	if err := validateOptionalRefs("OCIRepository", owner,
-		secretRefCheck{Field: "spec.secretRef", Ref: cr.Spec.SecretRef},
-		secretRefCheck{Field: "spec.certSecretRef", Ref: cr.Spec.CertSecretRef},
-		secretRefCheck{Field: "spec.proxySecretRef", Ref: cr.Spec.ProxySecretRef},
-	); err != nil {
-		return nil, err
-	}
-	// flate does not verify signatures: spec.verify is ignored, not validated.
-	return &OCIRepository{
+	out := &OCIRepository{
 		Name:              cr.Name,
 		Namespace:         cr.Namespace,
 		OCIRepositorySpec: cr.Spec,
-	}, nil
+	}
+	var err error
+	out.references(validateSecretReference(out.Named(), &err))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// ExternalArtifact is the Flux ExternalArtifact CRD
-// (source.toolkit.fluxcd.io/v1). It is the contract a third-party
-// controller uses to publish an on-cluster artifact under Flux's
-// source-controller schema. flate's offline reconcile cannot fetch
-// from a live cluster — if a downstream Kustomization or HelmRelease
-// references an ExternalArtifact via sourceRef.kind=ExternalArtifact,
-// the user must supply status.artifact in the YAML (typical workflow:
-// pre-bake a file:// URL) for flate to resolve a local path.
+// ExternalArtifact is a source whose content is published by its materializer.
 type ExternalArtifact struct {
 	Name      string `json:"name"                yaml:"name"`
 	Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
@@ -230,41 +253,62 @@ type ExternalArtifact struct {
 	// ExternalArtifactSpec embeds the upstream spec, exposing
 	// SourceRef at the top level.
 	sourcev1.ExternalArtifactSpec `json:",inline" yaml:",inline"`
-
-	// ArtifactURL / Revision / Digest come from status.artifact when
-	// pre-populated in the YAML. Empty otherwise (the normal case for a
-	// freshly-written CR); flate then fails to resolve any consumer.
-	ArtifactURL string `json:"-" yaml:"-"`
-	Revision    string `json:"-" yaml:"-"`
-	Digest      string `json:"-" yaml:"-"`
 }
 
 // Named identifies the ExternalArtifact.
 func (e *ExternalArtifact) Named() NamedResource {
-	return NamedResource{Kind: KindExternalArtifact, Namespace: e.Namespace, Name: e.Name}
+	return NamedResource{Group: kindTable[kindExternalArtifact].Group, Kind: KindExternalArtifact, Namespace: e.Namespace, Name: e.Name}
 }
 
-// Suspended is always false for ExternalArtifact — the CR has no
-// spec.suspend field per Flux's schema. Defined so the source
-// controller's Suspendable check is uniform.
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (e *ExternalArtifact) WithNamespace(namespace string) BaseManifest {
+	out := *e
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (e *ExternalArtifact) ProjectionCompatible(BaseManifest) bool { return true }
+
+// Suspended reports whether reconciliation is paused on this resource.
 func (e *ExternalArtifact) Suspended() bool { return false }
 
-// parseExternalArtifact decodes an ExternalArtifact CR via the
-// source-controller typed schema.
+// ExistenceOnly reports whether readiness requires no artifact acquisition.
+func (e *ExternalArtifact) ExistenceOnly() bool { return false }
+
+// SourceInterval returns the authored source refresh interval.
+func (e *ExternalArtifact) SourceInterval() time.Duration { return 0 }
+
 func parseExternalArtifact(doc map[string]any) (*ExternalArtifact, error) {
 	var cr sourcev1.ExternalArtifact
 	if err := decodeCR(doc, &cr, "ExternalArtifact", SourceDomain); err != nil {
 		return nil, err
 	}
-	out := &ExternalArtifact{
+	return &ExternalArtifact{
 		Name:                 cr.Name,
 		Namespace:            cr.Namespace,
 		ExternalArtifactSpec: cr.Spec,
+	}, nil
+}
+
+func (g *GitRepository) references(yield func(Reference) bool) {
+	credentialReferences(yield, g.Namespace, g.SecretRef, nil, g.ProxySecretRef)
+}
+
+func (o *OCIRepository) references(yield func(Reference) bool) {
+	credentialReferences(yield, o.Namespace, o.SecretRef, o.CertSecretRef, o.ProxySecretRef)
+}
+
+func (g *GitRepository) kind() KindInfo { return kindTable[kindGitRepository].KindInfo }
+
+func (o *OCIRepository) kind() KindInfo { return kindTable[kindOCIRepository].KindInfo }
+
+func (e *ExternalArtifact) kind() KindInfo { return kindTable[kindExternalArtifact].KindInfo }
+
+func (e *ExternalArtifact) references(yield func(Reference) bool) {
+	if e.SourceRef == nil {
+		return
 	}
-	if a := cr.Status.Artifact; a != nil {
-		out.ArtifactURL = a.URL
-		out.Revision = a.Revision
-		out.Digest = a.Digest
-	}
-	return out, nil
+	ref := e.SourceRef
+	yield(Reference{NamedResource: Resolve(NamedResource{Group: referenceGroup(ref.Kind, ref.APIVersion), Kind: ref.Kind, Name: ref.Name, Namespace: ref.Namespace}, "", e.Namespace), Use: "materializer", Gate: GateInputs})
 }

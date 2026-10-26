@@ -1,25 +1,8 @@
 package kustomize
 
-// generate.go reproduces fluxcd/pkg/kustomize.Generator.GenerateManifest against
-// an injected (in-memory) filesystem, so flate can merge a Flux Kustomization's
-// spec into a kustomization.yaml entirely in RAM — no on-disk staging, no
-// per-render mutation of a shared tree.
-//
-// Why a reimplementation rather than calling flux's Generator: flux v1.32.0's
-// Generator picks its own filesystem in getFS() (a secure on-disk FS rooted at
-// g.root, or a plain on-disk FS) and exposes no seam to inject one — the
-// `WithFS` its doc comment references does not exist in this release. flux ships
-// a memory-over-disk overlay (kustomize/filesys.MakeFsInMemory) but has not yet
-// wired it into the Generator. So to render in memory we mirror GenerateManifest
-// here. A golden byte-equivalence test (generate_test.go) pins this to flux's
-// real Generator across the full field matrix.
-//
-// Scope: this mirrors flux's auto-generate (path: ./) case. When the caller
-// passes a non-nil ignore matcher — for working-tree / self-referential sources
-// that never passed through a fetcher — source-controller's file exclusion
-// (.sops.yaml, binaries, …) is applied here while scanning for resources,
-// reproducing flux's NewGeneratorWithIgnore behavior; fetched artifacts were
-// already filtered and pass nil.
+// generate.go mirrors fluxcd/pkg/kustomize.Generator.GenerateManifest on an
+// injected filesystem. The upstream generator constructs its own disk filesystem,
+// so flate merges Flux specs into private construction overlays in memory.
 
 import (
 	"encoding/json"
@@ -40,6 +23,8 @@ import (
 	kustypes "sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 	"sigs.k8s.io/yaml"
+
+	"github.com/home-operations/flate/pkg/manifest"
 )
 
 // Flux Kustomization spec field names (mirrors the unexported consts in
@@ -65,11 +50,9 @@ const (
 //
 // It is a faithful port of Generator.GenerateManifest: same field order, same
 // _placeholder / originAnnotations empty-build guards, same sigs.k8s.io/yaml
-// encoder, so the output is byte-identical to flux's. Source-controller's file
-// exclusions are not consulted here: a working-tree fsys already hides them
-// (see ignorefs.go), so the scan sees the same files a fetched artifact holds.
-// The base path comes from fsys.CleanedAbs (the real on-disk path under the
-// memory-over-disk overlay), matching flux's filepath.Abs(dirPath).
+// encoder, so the output is byte-identical to flux's. The admitted filesystem
+// already applies source-controller's file exclusions before the scan.
+// CleanedAbs supplies the mounted base path used by the resource scan.
 func generateManifest(fsys filesys.FileSystem, dirPath string, obj map[string]any) ([]byte, string, error) {
 	data, kfile, foundExisting, err := findOrGenerateKustomization(fsys, dirPath)
 	if err != nil {
@@ -86,7 +69,7 @@ func generateManifest(fsys filesys.FileSystem, dirPath string, obj map[string]an
 
 	// An existing kustomization with no resources would fail krusty's
 	// "kustomization.yaml is empty" check; originAnnotations keeps it buildable.
-	// (The generated-from-scratch path uses a _placeholder namespace instead —
+	// (The generated-from-scratch path uses a _placeholder namespace instead;
 	// see findOrGenerateKustomization.)
 	if foundExisting && len(kus.Resources) == 0 {
 		kus.BuildMetadata = []string{"originAnnotations"}
@@ -109,7 +92,7 @@ func generateManifest(fsys filesys.FileSystem, dirPath string, obj map[string]an
 	for _, p := range patches {
 		kus.Patches = append(kus.Patches, kustypes.Patch{
 			Patch:  p.Patch,
-			Target: adaptSelector(p.Target),
+			Target: AdaptSelector(p.Target),
 		})
 	}
 
@@ -149,7 +132,7 @@ func generateManifest(fsys filesys.FileSystem, dirPath string, obj map[string]an
 		//nolint:staticcheck // byte-for-byte parity with flux's Generator, which populates this deprecated field
 		kus.PatchesJson6902 = append(kus.PatchesJson6902, kustypes.Patch{
 			Patch:  string(raw),
-			Target: adaptSelector(&p.Target),
+			Target: AdaptSelector(&p.Target),
 		})
 	}
 
@@ -158,20 +141,25 @@ func generateManifest(fsys filesys.FileSystem, dirPath string, obj map[string]an
 		return nil, "", fmt.Errorf("unable to get images: %w", err)
 	}
 	for _, image := range images {
-		newImage := kustypes.Image{
-			Name:    image.Name,
-			NewName: image.NewName,
-			NewTag:  image.NewTag,
-			Digest:  image.Digest,
-		}
-		// Dedup spec.images by name, last write winning — flux's
-		// checkKustomizeImageExists.
 		if i := slices.IndexFunc(kus.Images, func(img kustypes.Image) bool {
 			return img.Name == image.Name
 		}); i >= 0 {
-			kus.Images[i] = newImage
+			if image.NewName != "" {
+				kus.Images[i].NewName = image.NewName
+			}
+			// Tag and digest select one version; overriding either must clear
+			// the other so a stale digest cannot defeat a new tag at pull time.
+			if image.NewTag != "" || image.Digest != "" {
+				kus.Images[i].NewTag = image.NewTag
+				kus.Images[i].Digest = image.Digest
+			}
 		} else {
-			kus.Images = append(kus.Images, newImage)
+			kus.Images = append(kus.Images, kustypes.Image{
+				Name:    image.Name,
+				NewName: image.NewName,
+				NewTag:  image.NewTag,
+				Digest:  image.Digest,
+			})
 		}
 	}
 
@@ -227,10 +215,8 @@ func findOrGenerateKustomization(fsys filesys.FileSystem, dirPath string) (data 
 		return b, kpath, true, rerr
 	}
 
-	// flux uses filepath.Abs(dirPath); under the memory-over-disk overlay
-	// CleanedAbs delegates to the disk layer, yielding the real absolute path
-	// — also the prefix every walked path carries — so the TrimPrefix below
-	// yields the same "./relative" resource entries flux produces on disk.
+	// CleanedAbs and Walk MUST use the same mounted path prefix so resource
+	// entries remain relative to the build root.
 	base, _, err := fsys.CleanedAbs(dirPath)
 	if err != nil {
 		return nil, "", false, err
@@ -335,10 +321,10 @@ func kustomizeConfigKind(b []byte) string {
 	if err := yaml.Unmarshal(b, &head); err != nil {
 		return ""
 	}
-	if !strings.HasPrefix(head.APIVersion, "kustomize.config.k8s.io/") {
+	if !strings.HasPrefix(head.APIVersion, manifest.KustomizeDomain+"/") {
 		return ""
 	}
-	if head.Kind == "Kustomization" || head.Kind == "Component" {
+	if head.Kind == kustypes.KustomizationKind || head.Kind == kustypes.ComponentKind {
 		return head.Kind
 	}
 	return ""
@@ -374,9 +360,9 @@ func decodeTypedSlice[T any](obj map[string]any, fields ...string) ([]T, error) 
 	return res, resultErr
 }
 
-// adaptSelector converts a Flux selector into a kustomize selector. Mirrors
+// AdaptSelector converts a Flux selector into a kustomize selector. Mirrors
 // flux's generator adaptSelector (nil in, nil out).
-func adaptSelector(selector *fluxapis.Selector) *kustypes.Selector {
+func AdaptSelector(selector *fluxapis.Selector) *kustypes.Selector {
 	if selector == nil {
 		return nil
 	}

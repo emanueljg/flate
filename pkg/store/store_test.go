@@ -2,11 +2,18 @@ package store
 
 import (
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
+	"github.com/home-operations/flate/internal/testutil"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -18,7 +25,370 @@ func newCM(name, ns string) *manifest.ConfigMap {
 	return &manifest.ConfigMap{Name: name, Namespace: ns}
 }
 
+func TestStore_Snapshot(t *testing.T) {
+	t.Parallel()
+	id := testutil.HelmReleaseID("apps", "reader")
+	resourceSet := &manifest.ResourceSet{Name: id.Name, Namespace: id.Namespace}
+	for _, tc := range []struct {
+		name   string
+		obj    manifest.BaseManifest
+		id     manifest.NamedResource
+		status Status
+	}{
+		{"typed", &manifest.HelmRelease{Name: id.Name, Namespace: id.Namespace}, id, StatusReady},
+		{"raw canonical identity", &manifest.RawObject{APIVersion: manifest.HelmReleaseDomain + "/v2", Kind: id.Kind, Name: id.Name, Namespace: id.Namespace}, id, StatusReady},
+		{"statusless", newCM(id.Name, id.Namespace), newCM(id.Name, id.Namespace).Named(), StatusReady},
+		{"ResourceSet pending", resourceSet, resourceSet.Named(), StatusPending},
+		{"status only canonical", nil, id, StatusReady},
+		{"status only foreign", nil, manifest.NamedResource{Kind: id.Kind, Group: "example.test", Name: id.Name}, StatusReady},
+		{"absent", nil, id, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := New()
+			if tc.obj != nil {
+				st.AddObject(tc.obj)
+			}
+			if tc.status != "" {
+				st.UpdateStatus(tc.id, StatusInfo{Status: tc.status, Reason: "", Message: "observed"})
+			}
+			statusful := tc.obj != nil && manifest.KindOf(tc.obj).Status || tc.obj == nil && tc.id.KindInfo().Status
+			for _, requested := range []bool{false, true} {
+				t.Run(fmt.Sprint(requested), func(t *testing.T) {
+					t.Parallel()
+					var observation Observation
+					obj, observation := st.Snapshot(tc.id, requested)
+					assert.Equal(t, obj, tc.obj)
+					snapshot61, _ := st.Snapshot(tc.id, requested)
+					assert.Equal(t, snapshot61, tc.obj)
+					assert.Equal(t, observation.Statusful, statusful)
+					want, _ := st.GetStatus(tc.id)
+					if tc.obj != nil && !statusful && !requested {
+						want = StatusInfo{}
+					}
+					assert.Equal(t, observation.StatusInfo, want)
+					var conditions []Condition
+					if requested && tc.status != "" {
+						conditions = []Condition{readyCondition(tc.status, "", "observed")}
+					}
+					assert.Diff(t, observation.Conditions, conditions)
+					if len(observation.Conditions) != 0 {
+						observation.Conditions[0].Message = "mutated"
+						var fresh Observation
+						_, fresh = st.Snapshot(tc.id, true)
+						assert.Diff(t, fresh.Conditions, conditions)
+						assert.Equal(t, fresh.StatusInfo, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestStore_AddObject_ContentDedup(t *testing.T) {
+	t.Parallel()
+	t.Run("document metadata", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		obj := &manifest.OCIRepository{Name: "source", Namespace: "apps"}
+		arrivals := 0
+		s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { arrivals++ }, false)
+		s.AddObject(obj)
+		doc := map[string]any{"metadata": map[string]any{"name": obj.Name}}
+		s.AddObject(obj, doc)
+		next := manifest.DeepCopyMap(doc)
+		next["metadata"].(map[string]any)["namespace"] = obj.Namespace
+		s.AddObject(obj, next)
+		if arrivals != 1 {
+			t.Fatalf("unchanged source metadata caused %d arrivals, want 1", arrivals)
+		}
+		_, retained, attempt := s.GetEmission(obj.Named())
+		defer attempt.Finish()
+		if !specValueEqual(retained, next) {
+			t.Fatal("suppressed arrival lost the authoritative document")
+		}
+	})
+	for _, insert := range []struct {
+		name string
+		add  func(*Store, manifest.BaseManifest)
+	}{
+		{"single", func(s *Store, obj manifest.BaseManifest) { s.AddObject(obj) }},
+		{"batch", func(s *Store, obj manifest.BaseManifest) { s.AddObjects([]manifest.BaseManifest{obj}) }},
+	} {
+		t.Run(insert.name, func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name      string
+				newObject func(string) manifest.BaseManifest
+			}{
+				{"raw", func(value string) manifest.BaseManifest {
+					return &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "app", Namespace: "ns", Spec: map[string]any{"replicas": value}}
+				}},
+				{"typed", func(value string) manifest.BaseManifest {
+					return &manifest.ConfigMap{Name: "app", Namespace: "ns", Data: map[string]any{"value": value}}
+				}},
+			} {
+				for _, distinct := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/distinct=%t", tc.name, distinct), func(t *testing.T) {
+						t.Parallel()
+						s := New()
+						obj := tc.newObject("1")
+						seen := 0
+						s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
+							seen++
+							if s.GetObject(id) == nil {
+								t.Error("listener cannot see rendered object")
+							}
+						}, false)
+						insert.add(s, obj)
+						equal := obj
+						if distinct {
+							equal = tc.newObject("1")
+						}
+						insert.add(s, equal)
+						assert.Equal(t, seen, 1)
+						changed := tc.newObject("2")
+						insert.add(s, changed)
+						assert.Equal(t, seen, 2)
+						assert.Equal(t, s.GetObject(obj.Named()), changed)
+					})
+				}
+			}
+		})
+	}
+}
+
+func TestStore_AddObject_ConcurrentDedup(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		newObject func() manifest.BaseManifest
+	}{
+		{"typed", func() manifest.BaseManifest {
+			return &manifest.ConfigMap{Name: "app", Namespace: "ns", Data: map[string]any{"key": "value"}}
+		}},
+		{"raw", func() manifest.BaseManifest {
+			return &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "app", Spec: map[string]any{"replicas": 1}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := New()
+			var seen atomic.Int64
+			s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { seen.Add(1) }, false)
+			var wg sync.WaitGroup
+			for range 32 {
+				wg.Go(func() { s.AddObject(tc.newObject()) })
+			}
+			wg.Wait()
+			assert.Equal(t, seen.Load(), int64(1))
+		})
+	}
+}
+
+func TestStore_AddObject_NestedContent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		spec  map[string]any
+		equal bool
+	}{
+		{"equal", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "extra": []string{"a"}}, true},
+		{"nested map changed", map[string]any{"items": []any{map[string]any{"value": "changed"}, true, int64(1), 1.5}, "extra": []string{"a"}}, false},
+		{"slice length changed", map[string]any{"items": []any{map[string]any{"value": "same"}}, "extra": []string{"a"}}, false},
+		{"scalar type changed", map[string]any{"items": []any{map[string]any{"value": "same"}, true, 1, 1.5}, "extra": []string{"a"}}, false},
+		{"fallback changed", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "extra": []string{"b"}}, false},
+		{"missing key", map[string]any{"items": []any{map[string]any{"value": "same"}, true, int64(1), 1.5}, "other": []string{"a"}}, false},
+		{"nil spec", nil, false},
+		{"empty spec", map[string]any{}, false},
+	}
+	base := &manifest.RawObject{APIVersion: "example.test/v1", Kind: "Widget", Name: "app", Spec: cases[0].spec}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := New()
+			seen := 0
+			s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { seen++ }, false)
+			s.AddObject(base)
+			clone := *base
+			clone.Spec = tc.spec
+			s.AddObject(&clone)
+			want := 2
+			if tc.equal {
+				want = 1
+			}
+			assert.Equal(t, seen, want)
+		})
+	}
+}
+
+func TestObjectEqual_ConcurrentProjection(t *testing.T) {
+	t.Parallel()
+	parse := func() *manifest.Kustomization {
+		t.Helper()
+		obj, _, _, err := manifest.ParseDoc(map[string]any{
+			"apiVersion": manifest.FluxKustomizeDomain + "/v1", "kind": manifest.KindKustomization,
+			"metadata": map[string]any{"name": "app", "namespace": "ns"},
+			"spec":     map[string]any{"path": "./app", "sourceRef": map[string]any{"kind": "GitRepository", "name": "repo"}},
+		}, manifest.ParseDocOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return obj.(*manifest.Kustomization)
+	}
+	first, second := parse(), parse()
+	s := New()
+	s.AddObject(first)
+	start := make(chan struct{})
+	var ready, workers sync.WaitGroup
+	ready.Add(2)
+	workers.Go(func() {
+		ready.Done()
+		<-start
+		if _, err := first.RenderDocument(); err != nil {
+			t.Error(err)
+		}
+	})
+	workers.Go(func() {
+		ready.Done()
+		<-start
+		s.AddObject(second)
+	})
+	ready.Wait()
+	close(start)
+	workers.Wait()
+	got := s.GetObject(first.Named()).(*manifest.Kustomization)
+	assert.Equal(t, got.Named(), first.Named())
+	assert.Equal(t, got.Path, "./app")
+	assert.Equal(t, got.SourceRef, second.SourceRef)
+}
+
+func TestObjectEqual_KustomizationContent(t *testing.T) {
+	t.Parallel()
+	parse := func(t *testing.T) *manifest.Kustomization {
+		t.Helper()
+		obj, _, _, err := manifest.ParseDoc(map[string]any{
+			"apiVersion": manifest.FluxKustomizeDomain + "/v1", "kind": manifest.KindKustomization,
+			"metadata": map[string]any{"name": "app", "namespace": "ns"},
+			"spec": map[string]any{
+				"path": "./app", "sourceRef": map[string]any{"kind": "GitRepository", "name": "repo"},
+				"postBuild": map[string]any{"substitute": map[string]any{"KEY": "same"}},
+			},
+		}, manifest.ParseDocOptions{})
+		assert.NoError(t, err)
+		return obj.(*manifest.Kustomization)
+	}
+	populate := func(t *testing.T, k *manifest.Kustomization) {
+		t.Helper()
+		_, err := k.RenderDocument()
+		assert.NoError(t, err)
+	}
+	for _, tc := range []struct {
+		name    string
+		prepare func(*testing.T, *manifest.Kustomization, *manifest.Kustomization) *manifest.Kustomization
+		change  func(*manifest.Kustomization)
+		equal   bool
+	}{
+		{name: "cold caches", equal: true},
+		{name: "one populated cache", equal: true, prepare: func(t *testing.T, a, b *manifest.Kustomization) *manifest.Kustomization {
+			t.Helper()
+			populate(t, a)
+			return b
+		}},
+		{name: "independent populated caches", equal: true, prepare: func(t *testing.T, a, b *manifest.Kustomization) *manifest.Kustomization {
+			t.Helper()
+			populate(t, a)
+			populate(t, b)
+			return b
+		}},
+		{name: "absent cache", equal: true, prepare: func(t *testing.T, a, b *manifest.Kustomization) *manifest.Kustomization {
+			t.Helper()
+			populate(t, a)
+			return &manifest.Kustomization{Name: b.Name, Namespace: b.Namespace, KustomizationSpec: b.KustomizationSpec}
+		}},
+		{name: "name", change: func(k *manifest.Kustomization) { k.Name = "other" }},
+		{name: "namespace", change: func(k *manifest.Kustomization) { k.Namespace = "other" }},
+		{name: "source", change: func(k *manifest.Kustomization) { k.SourceRef.Name = "other" }},
+		{name: "path", change: func(k *manifest.Kustomization) { k.Path = "./other" }},
+		{name: "labels", change: func(k *manifest.Kustomization) { k.Labels = map[string]string{"app": "other"} }},
+		{name: "annotations", change: func(k *manifest.Kustomization) { k.Annotations = map[string]string{"note": "other"} }},
+		{name: "nil and empty labels", change: func(k *manifest.Kustomization) { k.Labels = map[string]string{} }},
+		{name: "nil and empty annotations", change: func(k *manifest.Kustomization) { k.Annotations = map[string]string{} }},
+		{name: "nil and empty spec slice", change: func(k *manifest.Kustomization) { k.Components = []string{} }},
+		{name: "nested spec", change: func(k *manifest.Kustomization) { k.PostBuild.Substitute["KEY"] = "other" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			first, second := parse(t), parse(t)
+			if tc.prepare != nil {
+				second = tc.prepare(t, first, second)
+			}
+			if tc.change != nil {
+				second = second.Clone()
+				tc.change(second)
+			}
+			assert.Equal(t, objectEqual(first, second), tc.equal)
+			assert.Equal(t, objectEqual(second, first), tc.equal)
+			s := New()
+			seen := 0
+			s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { seen++ }, false)
+			s.AddObject(first)
+			s.AddObject(second)
+			want := 2
+			if tc.equal {
+				want = 1
+			}
+			assert.Equal(t, seen, want)
+		})
+	}
+}
+
+func TestObjectEqual_RawObjectFields(t *testing.T) {
+	t.Parallel()
+	rawType := reflect.TypeFor[manifest.RawObject]()
+	fields := make([]string, rawType.NumField())
+	for i := range fields {
+		fields[i] = rawType.Field(i).Name
+	}
+	assert.Diff(t, fields, []string{"Kind", "APIVersion", "Name", "Namespace", "Spec"})
+	base := &manifest.RawObject{
+		Kind: "Widget", APIVersion: "example.test/v1", Name: "app", Namespace: "ns",
+		Spec: map[string]any{"items": []any{map[string]any{"value": "same"}}},
+	}
+	assert.Equal(t, objectEqual(base, base), true)
+	for _, tc := range []struct {
+		name   string
+		change func(*manifest.RawObject)
+		equal  bool
+	}{
+		{name: "equal distinct pointers", equal: true},
+		{name: "kind", change: func(obj *manifest.RawObject) { obj.Kind = "Other" }},
+		{name: "api version", change: func(obj *manifest.RawObject) { obj.APIVersion = "example.test/v2" }},
+		{name: "name", change: func(obj *manifest.RawObject) { obj.Name = "other" }},
+		{name: "namespace", change: func(obj *manifest.RawObject) { obj.Namespace = "other" }},
+		{name: "spec", change: func(obj *manifest.RawObject) { obj.Spec = nil }},
+		{name: "nested spec", change: func(obj *manifest.RawObject) {
+			obj.Spec["items"].([]any)[0].(map[string]any)["value"] = "changed"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			candidate := base.Clone()
+			assert.Equal(t, candidate == base, false)
+			if tc.change != nil {
+				tc.change(candidate)
+			}
+			assert.Equal(t, objectEqual(base, candidate), tc.equal)
+			assert.Equal(t, objectEqual(candidate, base), tc.equal)
+		})
+	}
+	assert.Diff(t, base.Spec, map[string]any{"items": []any{map[string]any{"value": "same"}}})
+	// nil and empty maps stay distinct, as under reflect.DeepEqual.
+	assert.Equal(t, objectEqual(&manifest.RawObject{Spec: map[string]any{}}, &manifest.RawObject{}), false)
+}
+
 func TestStore_AddObjectIdempotent(t *testing.T) {
+	t.Parallel()
 	s := New()
 	cm := newCM("a", "ns")
 	id := cm.Named()
@@ -41,6 +411,7 @@ func TestStore_AddObjectIdempotent(t *testing.T) {
 // it, mutate the clone, and re-AddObject. The store's reflect.DeepEqual
 // dedup recognizes the clone as different and fires EventObjectAdded.
 func TestStore_AddObject_CloneTriggersUpdate(t *testing.T) {
+	t.Parallel()
 	s := New()
 	cm := newCM("a", "ns")
 	id := cm.Named()
@@ -68,27 +439,38 @@ func TestStore_AddObject_CloneTriggersUpdate(t *testing.T) {
 	}
 }
 
-func TestStore_AddObjectsDispatchesAfterAllWrites(t *testing.T) {
+func TestStore_AddObjects_DispatchesAfterAllWrites(t *testing.T) {
+	t.Parallel()
 	s := New()
 	a := newCM("a", "ns")
-	b := newCM("b", "ns")
-	idA := a.Named()
-	idB := b.Named()
-
-	var sawBOnA bool
-	s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
-		if id == idA {
-			sawBOnA = s.GetObject(idB) != nil
+	b := &manifest.RawObject{Kind: manifest.KindConfigMap, APIVersion: "example.test/v1", Name: "a", Namespace: "ns"}
+	c := &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: "b", Namespace: "ns", Spec: map[string]any{"replicas": 1}}
+	idA, idB, idC := a.Named(), b.Named(), c.Named()
+	seen := map[manifest.NamedResource]int{}
+	s.AddListener(EventObjectAdded, func(id manifest.NamedResource, payload any) {
+		seen[id]++
+		assert.Equal(t, payload.(manifest.BaseManifest).Named(), id)
+		assert.Equal(t, s.GetObject(idA), manifest.BaseManifest(a))
+		assert.Equal(t, s.GetObject(idC), manifest.BaseManifest(c))
+		if got := s.GetObject(idB); got == nil || got.Named() != idB {
+			t.Errorf("batch listener cannot see foreign sibling: %v", got)
 		}
 	}, false)
 
-	s.AddObjects([]manifest.BaseManifest{a, b})
-	if !sawBOnA {
-		t.Fatal("listener for first object did not see later batch sibling")
-	}
+	s.AddObjects([]manifest.BaseManifest{a, b, c})
+	s.AddObjects([]manifest.BaseManifest{newCM("a", "ns"), b.Clone(), c.Clone()})
+	assert.Diff(t, seen, map[manifest.NamedResource]int{idA: 1, idB: 1, idC: 1})
+	newVersion := b.Clone()
+	newVersion.APIVersion = "example.test/v2"
+	assert.Equal(t, newVersion.Named(), idB)
+	s.AddObjects([]manifest.BaseManifest{newVersion})
+	assert.Equal(t, s.GetObject(idB), manifest.BaseManifest(newVersion))
+	assert.Equal(t, len(s.ListObjects("example.test", manifest.KindConfigMap)), 1)
+	assert.Diff(t, seen, map[manifest.NamedResource]int{idA: 1, idB: 2, idC: 1})
 }
 
 func TestStore_AddListener_Flush(t *testing.T) {
+	t.Parallel()
 	s := New()
 	s.AddObject(newCM("a", "ns"))
 	s.AddObject(newCM("b", "ns"))
@@ -100,110 +482,158 @@ func TestStore_AddListener_Flush(t *testing.T) {
 	assert.Equal(t, len(got), 2) // both seeds replayed
 }
 
-// TestStore_Refire_ResetsStatusBeforeDispatch pins the contract that
-// makes the issue #260 fix race-free: by the time the EventObjectAdded
-// listener fires, the resource's recorded status MUST already be
-// Pending. A consumer's depwait observing status between the two events
-// must never see the stale Ready left by an initial PreGate skip.
-func TestStore_Refire_ResetsStatusBeforeDispatch(t *testing.T) {
+func TestStore_AdmissionInvalidatesWithoutStatusReset(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "src"}
-	s.AddObject(&manifest.OCIRepository{Name: "src", Namespace: "flux-system"})
-	s.UpdateStatus(id, StatusReady, MsgUnchanged) // simulate PreGate skip
-
-	var observed StatusInfo
-	s.AddListener(EventObjectAdded, func(eventID manifest.NamedResource, _ any) {
-		if eventID != id {
-			return
-		}
-		info, _ := s.GetStatus(eventID)
-		observed = info
-	}, false)
-	s.Refire(id)
-
-	if observed.Status != StatusPending {
-		t.Errorf("listener saw status %+v on Refire; want Pending so depwaits block", observed)
+	obj := &manifest.OCIRepository{Name: "source", Namespace: "apps"}
+	id := obj.Named()
+	s.AddObject(obj)
+	s.SetIncluded(id, false)
+	s.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: ReasonUnchanged, Message: "unchanged"})
+	var reads ReadSet
+	reads.Init(s, id, nil)
+	reads.GetObject(id)
+	if reads.Admitted() {
+		t.Fatal("excluded execution admitted")
 	}
-	if observed.Message != MsgRefetching {
-		t.Errorf("listener saw message %q; want %q", observed.Message, MsgRefetching)
+	arrivals := 0
+	s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) { arrivals++ }, false)
+	s.SetIncluded(id, true)
+	if reads.Valid() || arrivals != 0 {
+		t.Fatalf("valid=%t arrivals=%d", reads.Valid(), arrivals)
+	}
+	if info, _ := s.GetStatus(id); info.Status != StatusReady || info.Outcome() != OutcomeUnchanged {
+		t.Fatalf("admission rewrote status: %+v", info)
 	}
 }
 
-// TestStore_Refire_NoopMissingID pins that Refire silently returns
-// when id isn't in the store — used by callers that may speculatively
-// refire ids that race a DeleteObject.
-func TestStore_Refire_NoopMissingID(t *testing.T) {
+func TestStore_UpdateStatus_Idempotent(t *testing.T) { //nolint:tparallel // Subtests exercise one ordered transition history.
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "ns", Name: "nope"}
-
-	fired := 0
-	s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) { fired++ }, false)
-	s.Refire(id) // must not panic, must not dispatch
-	assert.Equal(t, fired, 0)
-	if _, ok := s.GetStatus(id); ok {
-		t.Errorf("Refire on missing id left status behind")
+	id := testutil.KustomizationID("flux-system", "apps")
+	var events []StatusInfo
+	s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, payload any) {
+		events = append(events, payload.(StatusInfo))
+	}, false)
+	for _, tc := range []struct {
+		name         string
+		status       Status
+		reason, want StatusReason
+		count        int
+	}{
+		{"initial pending", StatusPending, "", ReasonReconciling, 1},
+		{"identical pending", StatusPending, "", ReasonReconciling, 1},
+		{"skip", StatusReady, ReasonSkipped, ReasonSkipped, 2},
+		{"identical skip", StatusReady, ReasonSkipped, ReasonSkipped, 2},
+		{"reason only", StatusReady, ReasonUnchanged, ReasonUnchanged, 3},
+		{"ordinary reset", StatusReady, "", ReasonSucceeded, 4},
+		{"identical ready", StatusReady, "", ReasonSucceeded, 4},
+		{"custom", StatusReady, "Custom", "Custom", 5},
+		{"failed reset", StatusFailed, "", ReasonFailed, 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.UpdateStatus(id, StatusInfo{Status: tc.status, Reason: tc.reason, Message: "same message"})
+			info, ok := s.GetStatus(id)
+			if !ok || info.Status != tc.status || info.Reason != tc.want || len(events) != tc.count {
+				t.Fatalf("status=%+v present=%v events=%d, want reason=%s events=%d", info, ok, len(events), tc.want, tc.count)
+			}
+			if events[len(events)-1] != info {
+				t.Fatal("event lost status projection")
+			}
+			var replay StatusInfo
+			u := s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, payload any) { replay = payload.(StatusInfo) }, true)
+			u()
+			if replay != info {
+				t.Fatalf("replay=%+v, want %+v", replay, info)
+			}
+		})
 	}
+	assert.Equal(t, events[1].Reason, ReasonSkipped)
 }
 
-func TestStore_UpdateStatus_Idempotent(t *testing.T) {
-	s := New()
-	id := manifest.NamedResource{Kind: "Kustomization", Namespace: "flux-system", Name: "apps"}
-
-	count := 0
-	s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, _ any) {
-		count++
-	}, false)
-	s.UpdateStatus(id, StatusPending, "starting")
-	s.UpdateStatus(id, StatusPending, "starting")
-	s.UpdateStatus(id, StatusReady, "done")
-	assert.Equal(t, count, 2)
-	info, ok := s.GetStatus(id)
-	if !ok || info.Status != StatusReady {
-		t.Errorf("status: %+v ok=%v", info, ok)
+func TestStatusInfo_Outcome(t *testing.T) {
+	t.Parallel()
+	failure := &dependencyFailure{ids: []manifest.NamedResource{testutil.HelmReleaseID("", "dep")}}
+	for _, tc := range []struct {
+		name        string
+		info        StatusInfo
+		outcome     Outcome
+		unavailable bool
+	}{
+		{name: "absent", outcome: OutcomePending},
+		{name: "ready", info: StatusInfo{Status: StatusReady}, outcome: OutcomePassed},
+		{name: "custom ready", info: StatusInfo{Status: StatusReady, Reason: "Custom", Message: "skipped: x"}, outcome: OutcomePassed},
+		{name: "misleading skip", info: StatusInfo{Status: StatusReady, Message: "skipped: x"}, outcome: OutcomePassed},
+		{name: "misleading unchanged", info: StatusInfo{Status: StatusReady, Message: "unchanged"}, outcome: OutcomePassed},
+		{name: "misleading suspended", info: StatusInfo{Status: StatusReady, Message: "suspended"}, outcome: OutcomePassed},
+		{name: "empty skipped", info: StatusInfo{Status: StatusReady, Reason: ReasonSkipped}, outcome: OutcomeSkipped, unavailable: true},
+		{name: "empty unchanged", info: StatusInfo{Status: StatusReady, Reason: ReasonUnchanged}, outcome: OutcomeUnchanged},
+		{name: "empty suspended", info: StatusInfo{Status: StatusReady, Reason: ReasonSuspended}, outcome: OutcomeSuspended, unavailable: true},
+		{name: "skipped diagnostic", info: StatusInfo{Status: StatusReady, Reason: ReasonSkipped, Message: "reworded"}, outcome: OutcomeSkipped, unavailable: true},
+		{name: "unchanged diagnostic", info: StatusInfo{Status: StatusReady, Reason: ReasonUnchanged, Message: "suspended"}, outcome: OutcomeUnchanged},
+		{name: "suspended diagnostic", info: StatusInfo{Status: StatusReady, Reason: ReasonSuspended, Message: "unchanged"}, outcome: OutcomeSuspended, unavailable: true},
+		{name: "failed before skip", info: StatusInfo{Status: StatusFailed, Reason: ReasonSkipped}, outcome: OutcomeFailed, unavailable: true},
+		{name: "blocked before skip", info: StatusInfo{Status: StatusFailed, Reason: ReasonSkipped, failure: failure}, outcome: OutcomeBlocked, unavailable: true},
+		{name: "pending before suspension", info: StatusInfo{Status: StatusPending, Reason: ReasonSuspended}, outcome: OutcomePending},
+		{name: "refetching", info: StatusInfo{Status: StatusPending, Reason: StatusReason("CustomPending"), Message: "suspended"}, outcome: OutcomePending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.info.Outcome(), tc.outcome)
+			assert.Equal(t, tc.info.IsUnavailable(), tc.unavailable)
+		})
 	}
 }
 
 func TestStore_SetCondition_NonReadyFiresStatusEvent(t *testing.T) {
-	// Non-Ready conditions DO fire EventStatusUpdated so CEL-based
-	// ReadyExpr waiters can react to Healthy / per-target health
-	// transitions. The Ready-derived StatusInfo payload doesn't change,
-	// but listeners that need finer granularity (depwait's CEL path)
-	// re-query GetConditions to see the change.
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: "Kustomization", Name: "k", Namespace: "ns"}
-	s.UpdateStatus(id, StatusPending, "starting")
+	id := testutil.KustomizationID("ns", "k")
+	s.UpdateStatus(id, StatusInfo{Status: StatusPending, Reason: "", Message: "starting"})
 	statusEvents := 0
 	s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, _ any) {
 		statusEvents++
 	}, false)
 	s.SetCondition(id, Condition{Type: ConditionHealthy, Status: metav1.ConditionTrue, Reason: "Healthy"})
-	assert.Equal(t, statusEvents, 1) // non-Ready SetCondition still fires
-	if got := len(s.GetConditions(id)); got != 2 {
+	assert.Equal(t, statusEvents, 1)
+	var observation Observation
+	_, observation = s.Snapshot(id, true)
+	conds := observation.Conditions
+	if got := len(conds); got != 2 {
 		t.Fatalf("expected 2 conditions, got %d", got)
 	}
 }
 
 func TestStore_SetCondition_ReadyFiresStatusEvent(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: "Kustomization", Name: "k", Namespace: "ns"}
-	statusEvents := 0
+	id := testutil.KustomizationID("ns", "k")
+	var events []StatusInfo
 	s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, payload any) {
-		statusEvents++
-		info, ok := payload.(StatusInfo)
-		if !ok || info.Status != StatusReady {
-			t.Errorf("expected Ready payload, got %+v", payload)
-		}
+		events = append(events, payload.(StatusInfo))
 	}, false)
-	s.SetCondition(id, Condition{
-		Type: ConditionReady, Status: metav1.ConditionTrue,
-		Reason: ReasonSucceeded, Message: "ok",
-	})
-	assert.Equal(t, statusEvents, 1)
+	cond := Condition{Type: ConditionReady, Status: metav1.ConditionTrue, Reason: string(ReasonSkipped), Message: "ok"}
+	s.SetCondition(id, cond)
+	var observation Observation
+	_, observation = s.Snapshot(id, true)
+	snapshot := observation.Conditions
+	cond.Reason = "Custom"
+	s.SetCondition(id, cond)
+	s.SetCondition(id, cond)
+	assert.Equal(t, len(events), 2)
+	assert.Equal(t, events[0].Reason, ReasonSkipped)
+	assert.Equal(t, events[1].Reason, StatusReason("Custom"))
+	info, ok := s.GetStatus(id)
+	if !ok || info != events[1] || info.Outcome() != OutcomePassed {
+		t.Fatalf("projected status = %+v", info)
+	}
+	assert.Equal(t, snapshot[0].Reason, string(ReasonSkipped))
 }
 
 func TestStore_SetCondition_IdenticalIsNoOp(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: "Kustomization", Name: "k", Namespace: "ns"}
+	id := testutil.KustomizationID("ns", "k")
 	statusEvents := 0
 	s.AddListener(EventStatusUpdated, func(_ manifest.NamedResource, _ any) { statusEvents++ }, false)
 
@@ -214,46 +644,101 @@ func TestStore_SetCondition_IdenticalIsNoOp(t *testing.T) {
 }
 
 func TestStore_FailedResources(t *testing.T) {
+	t.Parallel()
 	s := New()
 	assert.Equal(t, len(s.FailedResources()), 0) // empty store
 
 	ks := &manifest.Kustomization{Name: "x", Namespace: ""}
 	id := ks.Named()
 	s.AddObject(ks)
-	s.UpdateStatus(id, StatusFailed, "boom")
+	s.UpdateStatus(id, StatusInfo{Status: StatusFailed, Reason: "", Message: "boom"})
 	assert.Equal(t, len(s.FailedResources()), 1)
 
 	// Phantom guard: a SetCondition that races after DeleteObject must
 	// not resurrect a failure entry for an id that no longer exists.
 	s.DeleteObject(id)
-	s.UpdateStatus(id, StatusFailed, "phantom")  // simulates the race
-	assert.Equal(t, len(s.FailedResources()), 0) // phantom entry must not leak
+	s.UpdateStatus(id, StatusInfo{Status: StatusFailed, Reason: "", Message: "phantom"}) // simulates the race
+	assert.Equal(t, len(s.FailedResources()), 0)                                         // phantom entry must not leak
 }
 
-// PR125 switched ListObjects(kind) to a byName-index walk when kind is
-// non-empty. Verify it returns exactly the entries for that kind, that
-// the empty-kind path still walks everything, and that DeleteObject
-// keeps the secondary index consistent.
 func TestStore_ListObjects_ByKindIndex(t *testing.T) {
-	s := New()
-	s.AddObject(newCM("a", "ns1"))
-	s.AddObject(newCM("b", "ns2"))
-	s.AddObject(&manifest.Secret{Name: "s", Namespace: "ns1"})
+	t.Parallel()
+	for _, core := range []bool{false, true} {
+		for _, insertForeignFirst := range []bool{false, true} {
+			for _, withdrawForeignFirst := range []bool{false, true} {
+				t.Run(fmt.Sprintf("core=%t/insertForeignFirst=%t/withdrawForeignFirst=%t", core, insertForeignFirst, withdrawForeignFirst), func(t *testing.T) {
+					t.Parallel()
+					s := New()
+					var typed manifest.BaseManifest = &manifest.Kustomization{Name: "a", Namespace: "ns1"}
+					if core {
+						typed = newCM("a", "ns1")
+					}
+					id := typed.Named()
+					foreign := &manifest.RawObject{APIVersion: "example.test/v1", Kind: id.Kind, Namespace: id.Namespace, Name: id.Name}
+					pair := []manifest.BaseManifest{typed, foreign}
+					if insertForeignFirst {
+						pair[0], pair[1] = pair[1], pair[0]
+					}
+					s.AddObjects(pair)
+					other := &manifest.Secret{Name: "s", Namespace: "ns1"}
+					s.AddObject(other)
+					for _, tt := range []struct {
+						name, group, kind string
+						want              []manifest.BaseManifest
+					}{
+						{"real", id.Group, id.Kind, []manifest.BaseManifest{typed}},
+						{"foreign", "example.test", id.Kind, []manifest.BaseManifest{foreign}},
+						{"other kind", "", manifest.KindSecret, []manifest.BaseManifest{other}},
+						{"group without kind", "example.test", "", []manifest.BaseManifest{}},
+					} {
+						got := s.ListObjects(tt.group, tt.kind)
+						t.Run(tt.name, func(t *testing.T) {
+							t.Parallel()
 
-	assert.Equal(t, len(s.ListObjects(manifest.KindConfigMap)), 2)
-	assert.Equal(t, len(s.ListObjects(manifest.KindSecret)), 1)
-	assert.Equal(t, len(s.ListObjects("")), 3) // empty kind walks all
-	s.DeleteObject(manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "ns1", Name: "a"})
-	assert.Equal(t, len(s.ListObjects(manifest.KindConfigMap)), 1) // index stays consistent
+							if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(manifest.Kustomization{}), cmpopts.IgnoreFields(manifest.Kustomization{}, "projection")); diff != "" {
+								t.Fatalf("listed objects changed (-want +got): %s", diff)
+							}
+						})
+					}
+					inventory := []manifest.BaseManifest{typed, foreign, other}
+					slices.SortFunc(inventory, func(a, b manifest.BaseManifest) int { return a.Named().Compare(b.Named()) })
+					if diff := cmp.Diff(s.ListObjects("", ""), inventory, cmp.AllowUnexported(manifest.Kustomization{}), cmpopts.IgnoreFields(manifest.Kustomization{}, "projection")); diff != "" {
+						t.Fatalf("stored objects changed (-want +got): %s", diff)
+					}
+					pair = []manifest.BaseManifest{typed, foreign}
+					if withdrawForeignFirst {
+						pair[0], pair[1] = pair[1], pair[0]
+					}
+					for i, obj := range pair {
+						assert.Equal(t, s.GetObject(obj.Named()), obj)
+						assert.Equal(t, s.DeleteObject(obj.Named()), true)
+						assert.Equal(t, s.GetObject(obj.Named()), nil)
+						assert.Equal(t, len(s.ListObjects(obj.Named().Group, id.Kind)), 0)
+						if i == 0 {
+							remaining := pair[1]
+							assert.Equal(t, s.GetObject(remaining.Named()), remaining)
+							if diff := cmp.Diff(s.ListObjects(remaining.Named().Group, id.Kind), []manifest.BaseManifest{remaining}, cmp.AllowUnexported(manifest.Kustomization{}), cmpopts.IgnoreFields(manifest.Kustomization{}, "projection")); diff != "" {
+								t.Fatalf("stored objects changed (-want +got): %s", diff)
+							}
+						}
+					}
+					if diff := cmp.Diff(s.ListObjects("", ""), []manifest.BaseManifest{other}, cmp.AllowUnexported(manifest.Kustomization{}), cmpopts.IgnoreFields(manifest.Kustomization{}, "projection")); diff != "" {
+						t.Fatalf("stored objects changed (-want +got): %s", diff)
+					}
+				})
+			}
+		}
+	}
 }
 
 // TestStore_ListObjects_DeterministicOrder pins the sort contract:
 // two ListObjects calls with concurrent concurrent adds must return
-// objects in the same (Kind, Namespace, Name) order. Without the
+// objects in the same (Kind, Group, Namespace, Name) order. Without the
 // sort, Go map iteration is randomized and ownership tie-breaking in
 // change/ownership.go can attribute the same file to different KS
 // owners on different runs.
 func TestStore_ListObjects_DeterministicOrder(t *testing.T) {
+	t.Parallel()
 	s := New()
 	// Add objects in non-alphabetical order so insertion order can't
 	// accidentally hide a missing sort.
@@ -268,8 +753,8 @@ func TestStore_ListObjects_DeterministicOrder(t *testing.T) {
 		s.AddObject(obj)
 	}
 
-	first := s.ListObjects(manifest.KindConfigMap)
-	second := s.ListObjects(manifest.KindConfigMap)
+	first := s.ListObjects("", manifest.KindConfigMap)
+	second := s.ListObjects("", manifest.KindConfigMap)
 
 	if len(first) != len(second) {
 		t.Fatalf("lengths differ: %d vs %d", len(first), len(second))
@@ -291,6 +776,7 @@ func TestStore_ListObjects_DeterministicOrder(t *testing.T) {
 }
 
 func TestStore_AddListener_Unsubscribe(t *testing.T) {
+	t.Parallel()
 	s := New()
 	count := 0
 	unsub := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
@@ -303,8 +789,9 @@ func TestStore_AddListener_Unsubscribe(t *testing.T) {
 }
 
 func TestStore_SetArtifact(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: "GitRepository", Name: "r"}
+	id := manifest.NamedResource{Group: manifest.SourceDomain, Kind: "GitRepository", Name: "r"}
 	art := &SourceArtifact{Kind: "GitRepository", URL: "https://example", LocalPath: "/tmp/x"}
 
 	count := 0
@@ -326,11 +813,12 @@ func TestStore_SetArtifact(t *testing.T) {
 // rendered docs decode into fresh maps every reconcile — drives
 // this in production.
 func TestStore_SetArtifact_DistinctPointerDedup(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
-	makeArt := func() *KustomizationArtifact {
-		return &KustomizationArtifact{
-			Path: "./apps",
+	id := testutil.KustomizationID("flux-system", "apps")
+	makeArt := func() *Emission {
+		return &Emission{
+
 			Manifests: []map[string]any{
 				{
 					"apiVersion": "v1",
@@ -359,8 +847,9 @@ func TestStore_SetArtifact_DistinctPointerDedup(t *testing.T) {
 // short-circuit cuts that hot path from ~58 ns (reflect.DeepEqual on
 // aliased pointers) to ~17 ns (the map lookup alone).
 func TestStore_SetArtifact_PointerIdentityShortCircuit(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindGitRepository, Name: "r"}
+	id := manifest.NamedResource{Group: manifest.SourceDomain, Kind: manifest.KindGitRepository, Name: "r"}
 	art := &SourceArtifact{Kind: "GitRepository", URL: "https://example", LocalPath: "/tmp/x"}
 
 	events := 0
@@ -376,16 +865,17 @@ func TestStore_SetArtifact_PointerIdentityShortCircuit(t *testing.T) {
 // TestStore_SetArtifact_DifferentContent pins the inverse: a
 // re-set with DIFFERENT content fires an event.
 func TestStore_SetArtifact_DifferentContent(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "apps"}
+	id := testutil.KustomizationID("flux-system", "apps")
 
 	events := 0
 	s.AddListener(EventArtifactUpdated, func(_ manifest.NamedResource, _ any) { events++ }, false)
 
-	s.SetArtifact(id, &KustomizationArtifact{Path: "./apps", Manifests: []map[string]any{
+	s.SetArtifact(id, &Emission{Manifests: []map[string]any{
 		{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "cm-1"}},
 	}})
-	s.SetArtifact(id, &KustomizationArtifact{Path: "./apps", Manifests: []map[string]any{
+	s.SetArtifact(id, &Emission{Manifests: []map[string]any{
 		{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "cm-2"}},
 	}})
 
@@ -393,6 +883,7 @@ func TestStore_SetArtifact_DifferentContent(t *testing.T) {
 }
 
 func TestStore_ListenerPanicIsolated(t *testing.T) {
+	t.Parallel()
 	s := New()
 	other := 0
 	s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
@@ -412,6 +903,7 @@ func TestStore_ListenerPanicIsolated(t *testing.T) {
 // orchestrator's Run loop ever ticked. Parity with the live `fire`
 // path in TestStore_ListenerPanicIsolated.
 func TestStore_ListenerPanicRecoveredDuringReplay(t *testing.T) {
+	t.Parallel()
 	s := New()
 	s.AddObject(newCM("a", "ns"))
 	s.AddObject(newCM("b", "ns"))
@@ -429,24 +921,22 @@ func TestStore_ListenerPanicRecoveredDuringReplay(t *testing.T) {
 	assert.Equal(t, other, 2) // store healthy after recovered replay panic
 }
 
-func TestStore_Concurrency(_ *testing.T) {
+func TestStore_Concurrency(t *testing.T) {
+	t.Parallel()
 	s := New()
 	const N = 200
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for range N {
 			s.AddObject(newCM("a", "ns"))
 		}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for range N {
-			_ = s.ListObjects("ConfigMap")
+			_ = s.ListObjects("", "ConfigMap")
 		}
-	}()
+	})
 	wg.Wait()
 }
 
@@ -460,6 +950,7 @@ func TestStore_Concurrency(_ *testing.T) {
 // production by deduping per-id reconciles, but a test counter
 // surfaces it.
 func TestStore_AddListener_FlushNoDoubleFire(t *testing.T) {
+	t.Parallel()
 	const iterations = 200
 	for range iterations {
 		s := New()
@@ -478,21 +969,18 @@ func TestStore_AddListener_FlushNoDoubleFire(t *testing.T) {
 
 		var startGate, done sync.WaitGroup
 		startGate.Add(1)
-		done.Add(2)
 
-		go func() {
-			defer done.Done()
+		done.Go(func() {
 			startGate.Wait()
 			s.AddObject(racerObj)
-		}()
-		go func() {
-			defer done.Done()
+		})
+		done.Go(func() {
 			startGate.Wait()
 			s.AddListener(EventObjectAdded, func(id manifest.NamedResource, _ any) {
 				v, _ := counts.LoadOrStore(id, new(atomic.Int64))
 				v.(*atomic.Int64).Add(1)
 			}, true)
-		}()
+		})
 		startGate.Done()
 		done.Wait()
 
@@ -501,22 +989,6 @@ func TestStore_AddListener_FlushNoDoubleFire(t *testing.T) {
 			t.Fatalf("racer fired %d times on iteration; want exactly 1", got)
 		}
 	}
-}
-
-// TestStore_AddRendered_DispatchesListeners pins the listener contract:
-// AddRendered MUST fire EventObjectAdded so callers that listen for
-// kinds promoted via render (e.g. valuesFrom invalidation watching
-// rendered Secret docs) see the event. The original implementation
-// skipped dispatch entirely with a "rendered docs are leaves" comment;
-// adding any new listener for a render-output kind silently broke.
-func TestStore_AddRendered_DispatchesListeners(t *testing.T) {
-	s := New()
-	var seen atomic.Int64
-	s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
-		seen.Add(1)
-	}, false)
-	s.AddRendered(newCM("a", "ns"))
-	assert.Equal(t, seen.Load(), int64(1)) // AddRendered must dispatch
 }
 
 // TestStore_AddListenerNoFlush_NoMissedConcurrentWrites pins that a
@@ -536,6 +1008,7 @@ func TestStore_AddRendered_DispatchesListeners(t *testing.T) {
 // observes every AddObject made after its own goroutine acquired
 // the lock.
 func TestStore_AddListenerNoFlush_NoMissedConcurrentWrites(t *testing.T) {
+	t.Parallel()
 	s := New()
 	const writers = 64
 	var (
@@ -574,63 +1047,97 @@ func TestStore_AddListenerNoFlush_NoMissedConcurrentWrites(t *testing.T) {
 	}
 }
 
-// TestStore_ListenerSnapshotPool_NoLostEvents stresses the pooled
-// listener-snapshot path under concurrent fires. With 10 goroutines
-// firing 100 events each against a 50-listener set, every listener
-// must observe every event — losing one means the pool aliasing
-// is wrong (the dispatcher iterated a slice that had already been
-// released and recycled by another fire). Run under -race for the
-// full guarantee.
-func TestStore_ListenerSnapshotPool_NoLostEvents(t *testing.T) {
-	s := New()
-	const (
-		numListeners = 50
-		numFirers    = 10
-		eventsPer    = 100
-	)
-	totalEvents := int64(numFirers * eventsPer)
-	wantPerListener := totalEvents
+func TestStore_ListenerSnapshots(t *testing.T) {
+	t.Parallel()
+	t.Run("concurrent delivery", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		const (
+			numListeners = 50
+			numFirers    = 10
+			eventsPer    = 100
+		)
+		totalEvents := int64(numFirers * eventsPer)
+		wantPerListener := totalEvents
 
-	counts := make([]atomic.Int64, numListeners)
-	for i := range numListeners {
-		s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
-			counts[i].Add(1)
-		}, false)
-	}
-
-	var wg sync.WaitGroup
-	for g := range numFirers {
-		wg.Go(func() {
-			for n := range eventsPer {
-				// Distinct names per (goroutine, event) so the
-				// AddObject dedup never short-circuits — each call
-				// must fire EventObjectAdded.
-				name := fmt.Sprintf("g%d-n%d", g, n)
-				s.AddObject(newCM(name, "ns"))
-			}
-		})
-	}
-	wg.Wait()
-
-	for i := range numListeners {
-		if got := counts[i].Load(); got != wantPerListener {
-			t.Errorf("listener[%d] observed %d events, want %d (pool aliasing dropped a fire?)", i, got, wantPerListener)
+		counts := make([]atomic.Int64, numListeners)
+		for i := range numListeners {
+			s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+				counts[i].Add(1)
+			}, false)
 		}
-	}
+
+		var wg sync.WaitGroup
+		for g := range numFirers {
+			wg.Go(func() {
+				for n := range eventsPer {
+					// Distinct names per (goroutine, event) so the
+					// AddObject dedup never short-circuits — each call
+					// must fire EventObjectAdded.
+					name := fmt.Sprintf("g%d-n%d", g, n)
+					s.AddObject(newCM(name, "ns"))
+				}
+			})
+		}
+		wg.Wait()
+
+		for i := range numListeners {
+			if got := counts[i].Load(); got != wantPerListener {
+				t.Errorf("listener[%d] observed %d events, want %d (listener snapshot lost an event?)", i, got, wantPerListener)
+			}
+		}
+	})
+	t.Run("mutation during captured dispatch", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		paused := make(chan struct{})
+		resume := make(chan struct{})
+		var seen []int
+		var first, fifth Unsubscribe
+		first = s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			close(paused)
+			<-resume
+			seen = append(seen, 1)
+			first()
+			fifth = s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+				seen = append(seen, 5)
+			}, false)
+		}, false)
+		second := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 2)
+		}, false)
+		third := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 3)
+		}, false)
+
+		var wg sync.WaitGroup
+		wg.Go(func() { s.AddObject(newCM("captured", "ns")) })
+		<-paused
+		second()
+		second()
+		fourth := s.AddListener(EventObjectAdded, func(_ manifest.NamedResource, _ any) {
+			seen = append(seen, 4)
+		}, false)
+		close(resume)
+		wg.Wait()
+		assert.Diff(t, seen, []int{1, 2, 3})
+
+		seen = nil
+		s.AddObject(newCM("future", "ns"))
+		assert.Diff(t, seen, []int{3, 4, 5})
+		third()
+		fourth()
+		fifth()
+		seen = nil
+		s.AddObject(newCM("empty", "ns"))
+		assert.Equal(t, len(seen), 0)
+	})
 }
 
-// TestStore_SetConditionLocked_StableSliceLength asserts the in-place
-// rebuild contract for setConditionLocked: mutating the same condition
-// type N times leaves the conditions slice at length 1, not N. The
-// pre-fix implementation rebuilt the slice from scratch on every
-// transition (O(N) allocations across N transitions); the in-place
-// overwrite drops every allocation past the first.
-//
-// Counting GetConditions length is sufficient — the contract is "one
-// entry per unique Type, in-place updates do not grow the slice".
 func TestStore_SetConditionLocked_StableSliceLength(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := newCM("a", "ns").Named()
+	id := (&manifest.Kustomization{Name: "a", Namespace: "ns"}).Named()
 
 	for i := range 100 {
 		// Alternate status/message so every call is non-equal — the
@@ -640,102 +1147,156 @@ func TestStore_SetConditionLocked_StableSliceLength(t *testing.T) {
 		if i%2 == 0 {
 			status = StatusReady
 		}
-		s.UpdateStatus(id, status, fmt.Sprintf("iter-%d", i))
+		s.UpdateStatus(id, StatusInfo{Status: status, Reason: "", Message: fmt.Sprintf("iter-%d", i)})
 	}
 
-	assert.Equal(t, len(s.GetConditions(id)), 1) // in-place overwrite, no growth
+	var observation Observation
+	_, observation = s.Snapshot(id, true)
+	conds := observation.Conditions
+	assert.Equal(t, len(conds), 1)
 }
 
-// TestStore_SetConditionLocked_AppendsDistinctTypes pins the
-// fall-through-to-append path for new condition types: a Healthy
-// transition on top of an existing Ready must produce a 2-entry
-// slice, with both entries preserved across subsequent same-type
-// updates. The in-place mutation rule applies per-Type, not globally.
 func TestStore_SetConditionLocked_AppendsDistinctTypes(t *testing.T) {
+	t.Parallel()
 	s := New()
-	id := newCM("a", "ns").Named()
+	id := (&manifest.Kustomization{Name: "a", Namespace: "ns"}).Named()
 
-	s.UpdateStatus(id, StatusReady, "ok")
-	s.SetCondition(id, metav1.Condition{
+	s.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: "", Message: "ok"})
+	healthy := Condition{
 		Type:    ConditionHealthy,
 		Status:  metav1.ConditionTrue,
 		Reason:  "Healthy",
 		Message: "healthy",
-	})
+	}
+	s.SetCondition(id, healthy)
 
-	conds := s.GetConditions(id)
+	var before Observation
+	_, before = s.Snapshot(id, true)
+	conds := before.Conditions
 	if got := len(conds); got != 2 {
 		t.Fatalf("conditions length = %d, want 2 (Ready + Healthy)", got)
 	}
+	want := []Condition{
+		{Type: ConditionReady, Status: metav1.ConditionTrue, Reason: ReasonSucceeded, Message: "ok"},
+		healthy,
+	}
+	assert.Diff(t, conds, want)
 
-	// Mutating one in place must leave the other alone and keep length stable.
-	s.UpdateStatus(id, StatusFailed, "boom")
-	conds = s.GetConditions(id)
+	s.UpdateStatus(id, StatusInfo{Status: StatusFailed, Reason: "", Message: "boom"})
+	assert.Diff(t, conds, want)
+	conds[0].Message = "caller mutation"
+	var after Observation
+	_, after = s.Snapshot(id, true)
+	conds = after.Conditions
 	if got := len(conds); got != 2 {
 		t.Errorf("conditions length = %d after Ready transition, want 2", got)
 	}
-	var sawReady, sawHealthy bool
-	for _, c := range conds {
-		switch c.Type {
-		case ConditionReady:
-			sawReady = true
-		case ConditionHealthy:
-			sawHealthy = true
-		}
-	}
-	if !sawReady || !sawHealthy {
-		t.Errorf("expected both Ready and Healthy; sawReady=%v sawHealthy=%v", sawReady, sawHealthy)
-	}
+	want[0] = Condition{Type: ConditionReady, Status: metav1.ConditionFalse, Reason: ReasonFailed, Message: "boom"}
+	assert.Diff(t, conds, want)
 }
 
-// TestStore_ShardedConcurrentDifferentKinds hammers two distinct Kinds
-// (Kustomization, HelmRelease) from many goroutines concurrently and
-// asserts the operations complete cleanly under -race. The KS and HR
-// Kinds hash to different shards (verified manually: KS→14, HR→10), so
-// the workload exercises the cross-Kind parallelism that justifies the
-// shard refactor — under the old single-mutex design these goroutines
-// would all serialize on the single global lock. The bug bar here is correctness, not
-// timing: -race surfaces any shard-locking mistake (cross-shard
-// dangling reads, missed unlock paths, deadlocks) as a data race or
-// hang within the 30s test budget.
 func TestStore_ShardedConcurrentDifferentKinds(t *testing.T) {
-	s := New()
-	const N = 50
-	const workers = 8
-	var wg sync.WaitGroup
-
-	// 4 goroutines on Kustomizations, 4 on HelmReleases.
-	for w := range workers {
-		wg.Go(func() {
-			isKS := w%2 == 0
-			for i := range N {
-				if isKS {
-					ks := &manifest.Kustomization{Name: fmt.Sprintf("ks-%d-%d", w, i), Namespace: "ns"}
-					s.AddObject(ks)
-					s.UpdateStatus(ks.Named(), StatusReady, "ok")
-					_ = s.GetObject(ks.Named())
-				} else {
-					hr := &manifest.HelmRelease{Name: fmt.Sprintf("hr-%d-%d", w, i), Namespace: "ns"}
-					s.AddObject(hr)
-					s.UpdateStatus(hr.Named(), StatusReady, "ok")
-					_ = s.GetObject(hr.Named())
-				}
+	t.Parallel()
+	for _, workers := range []int{2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			t.Parallel()
+			s := New()
+			arrived, release := make(chan struct{}, workers), make(chan struct{})
+			var events [numEventKinds + 1]sync.Map
+			for kind := EventObjectAdded; int(kind) <= numEventKinds; kind++ {
+				s.AddListener(kind, func(id manifest.NamedResource, _ any) {
+					count, _ := events[kind].LoadOrStore(id, new(atomic.Int64))
+					count.(*atomic.Int64).Add(1)
+					if kind == EventObjectAdded && strings.HasSuffix(id.Name, "-0") && !strings.HasPrefix(id.Name, "parent-") && id.Group != "example.test" {
+						arrived <- struct{}{}
+						<-release
+					}
+				}, false)
 			}
+			var wg sync.WaitGroup
+			for w := range workers {
+				wg.Go(func() {
+					for i := range 20 {
+						name := fmt.Sprintf("%d-%d", w, i)
+						var typed manifest.BaseManifest = &manifest.Kustomization{Name: name, Namespace: "ns"}
+						if w%2 != 0 {
+							typed = &manifest.HelmRelease{Name: name, Namespace: "ns"}
+						}
+						foreign := &manifest.RawObject{APIVersion: "example.test/v1", Kind: typed.Named().Kind, Namespace: "ns", Name: name}
+						objects := [2]manifest.BaseManifest{typed, foreign}
+						if i%2 != 0 {
+							objects[0], objects[1] = objects[1], objects[0]
+						}
+						for _, obj := range objects {
+							id := obj.Named()
+							parent := id
+							parent.Name = "parent-" + id.Name
+							s.AddObject(&manifest.RawObject{APIVersion: parent.Group + "/v1", Kind: parent.Kind, Name: parent.Name, Namespace: parent.Namespace})
+							s.RecordEmitted(parent, &Emission{Children: []Child{{Obj: obj}}, Complete: true}, nil)
+							s.UpdateStatus(id, StatusInfo{Status: StatusReady, Reason: "", Message: id.Group})
+							s.SetArtifact(id, &SourceArtifact{URL: id.Group})
+						}
+						for _, obj := range objects {
+							id := obj.Named()
+							assert.Equal(t, s.GetObject(id), obj)
+							status, ok := s.GetStatus(id)
+							assert.Equal(t, ok, true)
+							assert.Equal(t, status.Status, StatusReady)
+							assert.Equal(t, status.Message, id.Group)
+							assert.Diff(t, s.GetArtifact(id), Artifact(&SourceArtifact{URL: id.Group}))
+							owners := testutil.Owners(s.Productions(id, nil))
+							assert.Equal(t, len(owners), 1)
+							assert.Equal(t, owners[0].Group, id.Group)
+							for kind := EventObjectAdded; int(kind) <= numEventKinds; kind++ {
+								count, ok := events[kind].Load(id)
+								if !ok || count.(*atomic.Int64).Load() != 1 {
+									t.Errorf("event %v for %v = %v", kind, id, count)
+								}
+							}
+						}
+						if i%4 >= 2 {
+							objects[0], objects[1] = objects[1], objects[0]
+						}
+						removed := objects[0].Named()
+						parent := removed
+						parent.Name = "parent-" + removed.Name
+						s.RecordEmitted(parent, &Emission{Complete: true}, nil)
+						s.DeleteObject(parent)
+						assert.Equal(t, s.GetObject(removed), nil)
+						var removedObservation Observation
+						_, removedObservation = s.Snapshot(removed, true)
+						conds := removedObservation.Conditions
+						assert.Equal(t, len(conds), 0)
+						assert.Equal(t, s.GetArtifact(removed), nil)
+						id := objects[1].Named()
+						assert.Equal(t, s.GetObject(id), objects[1])
+						status, ok := s.GetStatus(id)
+						assert.Equal(t, ok, true)
+						assert.Equal(t, status.Message, id.Group)
+						assert.Diff(t, s.GetArtifact(id), Artifact(&SourceArtifact{URL: id.Group}))
+						var observation Observation
+						_, observation = s.Snapshot(id, true)
+						conds = observation.Conditions
+						assert.Diff(t, conds, []Condition{readyCondition(StatusReady, "", id.Group)})
+						parent = id
+						parent.Name = "parent-" + id.Name
+						s.RecordEmitted(parent, &Emission{Complete: true}, nil)
+						s.DeleteObject(parent)
+					}
+				})
+			}
+			for range workers {
+				<-arrived
+			}
+			close(release)
+			wg.Wait()
+			assert.Equal(t, len(s.ListObjects("", "")), 0)
 		})
-	}
-	wg.Wait()
-
-	// Sanity: every object landed.
-	if got := len(s.ListObjects(manifest.KindKustomization)); got != N*(workers/2) {
-		t.Errorf("expected %d KSes, got %d", N*(workers/2), got)
-	}
-	if got := len(s.ListObjects(manifest.KindHelmRelease)); got != N*(workers/2) {
-		t.Errorf("expected %d HRs, got %d", N*(workers/2), got)
 	}
 }
 
 // TestStore_CrossKindOperationDoesntDeadlock pounds the cross-shard
-// paths (ListObjects(""), FailedResources, AddListener(replay=true))
+// paths (ListObjects("", ""), FailedResources, AddListener(replay=true))
 // from many goroutines while per-shard writers churn through different
 // Kinds. The canonical-order lockAll/rLockAll rule prevents two
 // cross-shard operations from deadlocking by taking shards in opposing
@@ -761,7 +1322,7 @@ func TestStore_CrossKindOperationDoesntDeadlock(t *testing.T) {
 			for i := range ops {
 				switch (w + i) % 5 {
 				case 0:
-					_ = s.ListObjects("")
+					_ = s.ListObjects("", "")
 				case 1:
 					_ = s.FailedResources()
 				case 2:
@@ -770,11 +1331,11 @@ func TestStore_CrossKindOperationDoesntDeadlock(t *testing.T) {
 				case 3:
 					ks := &manifest.Kustomization{Name: fmt.Sprintf("ks-w%d-i%d", w, i), Namespace: "ns"}
 					s.AddObject(ks)
-					s.UpdateStatus(ks.Named(), StatusFailed, "boom")
+					s.UpdateStatus(ks.Named(), StatusInfo{Status: StatusFailed, Reason: "", Message: "boom"})
 				case 4:
 					hr := &manifest.HelmRelease{Name: fmt.Sprintf("hr-w%d-i%d", w, i), Namespace: "ns"}
 					s.AddObject(hr)
-					s.SetArtifact(hr.Named(), &HelmReleaseArtifact{Manifests: nil, Fingerprint: "x"})
+					s.SetArtifact(hr.Named(), &Emission{Manifests: nil, Fingerprint: "x"})
 				}
 			}
 		})
@@ -785,5 +1346,46 @@ func TestStore_CrossKindOperationDoesntDeadlock(t *testing.T) {
 		// Success — no deadlock.
 	case <-time.After(30 * time.Second):
 		t.Fatal("cross-shard ops deadlocked (lockAll canonical-order regression?)")
+	}
+}
+
+func TestStore_AddObject_TypedDocumentFreeAllocations(t *testing.T) {
+	s := New()
+	versions := [2]*manifest.ResourceSetInputProvider{
+		{Name: "provider", Namespace: "ns", Labels: map[string]string{"revision": "a"}},
+		{Name: "provider", Namespace: "ns", Labels: map[string]string{"revision": "b"}},
+	}
+	s.AddObject(versions[0])
+	i := 0
+	got := testing.AllocsPerRun(100, func() {
+		i++
+		s.AddObject(versions[i%2])
+	})
+	if got > 6 {
+		t.Fatalf("changed typed object allocations=%v, want at most 6", got)
+	}
+	if s.GetObject(versions[0].Named()) != versions[i%2] {
+		t.Fatal("changed typed object was not admitted")
+	}
+}
+
+func TestRecordEmitted_ReplacementAllocations(t *testing.T) {
+	s := New()
+	owner := &manifest.Kustomization{Name: "owner", Namespace: "ns"}
+	s.AddObject(owner)
+	versions := [2]Emission{{Complete: true}, {Complete: true}}
+	for version := range versions {
+		for i := range 100 {
+			versions[version].Children = append(versions[version].Children, Child{Obj: &manifest.RawObject{Kind: "Deployment", APIVersion: "apps/v1", Name: fmt.Sprintf("app-%d-%d", version, i), Namespace: "ns"}})
+		}
+	}
+	s.RecordEmitted(owner.Named(), &versions[0], nil)
+	round := 0
+	got := testing.AllocsPerRun(20, func() {
+		round++
+		s.RecordEmitted(owner.Named(), &versions[round%2], nil)
+	})
+	if got > 60 {
+		t.Fatalf("100-output replacement allocations=%v, want at most 60", got)
 	}
 }

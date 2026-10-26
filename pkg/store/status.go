@@ -1,64 +1,13 @@
 package store
 
 import (
+	"errors"
 	"slices"
-	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
-
-// Canonical StatusReady message vocabulary. flate overloads
-// StatusReady with several "ready but…" sub-states encoded in the
-// message text — depwait treats them uniformly as ready (so deps
-// unblock), while consumers branch on the message to decide UI /
-// propagation.
-//
-// Three sub-states exist today:
-//
-//   - SkippedPrefix — a resource soft-skipped by --allow-missing-
-//     secrets (or by a consumer propagating a source-skip). Detect
-//     via IsSkipped. Message format: "skipped: <reason>".
-//   - MsgUnchanged — the change-filter excluded this resource
-//     because its sources weren't in the diff. Detect via
-//     IsUnchanged. Used by `flate test` for SKIPPED outcomes.
-//   - MsgSuspended — spec.suspend was honored. Detect via
-//     IsSuspended.
-//
-// All three are kept in one place so the literal-vs-helper drift
-// (testrunner's `info.Message == "unchanged"` direct compare, etc.)
-// has exactly one source of truth and a future rephrasing in
-// controllers/base only requires updating the constant here.
-const (
-	SkippedPrefix = "skipped:"
-	MsgUnchanged  = "unchanged"
-	MsgSuspended  = "suspended"
-	// MsgRefetching is the Pending-message Refire writes before
-	// re-dispatching EventObjectAdded. Surfaced as a distinct sentinel
-	// (vs. the source controller's own "fetching" mid-reconcile) so log
-	// scraping can distinguish a Refire-triggered re-pull from a
-	// first-time fetch.
-	MsgRefetching = "re-fetching"
-)
-
-// IsSkipped reports whether info represents a soft-skip — i.e. a
-// StatusReady whose message starts with SkippedPrefix.
-func IsSkipped(info StatusInfo) bool {
-	return info.Status == StatusReady && strings.HasPrefix(info.Message, SkippedPrefix)
-}
-
-// IsUnchanged reports whether info represents a change-filter
-// exclusion (StatusReady + MsgUnchanged).
-func IsUnchanged(info StatusInfo) bool {
-	return info.Status == StatusReady && info.Message == MsgUnchanged
-}
-
-// IsSuspended reports whether info represents a spec.suspend honor
-// (StatusReady + MsgSuspended).
-func IsSuspended(info StatusInfo) bool {
-	return info.Status == StatusReady && info.Message == MsgSuspended
-}
 
 // Status is the processing state of a resource as projected from its
 // Ready condition. Kept as a high-level rollup for callers (depwait,
@@ -72,11 +21,131 @@ const (
 	StatusFailed  Status = "Failed"
 )
 
-// StatusInfo bundles a status with an optional descriptive message.
-// Derived from the Ready condition; see Store.GetStatus.
+// StatusInfo projects readiness, reason, message and failure provenance from a Ready condition.
 type StatusInfo struct {
-	Status  Status
-	Message string
+	Status          Status
+	Reason          StatusReason
+	Message         string
+	failure         *dependencyFailure
+	applyingObjects int
+}
+
+// StatusReason identifies a Ready condition's machine-readable reason.
+type StatusReason string
+
+// Special Ready condition reasons.
+const (
+	ReasonSkipped   StatusReason = "Skipped"
+	ReasonUnchanged StatusReason = "Unchanged"
+	ReasonSuspended StatusReason = "Suspended"
+)
+
+// Outcome classifies a resource's readiness and failure provenance.
+type Outcome string
+
+// Resource outcomes.
+const (
+	OutcomePending   Outcome = "Pending"
+	OutcomePassed    Outcome = "Passed"
+	OutcomeFailed    Outcome = "Failed"
+	OutcomeBlocked   Outcome = "Blocked"
+	OutcomeSkipped   Outcome = "Skipped"
+	OutcomeUnchanged Outcome = "Unchanged"
+	OutcomeSuspended Outcome = "Suspended"
+)
+
+// Outcome returns the semantic outcome independently of diagnostic text.
+func (i StatusInfo) Outcome() Outcome {
+	switch i.Status {
+	case StatusFailed:
+		if i.IsDependencyFailure() {
+			return OutcomeBlocked
+		}
+		return OutcomeFailed
+	case StatusReady:
+		switch i.Reason {
+		case ReasonSkipped:
+			return OutcomeSkipped
+		case ReasonUnchanged:
+			return OutcomeUnchanged
+		case ReasonSuspended:
+			return OutcomeSuspended
+		default:
+			return OutcomePassed
+		}
+	default:
+		return OutcomePending
+	}
+}
+
+// IsUnavailable reports whether a producer's output cannot be compared.
+func (i StatusInfo) IsUnavailable() bool {
+	switch i.Outcome() {
+	case OutcomeFailed, OutcomeBlocked, OutcomeSkipped, OutcomeSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsDependencyFailure reports whether the Failed status came from failed dependencies.
+func (i StatusInfo) IsDependencyFailure() bool {
+	return i.failure != nil
+}
+
+// BlockedBy returns a copy of the immediate failed dependencies in this snapshot.
+func (i StatusInfo) BlockedBy() []manifest.NamedResource {
+	if i.failure == nil {
+		return nil
+	}
+	return slices.Clone(i.failure.ids)
+}
+
+// Failure IDs are immutable so StatusInfo can retain them after the shard unlocks.
+type conditionRecord struct {
+	state           *conditionState
+	applyingObjects int
+	conditions      []Condition
+	failure         *dependencyFailure
+}
+
+type conditionState struct {
+	authority
+	first [1]Condition
+}
+
+func (r conditionRecord) stamp() authority {
+	if r.state == nil {
+		return authority{}
+	}
+	return r.state.authority
+}
+
+func (r conditionRecord) advanceLocked(sh *shard) {
+	if r.state.generation == ^uint64(0) {
+		sh.mu.Unlock()
+		panic("store: authority generation exhausted")
+	}
+	r.state.authority = sh.advanceLocked(r.state.authority)
+}
+
+type dependencyFailure struct {
+	ids []manifest.NamedResource
+}
+
+func newDependencyFailure(err error) *dependencyFailure {
+	dep, ok := errors.AsType[*manifest.DependencyFailedError](err)
+	if !ok || len(dep.Failed) == 0 {
+		return nil
+	}
+	ids := slices.Clone(dep.Failed)
+	slices.SortFunc(ids, manifest.NamedResource.Compare)
+	return &dependencyFailure{ids: ids}
+}
+
+// same reports whether f and o record the same failed dependencies; nil means none.
+func (f *dependencyFailure) same(o *dependencyFailure) bool {
+	return f == o || f != nil && o != nil && slices.Equal(f.ids, o.ids)
 }
 
 // Condition is an alias for k8s metav1.Condition. flate stores
@@ -100,28 +169,7 @@ const (
 	ReasonReconciling = "Reconciling"
 )
 
-// SupportsStatus reports whether the given kind participates in the
-// status pipeline. Kinds outside this set (ConfigMap, Secret, ...) are
-// considered "ready" simply by existing.
-func SupportsStatus(kind string) bool {
-	switch kind {
-	case manifest.KindKustomization,
-		manifest.KindGitRepository,
-		manifest.KindHelmRelease,
-		manifest.KindHelmRepository,
-		manifest.KindOCIRepository,
-		manifest.KindHelmChart,
-		manifest.KindExternalArtifact,
-		manifest.KindBucket:
-		return true
-	}
-	return false
-}
-
-// readyCondition builds the Ready condition that corresponds to the
-// (status, message) pair UpdateStatus accepts. Reason is derived from
-// Status; Message is passed through verbatim.
-func readyCondition(status Status, message string) Condition {
+func readyCondition(status Status, reason StatusReason, message string) Condition {
 	c := Condition{
 		Type:    ConditionReady,
 		Message: message,
@@ -137,38 +185,52 @@ func readyCondition(status Status, message string) Condition {
 		c.Status = metav1.ConditionUnknown
 		c.Reason = ReasonReconciling
 	}
+	if reason != "" {
+		c.Reason = string(reason)
+	}
 	return c
 }
 
-// statusInfoFromConditions projects the rollup StatusInfo from the
+// statusInfo projects the rollup StatusInfo from the
 // Ready condition. Returns (zero, false) when no Ready condition is
 // present.
-func statusInfoFromConditions(conds []Condition) (StatusInfo, bool) {
-	for _, c := range conds {
+func (r conditionRecord) statusInfo() (StatusInfo, bool) {
+	for i := range r.conditions {
+		c := &r.conditions[i]
 		if c.Type != ConditionReady {
 			continue
 		}
-		info := StatusInfo{Message: c.Message}
 		switch c.Status {
 		case metav1.ConditionTrue:
-			info.Status = StatusReady
+			return StatusInfo{Status: StatusReady, Reason: StatusReason(c.Reason), Message: c.Message, applyingObjects: r.applyingObjects}, true
 		case metav1.ConditionFalse:
-			info.Status = StatusFailed
+			return StatusInfo{Status: StatusFailed, Reason: StatusReason(c.Reason), Message: c.Message, applyingObjects: r.applyingObjects, failure: r.failure}, true
 		default:
-			info.Status = StatusPending
+			return StatusInfo{Status: StatusPending, Reason: StatusReason(c.Reason), Message: c.Message, applyingObjects: r.applyingObjects}, true
 		}
-		return info, true
 	}
 	return StatusInfo{}, false
 }
 
 // UpdateStatus records a Ready-condition transition and dispatches a
-// StatusUpdated event when the StatusInfo rollup changes. Internally
-// the (status, message) pair is stored as a metav1.Condition so future
-// callers (ReadyExpr CEL, SOPS detection, healthChecks) can see the
-// rich state via GetConditions.
-func (s *Store) UpdateStatus(id manifest.NamedResource, status Status, message string) {
-	s.SetCondition(id, readyCondition(status, message))
+// StatusUpdated event when the StatusInfo rollup changes. Snapshot
+// exposes the full condition state. An empty reason derives the normal reason from status.
+func (s *Store) UpdateStatus(id manifest.NamedResource, info StatusInfo) {
+	s.setCondition(id, readyCondition(info.Status, info.Reason, info.Message), info.applyingObjects, nil)
+}
+
+// ReportProgress dispatches transient phase text without changing Ready conditions.
+func (s *Store) ReportProgress(id manifest.NamedResource, message string) {
+	dispatch := fireUnderLock(s, EventStatusUpdated, id)
+	if dispatch.listeners != nil {
+		dispatch.payload = StatusInfo{Status: StatusPending, Reason: ReasonReconciling, Message: message}
+	}
+	dispatch.run()
+}
+
+// UpdateFailure atomically records a terminal error and its immediate failed dependencies.
+func (s *Store) UpdateFailure(id manifest.NamedResource, err error) {
+	s.setCondition(id, readyCondition(StatusFailed, "", err.Error()), 0, newDependencyFailure(err))
 }
 
 // SetCondition upserts cond into the resource's condition list keyed
@@ -186,68 +248,91 @@ func (s *Store) UpdateStatus(id manifest.NamedResource, status Status, message s
 // lands (e.g. tests). The FailedResources rollup filters phantoms
 // by intersecting against the object map at read time.
 func (s *Store) SetCondition(id manifest.NamedResource, cond Condition) {
+	s.setCondition(id, cond, 0, nil)
+}
+
+func (s *Store) setCondition(id manifest.NamedResource, cond Condition, applyingObjects int, failure *dependencyFailure) {
 	sh := s.shardFor(id)
 	sh.mu.Lock()
-	updated, changed := sh.setConditionLocked(id, cond)
+	updated, changed := sh.setConditionLocked(id, cond, applyingObjects, failure)
 	if !changed {
 		sh.mu.Unlock()
 		return
 	}
-	newInfo, _ := statusInfoFromConditions(updated)
-	dispatch := s.fireUnderLock(EventStatusUpdated, id, newInfo)
+	if sh.derived && sh.cells[id].hidden {
+		sh.mu.Unlock()
+		return
+	}
+	dispatch := fireUnderLock(s, EventStatusUpdated, id)
+	if dispatch.listeners != nil {
+		newInfo, _ := updated.statusInfo()
+		dispatch.payload = newInfo
+	}
 	sh.mu.Unlock()
-	dispatch()
+	dispatch.run()
 }
 
-// setConditionLocked upserts cond into id's condition list and
-// returns the updated list plus whether it actually changed (an
-// identical re-write is a no-op). Caller MUST hold sh.mu — used both
-// by SetCondition (which takes the lock itself) and by Refire (which
-// already holds the lock for an atomic check-and-act).
-//
-// Mutates the existing slice in place when cond.Type already exists.
-// The hot path is "same condition type, new status/message" (every
-// reconcile transition flips the Ready condition); the prior
-// implementation rebuilt the full slice on each hit, allocating an
-// O(len(prev)) backing array per update. In-place overwrite drops
-// that allocation entirely while preserving the no-op fast path
-// (identical re-write returns the original slice with changed=false).
-//
-// Appending a never-seen type still allocates — that's the normal
-// slice-growth path and unavoidable. The Conditions slice is short
-// (Ready + occasional Healthy) so the steady state hits the
-// overwrite branch on every reconcile.
-//
-// The returned slice ALIASES sh.conditions[id] when an existing entry
-// is overwritten (it IS the live backing array). Listeners that read
-// the slice MUST do so before the next write under sh.mu — current
-// callers project a StatusInfo immediately under the same lock, so
-// no aliasing hazard exists today. A future caller that holds onto
-// the returned slice past sh.mu's release would observe further
-// mutations and MUST copy first; statusInfoFromConditions matches
-// this contract by reading values out of the slice in-place.
-func (sh *shard) setConditionLocked(id manifest.NamedResource, cond Condition) (updated []Condition, changed bool) {
-	prev := sh.conditions[id]
-	for i := range prev {
-		if prev[i].Type != cond.Type {
+// Caller MUST hold sh.mu and project conditions before unlocking: the returned
+// record aliases the live condition slice. Failure IDs remain immutable.
+// Existing conditions with unchanged provenance MUST be overwritten in place
+// without reassigning the map entry, preserving the allocation-free hot path.
+func (sh *shard) setConditionLocked(id manifest.NamedResource, cond Condition, applyingObjects int, failure *dependencyFailure) (conditionRecord, bool) {
+	record := sh.conditions[id]
+	ready := cond.Type == ConditionReady
+	objects := record.applyingObjects
+	objectsChanged := ready && objects != applyingObjects
+	if ready && applyingObjects != 0 {
+		cond.Message = ""
+	}
+	failureChanged := ready && !record.failure.same(failure)
+	for i := range record.conditions {
+		previous := &record.conditions[i]
+		if previous.Type != cond.Type {
 			continue
 		}
-		if conditionEqual(prev[i], cond) {
-			return prev, false
+		messageChanged := previous.Message != cond.Message
+		if ready {
+			messageChanged = !sameMessage(previous.Message, objects, cond.Message, applyingObjects)
 		}
-		prev[i] = cond
-		// sh.conditions[id] already references this backing array —
-		// no reassignment needed. Returning prev (now mutated) keeps
-		// the original allocation alive instead of replacing it.
-		return prev, true
+		changed := messageChanged || previous.Status != cond.Status || previous.Reason != cond.Reason || previous.ObservedGeneration != cond.ObservedGeneration
+		// An unchanged blocker set MUST retain its first diagnostic to bound cyclic propagation.
+		if failure != nil && !failureChanged && record.conditions[i].Status == cond.Status && record.conditions[i].Reason == cond.Reason {
+			return record, false
+		}
+		if changed || failureChanged {
+			record.advanceLocked(sh)
+		}
+		if changed || objectsChanged {
+			*previous = cond
+		}
+		if failureChanged || objectsChanged {
+			record.failure = failure
+			if ready {
+				record.applyingObjects = applyingObjects
+			}
+			sh.conditions[id] = record
+		}
+		return record, changed || failureChanged
 	}
-	// New condition type: extend the slice. This branch is rare
-	// (Ready + Healthy is the only multi-type combination flate
-	// emits today) so the per-call allocation cost is amortized
-	// across the lifetime of the resource.
-	updated = append(prev, cond)
-	sh.conditions[id] = updated
-	return updated, true
+	if record.state == nil {
+		if !sh.canAdmit(1) {
+			sh.mu.Unlock()
+			panic("store: authority generation exhausted")
+		}
+		sh.admitAbsenceLocked(id, conditionFacet)
+		record.state = &conditionState{}
+		record.conditions = record.state.first[:0]
+	}
+	record.advanceLocked(sh)
+	if failureChanged {
+		record.failure = failure
+	}
+	if ready {
+		record.applyingObjects = applyingObjects
+	}
+	record.conditions = append(record.conditions, cond)
+	sh.conditions[id] = record
+	return record, true
 }
 
 // GetStatus returns the Ready-derived StatusInfo for id and whether
@@ -256,20 +341,10 @@ func (s *Store) GetStatus(id manifest.NamedResource) (StatusInfo, bool) {
 	sh := s.shardFor(id)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	return statusInfoFromConditions(sh.conditions[id])
-}
-
-// GetConditions returns a copy of id's condition list. Empty for
-// unknown ids.
-func (s *Store) GetConditions(id manifest.NamedResource) []Condition {
-	sh := s.shardFor(id)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	conds := sh.conditions[id]
-	if len(conds) == 0 {
-		return nil
+	if sh.derived && sh.cells[id].hidden {
+		return StatusInfo{}, false
 	}
-	return slices.Clone(conds)
+	return sh.conditions[id].statusInfo()
 }
 
 // conditionEqual reports whether two conditions carry the same
@@ -308,11 +383,11 @@ func (s *Store) FailedResources() map[manifest.NamedResource]StatusInfo {
 	defer s.rUnlockAll()
 	out := make(map[manifest.NamedResource]StatusInfo)
 	for _, sh := range s.shards {
-		for id, conds := range sh.conditions {
-			if _, inStore := sh.objects[id]; !inStore {
+		for id, record := range sh.conditions {
+			if sh.objectLocked(id) == nil {
 				continue
 			}
-			if info, ok := statusInfoFromConditions(conds); ok && info.Status == StatusFailed {
+			if info, ok := record.statusInfo(); ok && info.Status == StatusFailed {
 				out[id] = info
 			}
 		}
@@ -320,23 +395,12 @@ func (s *Store) FailedResources() map[manifest.NamedResource]StatusInfo {
 	return out
 }
 
-// SetBlocked records that id failed only because the given dependencies failed
-// or were missing — the structured form of a DependencyFailedError, captured at
-// the failure sink. The failure report uses it to group derived failures under
-// their root cause instead of reprinting nested "dependencies failed: …" chains.
-// A defensive copy is stored so the caller's slice can't mutate store state.
-func (s *Store) SetBlocked(id manifest.NamedResource, deps []manifest.NamedResource) {
-	sh := s.shardFor(id)
-	sh.mu.Lock()
-	sh.blocked[id] = slices.Clone(deps)
-	sh.mu.Unlock()
-}
-
-// BlockedBy returns the immediate dependencies that blocked id (set via
-// SetBlocked), or nil when id failed on its own — i.e. a primary failure.
-func (s *Store) BlockedBy(id manifest.NamedResource) []manifest.NamedResource {
-	sh := s.shardFor(id)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	return slices.Clone(sh.blocked[id])
+func (r conditionRecord) project(conditions []Condition) {
+	if r.applyingObjects != 0 {
+		for i := range conditions {
+			if conditions[i].Type == ConditionReady {
+				conditions[i].Message = StatusInfo{applyingObjects: r.applyingObjects}.String()
+			}
+		}
+	}
 }

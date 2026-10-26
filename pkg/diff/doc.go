@@ -1,16 +1,13 @@
 // Package diff compares two sets of rendered Kubernetes manifests and
 // reports the resources whose rendered form differs.
 //
-// [RenderDocs] is the entry point, and it takes one of two paths by
-// [Format]. The dyff text styles (human default, github, brief, gitlab,
-// gitea) render the whole set through dyff at once: dyff pairs documents
-// by their Kubernetes identity and labels each diff natively with
-// apiVersion/kind/namespace/name. The plain unified diff takes a
-// per-resource path — each resource is paired against its counterpart,
-// keyed by parent KS/HR and resource identity (not just name, so a
-// Deployment from HelmRelease A never diffs against the same-named
-// Deployment from HelmRelease B), and the per-resource bodies are
-// concatenated.
+// [RenderDocs] matches normalized resources by canonical parent and resource
+// identity in every [Format]. Parent group, kind, namespace and name distinguish
+// producers; [Parent.Path] is display metadata. A resource moved between parents
+// is a removal and an addition, even when its contents are identical.
+// Native styles retain Kubernetes apiVersion/kind/namespace/name labels and use
+// dyff to compare each pair's contents. Unified, HTML and JSON formats present
+// the same pairs with their producing parents.
 //
 // Most styles delegate to [dyff], whose K8s-aware comparison pairs named
 // list entries (containers, env vars) by their identifier, so reordering
@@ -34,34 +31,40 @@
 //
 // # SDK usage
 //
-// [RenderDocs] returns formatted bytes. A consumer that needs the diff as
-// *data* — to build its own API payload, web UI, or image report —
-// instead calls [Changes], which returns the same paired, normalized,
-// noise-filtered set as a [][Change] (added / changed / removed, with the
-// per-side manifests and the captured helm.sh/chart label). Render two
-// cluster directories with [orchestrator.RenderTrees] (it owns the
-// two-orchestrator, shared-cache, changed-only dance), then feed the
-// Results to [Changes]:
+// [Compare] consumes two [Snapshot] values from completed runs selected by
+// orchestrator.Select, withholds unavailable producer batches, and returns
+// formatted bytes, duplicate warnings and structured suppressions without discarding
+// selected render errors. The comparison requires cfg.HeadOnly to be false so
+// both runs are completed. Render two trees, select the requested producer kinds,
+// then compare them:
 //
-//	base, head, _ := orchestrator.RenderTrees(ctx,
+//	base, head, runErr := orchestrator.RenderTrees(ctx,
 //		orchestrator.Tree{RepoRoot: baseDir}, orchestrator.Tree{RepoRoot: headDir}, cfg)
-//	changes := diff.Changes(
-//		diff.DocsFromManifests(base.Result.Manifests, nil),
-//		diff.DocsFromManifests(head.Result.Manifests, nil),
+//	selected, selectedErr, _ := orchestrator.Select(
+//		[]orchestrator.Rendered{base, head}, runErr,
+//		[]manifest.NamedResource{{Group: manifest.FluxKustomizeDomain, Kind: manifest.KindKustomization}, {Group: manifest.HelmReleaseDomain, Kind: manifest.KindHelmRelease}}, nil)
+//	if len(selected) == 0 {
+//		return selectedErr
+//	}
+//	out, warnings, suppressed, err := diff.Compare(
+//		diff.Snapshot{Manifests: selected[0].Manifests, Unavailable: selected[0].Unavailable},
+//		diff.Snapshot{Manifests: selected[1].Manifests, Unavailable: selected[1].Unavailable},
+//		selectedErr,
 //		diff.Options{
-//			StripAttrs:  diff.DefaultStripAttrs,
-//			StripFields: diff.DefaultStripFields,
-//			Normalize:   redact, // optional extra per-manifest scrub
+//			StripAttrs: diff.DefaultStripAttrs, StripFields: diff.DefaultStripFields,
+//			Normalize: redact, // optional extra per-manifest scrub
 //		},
 //	)
+//	// Deliver out to the product writer; present warnings and suppressed through
+//	// the diagnostic writer, including when err is non-nil.
 //
-// [DocsFromManifests] is the store-free adapter from a render Result's
-// per-parent manifests to the flat []Doc both [Changes] and [RenderDocs]
-// take. [Options].Normalize is an optional per-manifest hook (applied
-// after the built-in strips) for noise the defaults don't cover — e.g.
-// redacting Secret values or chart-minted TLS certs. See the package
-// Example.
+// [CompareImages] uses the same selected producer availability and returns a
+// sorted image list plus structured suppressions. [Changes] and [RenderDocs] retain
+// their low-level document APIs for callers that already have attributed
+// [Doc] values. [Options].Normalize runs after the built-in strips on copied
+// manifests. See the package Example for structured changes with chart metadata.
 //
 // [dyff]: https://github.com/homeport/dyff
+//
 // [orchestrator.RenderTrees]: https://pkg.go.dev/github.com/home-operations/flate/pkg/orchestrator#RenderTrees
 package diff

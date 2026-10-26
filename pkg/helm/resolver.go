@@ -5,63 +5,36 @@ import (
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// SourceResolver is the lookup surface helm.Client needs to resolve a
-// HelmRelease's sourceRef against the canonical object store.
-//
-// The interface exists so helm.Client reads source CRs from the
-// canonical store on every lookup rather than maintaining a parallel
-// registry — see NewStoreSourceResolver for the production-side
-// adapter. Embedders rendering a single HelmRelease without an
-// Orchestrator can implement this directly.
-//
-// A nil return from any method means "not found" — callers translate
-// that into a typed manifest.ErrObjectNotFound error.
-type SourceResolver interface {
-	// HelmRepository returns the HelmRepository at the given (ns, name)
-	// or nil. Used for index.yaml fetch + SecretRef/CertSecretRef.
-	HelmRepository(namespace, name string) *manifest.HelmRepository
-	// OCIRepository returns the OCIRepository at the given (ns, name)
-	// or nil. The .url field is the chart-artifact root.
-	OCIRepository(namespace, name string) *manifest.OCIRepository
-	// LocalSourceArtifact returns the fetched on-disk artifact for a
-	// GitRepository / Bucket / ExternalArtifact source, or nil. Charts
-	// live at <artifact.LocalPath>/<hr.Chart.Name> for any of those
-	// three sourceRef.kind values.
-	LocalSourceArtifact(kind, namespace, name string) *store.SourceArtifact
-	// HelmChart returns the HelmChartSource at the given (ns, name) or
-	// nil. Used by HelmRelease.ResolveChartRef to materialize a
-	// spec.chartRef into a concrete chart reference.
-	HelmChart(namespace, name string) *manifest.HelmChartSource
+type sourceReader interface {
+	GetDeclaration(manifest.NamedResource) manifest.BaseManifest
+	GetArtifact(manifest.NamedResource) store.Artifact
 }
 
-// NewStoreSourceResolver returns a SourceResolver backed by the
-// canonical object store. The orchestrator wires this into helm.Client
-// so chart-source lookups read straight from the Store.
-func NewStoreSourceResolver(s *store.Store) SourceResolver {
-	return &storeResolver{store: s}
+// Sources resolves chart declarations and content from one operation's inputs.
+type Sources struct {
+	reader sourceReader
 }
 
-type storeResolver struct {
-	store *store.Store
-}
+// NewSources binds chart resolution to the supplied captured or completed inputs.
+func NewSources(reader sourceReader) Sources { return Sources{reader: reader} }
 
-func (r *storeResolver) HelmRepository(namespace, name string) *manifest.HelmRepository {
-	obj, _ := r.store.GetByName[*manifest.HelmRepository](manifest.KindHelmRepository, namespace, name)
+// HelmRepository returns the selected repository declaration.
+func (s Sources) HelmRepository(namespace, name string) *manifest.HelmRepository {
+	obj, _ := s.reader.GetDeclaration(manifest.NamedResource{Group: manifest.SourceDomain, Kind: manifest.KindHelmRepository, Namespace: namespace, Name: name}).(*manifest.HelmRepository)
 	return obj
 }
 
-func (r *storeResolver) OCIRepository(namespace, name string) *manifest.OCIRepository {
-	obj, _ := r.store.GetByName[*manifest.OCIRepository](manifest.KindOCIRepository, namespace, name)
-	return obj
-}
-
-func (r *storeResolver) LocalSourceArtifact(kind, namespace, name string) *store.SourceArtifact {
-	id := manifest.NamedResource{Kind: kind, Namespace: namespace, Name: name}
-	art, _ := r.store.GetArtifact(id).(*store.SourceArtifact)
+// LocalSourceArtifact returns the selected source content.
+func (s Sources) LocalSourceArtifact(id manifest.NamedResource) *store.SourceArtifact {
+	if s.reader == nil {
+		return nil
+	}
+	art, _ := s.reader.GetArtifact(id).(*store.SourceArtifact)
 	return art
 }
 
-func (r *storeResolver) HelmChart(namespace, name string) *manifest.HelmChartSource {
-	obj, _ := r.store.GetByName[*manifest.HelmChartSource](manifest.KindHelmChart, namespace, name)
+// HelmChart returns the selected chart declaration.
+func (s Sources) HelmChart(id manifest.NamedResource) *manifest.HelmChartSource {
+	obj, _ := s.reader.GetDeclaration(id).(*manifest.HelmChartSource)
 	return obj
 }

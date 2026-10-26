@@ -5,7 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/store"
 )
 
 // bigPlatformValuesYAML builds a large nested values document resembling a
@@ -44,7 +47,7 @@ func BenchmarkExpandValueReferences_SharedLargeCM(b *testing.B) {
 	}
 	provider := &SliceProvider{ConfigMaps: []*manifest.ConfigMap{cm}}
 	ref := manifest.ValuesReference{Kind: "ConfigMap", Name: "platform-values"}
-	cache := NewCache() // shared across all HRs, as in production (one per helm.Client)
+	cache := &Cache{} // shared across all HRs, as in production (one per helm.Client)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -54,7 +57,7 @@ func BenchmarkExpandValueReferences_SharedLargeCM(b *testing.B) {
 			ValuesFrom: []manifest.ValuesReference{ref},
 			Values:     map[string]any{"replicaCount": 2},
 		}
-		if err := ExpandValueReferences(hr, provider, cache); err != nil {
+		if _, err := ExpandValueReferences(hr, provider, cache); err != nil {
 			b.Fatalf("ExpandValueReferences: %v", err)
 		}
 	}
@@ -62,7 +65,7 @@ func BenchmarkExpandValueReferences_SharedLargeCM(b *testing.B) {
 
 // BenchmarkExpandValueReferences_ManyFromRefs measures ExpandValueReferences
 // against an HR with 10 valuesFrom ConfigMap refs — each carrying a
-// multi-key YAML document — backed by a SliceProvider. The DeepMerge
+// multi-key YAML document — backed by a SliceProvider. The merge
 // chain dominates here; the lookupValueRef path runs once per ref.
 func BenchmarkExpandValueReferences_ManyFromRefs(b *testing.B) {
 	const n = 10
@@ -87,10 +90,10 @@ counts:
 	}
 	provider := &SliceProvider{ConfigMaps: cms}
 	// Shared Cache across iterations: same valuesFrom refs hit the
-	// FNV-keyed memo and skip yaml.Unmarshal — matches the production
+	// content-keyed memo and skip yaml.Unmarshal — matches the production
 	// pattern where M HRs sharing a platform-wide values CM parse
 	// exactly once.
-	cache := NewCache()
+	cache := &Cache{}
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -102,9 +105,31 @@ counts:
 			ValuesFrom: refs,
 			Values:     map[string]any{"image": map[string]any{"repository": "nginx"}},
 		}
-		if err := ExpandValueReferences(hr, provider, cache); err != nil {
+		if _, err := ExpandValueReferences(hr, provider, cache); err != nil {
 			b.Fatalf("ExpandValueReferences: %v", err)
 		}
+	}
+}
+
+func BenchmarkExpandValueReferences_TargetPaths(b *testing.B) {
+	for _, count := range []int{1, 5} {
+		b.Run(fmt.Sprintf("targets=%d", count), func(b *testing.B) {
+			cm := &manifest.ConfigMap{Name: "platform", Namespace: "default", Data: map[string]any{"values.yaml": bigPlatformValuesYAML()}}
+			inject := &manifest.ConfigMap{Name: "inject", Namespace: "default", Data: map[string]any{"value": "replacement"}}
+			provider := &SliceProvider{ConfigMaps: []*manifest.ConfigMap{cm, inject}}
+			refs := []manifest.ValuesReference{{Kind: "ConfigMap", Name: cm.Name}}
+			for i := range count {
+				refs = append(refs, manifest.ValuesReference{Kind: "ConfigMap", Name: inject.Name, ValuesKey: "value", TargetPath: fmt.Sprintf("app%d.image.tag", i)})
+			}
+			cache := &Cache{}
+			b.ReportAllocs()
+			for b.Loop() {
+				hr := &manifest.HelmRelease{Name: "app", Namespace: "default", ValuesFrom: refs}
+				if _, err := ExpandValueReferences(hr, provider, cache); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -126,7 +151,7 @@ func BenchmarkExpandValueReferences_ManyKeyCM(b *testing.B) {
 	cm := &manifest.ConfigMap{Name: "shared", Namespace: "default", Data: data}
 	provider := &SliceProvider{ConfigMaps: []*manifest.ConfigMap{cm}}
 	ref := manifest.ValuesReference{Kind: "ConfigMap", Name: "shared", ValuesKey: "values.yaml"}
-	cache := NewCache()
+	cache := &Cache{}
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -135,7 +160,7 @@ func BenchmarkExpandValueReferences_ManyKeyCM(b *testing.B) {
 			Name: "app", Namespace: "default",
 			ValuesFrom: []manifest.ValuesReference{ref},
 		}
-		if err := ExpandValueReferences(hr, provider, cache); err != nil {
+		if _, err := ExpandValueReferences(hr, provider, cache); err != nil {
 			b.Fatalf("ExpandValueReferences: %v", err)
 		}
 	}
@@ -164,40 +189,77 @@ func BenchmarkExpandPostBuildSubstituteReference_SharedCM(b *testing.B) {
 	for b.Loop() {
 		// Fresh KS per iteration mirrors a distinct KS reconcile sharing
 		// the same substituteFrom CM.
+		postBuild := kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: "ConfigMap", Name: "cluster-settings"}}}
 		ks := &manifest.Kustomization{Name: "app", Namespace: "flux-system"}
-		ks.PostBuildSubstituteFrom = []manifest.SubstituteReference{{Kind: "ConfigMap", Name: "cluster-settings"}}
+		ks.PostBuild = &postBuild
 		if err := ExpandPostBuildSubstituteReference(ks, provider); err != nil {
 			b.Fatalf("ExpandPostBuildSubstituteReference: %v", err)
 		}
 	}
 }
 
-// BenchmarkDeepMerge_DeepTree measures DeepMerge against two 5-level
-// nested maps — the cost the Helm prepare path pays per HR when
-// layering inline values onto resolved valuesFrom output.
-func BenchmarkDeepMerge_DeepTree(b *testing.B) {
-	base := buildDeepTree(5, "base")
-	override := buildDeepTree(5, "override")
-
+func BenchmarkExpandPostBuildSubstituteReference_ParseSharedCM(b *testing.B) {
+	const input = `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: app, namespace: flux-system}
+spec:
+  sourceRef: {kind: GitRepository, name: apps}
+  postBuild: {substituteFrom: [{kind: ConfigMap, name: cluster-settings}]}
+`
+	data := make(map[string]any, 50)
+	for i := range 50 {
+		data[fmt.Sprintf("VAR_%d", i)] = fmt.Sprintf("value-%d", i)
+	}
+	provider := &SliceProvider{ConfigMaps: []*manifest.ConfigMap{{Name: "cluster-settings", Namespace: "flux-system", Data: data}}}
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		_ = DeepMerge(base, override)
+		docs, err := manifest.DecodeDocs(strings.NewReader(input))
+		if err != nil {
+			b.Fatal(err)
+		}
+		obj, _, _, err := manifest.ParseDoc(docs[0], manifest.ParseDocOptions{DefaultNamespace: ""})
+		if err != nil {
+			b.Fatal(err)
+		}
+		ks := obj.(*manifest.Kustomization)
+		if err := ExpandPostBuildSubstituteReference(ks, provider); err != nil {
+			b.Fatal(err)
+		}
+		if len(ks.PostBuild.Substitute) != len(data) || ks.PostBuild.Substitute["VAR_49"] != "value-49" {
+			b.Fatal("shared ConfigMap substitutions were not expanded")
+		}
 	}
 }
 
-// buildDeepTree constructs a depth-deep map where every level is a
-// fresh map[string]any containing a leaf "leaf" key plus a "next" key
-// that recurses. Used so DeepMerge has to walk all the way down to
-// merge a leaf — exercising the recursive-map branch end to end.
-func buildDeepTree(depth int, tag string) map[string]any {
-	if depth == 0 {
-		return map[string]any{"leaf": tag}
-	}
-	return map[string]any{
-		"leaf": tag,
-		"key1": fmt.Sprintf("scalar-%d", depth),
-		"key2": []any{1, 2, 3, "four", true},
-		"next": buildDeepTree(depth-1, tag),
+func BenchmarkStoreProvider_Lookup(b *testing.B) {
+	for _, count := range []int{1, 4, 16, 32} {
+		b.Run(fmt.Sprintf("inputs=%d", count), func(b *testing.B) {
+			st := store.New()
+			objects := make([]*manifest.ConfigMap, count)
+			ids := make([]manifest.NamedResource, count)
+			for i := range objects {
+				objects[i] = &manifest.ConfigMap{Name: fmt.Sprintf("values-%02d", i), Namespace: "apps"}
+				ids[i] = objects[i].Named()
+				st.AddObject(objects[i])
+			}
+			var reads store.ReadSet
+			reads.Init(st, manifest.NamedResource{}, nil)
+			defer reads.Close()
+			provider := NewStoreProvider(&reads, false, nil)
+			for _, id := range ids {
+				provider.Lookup(id)
+			}
+			i := 0
+			b.ReportAllocs()
+			for b.Loop() {
+				if provider.Data(ids[i]) != objects[i] {
+					b.Fatal("lookup returned another input")
+				}
+				i++
+				if i == count {
+					i = 0
+				}
+			}
+		})
 	}
 }

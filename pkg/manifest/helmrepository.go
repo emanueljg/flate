@@ -2,6 +2,8 @@ package manifest
 
 import (
 	"cmp"
+	"strings"
+	"time"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 )
@@ -18,11 +20,43 @@ type HelmRepository struct {
 
 // Named identifies the repo.
 func (h *HelmRepository) Named() NamedResource {
-	return NamedResource{Kind: KindHelmRepository, Namespace: h.Namespace, Name: h.Name}
+	return NamedResource{Group: kindTable[kindHelmRepository].Group, Kind: KindHelmRepository, Namespace: h.Namespace, Name: h.Name}
 }
 
-// RepoName delegates to the canonical NamedResource helper.
-func (h *HelmRepository) RepoName() string { return h.Named().FluxResourceName() }
+// Suspended reports whether reconciliation is paused on this resource.
+func (h *HelmRepository) Suspended() bool { return h.Suspend }
+
+// ExistenceOnly reports whether readiness requires no artifact acquisition.
+func (h *HelmRepository) ExistenceOnly() bool { return true }
+
+// SourceInterval returns the authored source refresh interval.
+func (h *HelmRepository) SourceInterval() time.Duration { return h.Interval.Duration }
+
+// Content returns the repository inputs that define HTTP acquisitions.
+func (h *HelmRepository) Content() any {
+	var auth []NamedResource
+	h.references(func(ref Reference) bool {
+		if ref.Content && ref.Name != "" {
+			auth = append(auth, ref.NamedResource)
+		}
+		return true
+	})
+	return struct {
+		URL             string
+		Auth            []NamedResource
+		PassCredentials bool
+	}{h.URL, auth, h.PassCredentials}
+}
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (h *HelmRepository) WithNamespace(namespace string) BaseManifest {
+	out := *h
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (h *HelmRepository) ProjectionCompatible(BaseManifest) bool { return true }
 
 // parseHelmRepository decodes a HelmRepository CR via the
 // source-controller typed schema.
@@ -34,17 +68,27 @@ func parseHelmRepository(doc map[string]any) (*HelmRepository, error) {
 	if cr.Spec.URL == "" {
 		return nil, inputf("HelmRepository missing spec.url")
 	}
-	cr.Spec.Type = cmp.Or(cr.Spec.Type, RepoTypeDefault)
-	owner := cr.Namespace + "/" + cr.Name
-	if err := validateOptionalRefs("HelmRepository", owner,
-		secretRefCheck{Field: "spec.secretRef", Ref: cr.Spec.SecretRef},
-		secretRefCheck{Field: "spec.certSecretRef", Ref: cr.Spec.CertSecretRef},
-	); err != nil {
-		return nil, err
-	}
-	return &HelmRepository{
+	cr.Spec.Type = cmp.Or(cr.Spec.Type, sourcev1.HelmRepositoryTypeDefault)
+	out := &HelmRepository{
 		Name:               cr.Name,
 		Namespace:          cr.Namespace,
 		HelmRepositorySpec: cr.Spec,
-	}, nil
+	}
+	var err error
+	out.references(validateSecretReference(out.Named(), &err))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (h *HelmRepository) references(yield func(Reference) bool) {
+	credentialReferences(yield, h.Namespace, h.SecretRef, h.CertSecretRef)
+}
+
+func (h *HelmRepository) kind() KindInfo { return kindTable[kindHelmRepository].KindInfo }
+
+// IsOCI reports whether the repository serves charts through OCI.
+func (h *HelmRepository) IsOCI() bool {
+	return h.Type == sourcev1.HelmRepositoryTypeOCI || strings.HasPrefix(h.URL, "oci://")
 }

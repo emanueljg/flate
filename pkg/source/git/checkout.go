@@ -1,90 +1,20 @@
 package git
 
 import (
-	"fmt"
-	"strings"
+	"context"
+	"slices"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport"
-
-	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// checkoutRef checks out the worktree at the requested ref, applying
-// sparse-checkout directories when configured. Mirrors source-
-// controller's ref-resolution order: Commit > Name > SemVer > Tag >
-// Branch, falling back to HEAD when no ref is set.
-func checkoutRef(repo *git.Repository, ref manifest.GitRepositoryRef, sparse []string) error {
+func checkoutRef(repo *git.Repository, hash plumbing.Hash, sparse []string) error {
 	wt, err := repo.Worktree()
 	if err != nil {
 		return err
 	}
-	checkout := func(set func(*git.CheckoutOptions)) error {
-		opts := &git.CheckoutOptions{}
-		if len(sparse) > 0 {
-			opts.SparseCheckoutDirectories = append(opts.SparseCheckoutDirectories, sparse...)
-		}
-		set(opts)
-		return wt.Checkout(opts)
-	}
-	checkoutHash := func(h plumbing.Hash) error {
-		return checkout(func(o *git.CheckoutOptions) { o.Hash = h })
-	}
-	// tryCheckoutRevision resolves rev and, on success, checks out the
-	// resolved hash. The bool reports whether rev resolved so callers can
-	// fall through to an alternate lookup when it didn't.
-	tryCheckoutRevision := func(rev plumbing.Revision) (bool, error) {
-		h, err := repo.ResolveRevision(rev)
-		if err != nil {
-			return false, nil
-		}
-		return true, checkoutHash(*h)
-	}
-	switch {
-	case ref.Commit != "":
-		hash := plumbing.NewHash(ref.Commit)
-		if err := validateCommitBranch(repo, hash, ref.Branch); err != nil {
-			return err
-		}
-		return checkoutHash(hash)
-	case ref.Name != "":
-		// Full ref name takes precedence (e.g. "refs/pull/420/head",
-		// "refs/tags/v1.2.3"). Resolve against the cloned repo so the
-		// explicitly fetched ref wins; branch refs may still exist only
-		// under refs/remotes/origin from the default clone refspec.
-		if done, err := tryCheckoutRevision(plumbing.Revision(ref.Name)); done {
-			return err
-		}
-		// Fall through: try resolving as a remote-tracking ref. This
-		// handles refs/heads/<branch> by mapping to refs/remotes/origin/<branch>.
-		if rest, ok := strings.CutPrefix(ref.Name, "refs/heads/"); ok {
-			remote := plumbing.NewRemoteReferenceName("origin", rest)
-			if done, err := tryCheckoutRevision(plumbing.Revision(remote)); done {
-				return err
-			}
-		}
-		return fmt.Errorf("%w: unable to resolve git ref %q", manifest.ErrInput, ref.Name)
-	case ref.SemVer != "":
-		h, err := resolveSemver(repo, ref.SemVer)
-		if err != nil {
-			return err
-		}
-		return checkoutHash(h)
-	case ref.Tag != "":
-		if done, err := tryCheckoutRevision(plumbing.Revision("refs/tags/" + ref.Tag)); done {
-			return err
-		}
-		return checkout(func(o *git.CheckoutOptions) { o.Branch = plumbing.NewTagReferenceName(ref.Tag) })
-	case ref.Branch != "":
-		remoteRef := plumbing.NewRemoteReferenceName("origin", ref.Branch)
-		if done, err := tryCheckoutRevision(plumbing.Revision(remoteRef)); done {
-			return err
-		}
-		return checkout(func(o *git.CheckoutOptions) { o.Branch = plumbing.NewBranchReferenceName(ref.Branch) })
-	}
-	// No ref: just check out HEAD (with sparse, if configured).
-	return checkout(func(*git.CheckoutOptions) {})
+	return wt.Checkout(&git.CheckoutOptions{Hash: hash, SparseCheckoutDirectories: slices.Clone(sparse)})
 }
 
 // updateSubmodules initializes and pulls submodules in the cloned
@@ -92,7 +22,7 @@ func checkoutRef(repo *git.Repository, ref manifest.GitRepositoryRef, sparse []s
 // parent's auth is reused for each submodule's fetch — Flux's
 // behavior assumes a single credential source per GitRepository CR,
 // even when submodules live on different hosts.
-func updateSubmodules(repo *git.Repository, auth transport.AuthMethod) error {
+func updateSubmodules(ctx context.Context, repo *git.Repository, auth transport.AuthMethod) error {
 	wt, err := repo.Worktree()
 	if err != nil {
 		return err
@@ -101,7 +31,7 @@ func updateSubmodules(repo *git.Repository, auth transport.AuthMethod) error {
 	if err != nil {
 		return err
 	}
-	return subs.Update(&git.SubmoduleUpdateOptions{
+	return subs.UpdateContext(ctx, &git.SubmoduleUpdateOptions{
 		Init:              true,
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
 		Auth:              auth,

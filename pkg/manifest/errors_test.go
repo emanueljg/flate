@@ -2,9 +2,23 @@ package manifest
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestTrimSentinelPrefix_AllSentinels(t *testing.T) {
+	t.Parallel()
+	for _, sentinel := range sentinels {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+			msg := fmt.Errorf("%w: cause: detail", sentinel).Error()
+			if got := TrimSentinelPrefix(msg); got != "cause: detail" {
+				t.Errorf("TrimSentinelPrefix(%q) = %q", msg, got)
+			}
+		})
+	}
+}
 
 // TestTrimSentinelPrefix locks the user-facing error format: strip
 // the two-layer `flux error: <subcategory>:` chain produced by
@@ -12,6 +26,7 @@ import (
 // used for errors.Is branching keep working; only the rendered
 // string is reshaped.
 func TestTrimSentinelPrefix(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in, want string
 	}{
@@ -40,9 +55,10 @@ func TestTrimSentinelPrefix(t *testing.T) {
 }
 
 func TestDependencyFailedError_Format(t *testing.T) {
-	parent := NamedResource{Kind: KindKustomization, Namespace: "default", Name: "child"}
-	depA := NamedResource{Kind: KindKustomization, Namespace: "security", Name: "pocket-id-instance"}
-	depB := NamedResource{Kind: KindKustomization, Namespace: "database", Name: "cnpg-cluster"}
+	t.Parallel()
+	parent := NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: "default", Name: "child"}
+	depA := NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: "security", Name: "pocket-id-instance"}
+	depB := NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: "database", Name: "cnpg-cluster"}
 
 	err := &DependencyFailedError{
 		Parent: parent,
@@ -65,8 +81,9 @@ func TestDependencyFailedError_Format(t *testing.T) {
 }
 
 func TestDependencyFailedError_Unwraps(t *testing.T) {
+	t.Parallel()
 	err := &DependencyFailedError{
-		Parent: NamedResource{Kind: KindKustomization, Name: "x"},
+		Parent: NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Name: "x"},
 	}
 	if !errors.Is(err, ErrInput) {
 		t.Errorf("expected errors.Is(err, ErrInput) to be true")
@@ -81,8 +98,9 @@ func TestDependencyFailedError_Unwraps(t *testing.T) {
 }
 
 func TestDependencyFailedError_EmptyFailedList(t *testing.T) {
+	t.Parallel()
 	err := &DependencyFailedError{
-		Parent: NamedResource{Kind: KindKustomization, Namespace: "ns", Name: "k"},
+		Parent: NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: "ns", Name: "k"},
 	}
 	if msg := err.Error(); !strings.Contains(msg, "dependencies failed") {
 		t.Errorf("empty-failed error should still mention dependencies failed: %q", msg)

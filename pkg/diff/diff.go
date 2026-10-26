@@ -1,29 +1,32 @@
 package diff
 
-import "fmt"
+import (
+	"bytes"
+	"cmp"
+	"fmt"
+
+	"github.com/home-operations/flate/internal/output"
+	"github.com/home-operations/flate/pkg/manifest"
+)
 
 // Parent identifies the Flux Kustomization or HelmRelease that rendered a
-// manifest. It never appears in the output — it's a pairing discriminator
-// (see pairKey) so a Deployment rendered by HelmRelease A never diffs
-// against the same-named Deployment from HelmRelease B.
+// manifest. Its zero value identifies an ownerless document. It distinguishes
+// resources from different producers and attributes structured output.
 type Parent struct {
-	Kind      string
-	Namespace string
-	Name      string
+	manifest.NamedResource
 	// Path is the Flux Kustomization spec.path (only set for KS
-	// parents). Slash-normalized, with the conventional `./` prefix
-	// stripped. Disambiguates two KS parents that share a (kind, ns,
-	// name) but render from different overlays.
-	Path string
+	// parents), with the conventional `./` prefix stripped. It is display
+	// metadata, not part of producer identity.
+	Path string `json:"path"`
 }
 
-// Doc pairs a rendered manifest with its parent.
+// Doc pairs a rendered manifest with its optional parent.
 type Doc struct {
 	Manifest map[string]any
 	Parent   Parent
 }
 
-// Options tunes RenderDocs behavior.
+// Options tunes Compare and RenderDocs behavior.
 type Options struct {
 	// StripAttrs lists annotation/label keys removed from each
 	// manifest's metadata (and pod-template metadata) before the diff
@@ -53,26 +56,36 @@ type Options struct {
 	// Format selects the output style (see the Format constants). The
 	// zero value renders the human default.
 	Format Format
-	// Suppressed lists the producers SuppressFailed withheld from the two
-	// doc sets. Every format discloses them in a leading note block so a
-	// one-sided render failure is never mistaken for a wholesale change.
+	// Suppressed lists additional producer disclosures. Compare appends its
+	// selected suppressions without modifying this slice and returns them as data.
+	// JSON also includes them in its suppressed array.
 	Suppressed []Suppression
 }
 
-// RenderDocs is the top-level entry point: it compares the two doc sets and
-// returns the formatted diff for opts.Format. The dyff text styles
-// (github/human/brief/gitlab/gitea, and the zero value) render the whole
-// set through dyff for native per-resource labels; FormatDiff takes the
-// per-resource unified-diff path.
-func RenderDocs(left, right []Doc, opts Options) ([]byte, error) {
-	switch {
-	case opts.Format == "" || opts.Format.isDyffText():
-		return renderNative(left, right, opts)
-	case opts.Format == FormatDiff:
-		return renderUnified(left, right, opts)
-	case opts.Format == FormatHTML:
-		return renderHTML(left, right, opts)
+// RenderDocs compares normalized documents by canonical parent and resource identity
+// and returns the formatted diff for opts.Format. Parent.Path is display metadata.
+// Native formats use dyff for content comparison and Kubernetes resource labels;
+// unified, HTML and JSON formats present the same canonical pairs.
+// Discovered warnings are returned even when formatting fails.
+func RenderDocs(left, right []Doc, opts Options) ([]byte, []manifest.Warning, error) {
+	paired, warnings, leftCopied, rightCopied := pair(left, right, opts)
+	opts.Format = cmp.Or(opts.Format, FormatHuman)
+	var out []byte
+	var err error
+	switch opts.Format {
+	case FormatDiff, FormatHTML:
+		var buf bytes.Buffer
+		encoder := output.Encoder{Writer: &buf, Format: output.Format(opts.Format)}
+		err = encoder.Lines(changedPairs(paired))
+		if err == nil {
+			out = buf.Bytes()
+		}
+	case FormatJSON:
+		out, err = renderJSON(changes(paired, leftCopied, rightCopied), opts.Suppressed)
+	case FormatHuman, FormatGitHub, FormatBrief, FormatGitLab, FormatGitea:
+		out, err = renderNative(paired, opts.Format)
 	default:
-		return nil, fmt.Errorf("unsupported diff format %q", opts.Format)
+		err = fmt.Errorf("unsupported diff format %q", opts.Format)
 	}
+	return out, warnings, err
 }

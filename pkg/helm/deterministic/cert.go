@@ -15,12 +15,12 @@ import (
 	"time"
 )
 
-// certFuncs returns deterministic overrides for sprig's certificate and
+// certFuncs registers deterministic overrides for sprig's certificate and
 // private-key generators. All generated material is ed25519: ed25519.GenerateKey
 // reads the seeded stream directly (unlike rsa/ecdsa.GenerateKey, which route
 // through crypto/rand's CustomReader and discard a custom reader), and ed25519
 // signatures are deterministic (RFC 8032). Combined with a stream-derived serial
-// and FixedTime validity, every cert/key renders identically run to run — with
+// and fixedTime validity, every cert/key renders identically run to run — with
 // no hand-rolled crypto and no seeded reader handed to x509.CreateCertificate.
 //
 // flate renders for offline review and never applies its output, so an ed25519
@@ -31,24 +31,21 @@ import (
 // cannot make rsa/ecdsa keygen deterministic. The *WithKey variants keep their
 // signatures but ignore the supplied PEM and generate an ed25519 key, so output
 // stays deterministic regardless of the caller's key type.
-func certFuncs(s *stream) template.FuncMap {
-	return template.FuncMap{
-		"genPrivateKey":   func(typ string) string { return genPrivateKey(s, typ) },
-		"buildCustomCert": buildCustomCert,
-		"genCA":           func(cn string, days int) (certificate, error) { return genCA(s, cn, days) },
-		"genCAWithKey":    func(cn string, days int, _ string) (certificate, error) { return genCA(s, cn, days) },
-		"genSelfSignedCert": func(cn string, ips, alternateDNS []any, days int) (certificate, error) {
-			return genSelfSignedCert(s, cn, ips, alternateDNS, days)
-		},
-		"genSelfSignedCertWithKey": func(cn string, ips, alternateDNS []any, days int, _ string) (certificate, error) {
-			return genSelfSignedCert(s, cn, ips, alternateDNS, days)
-		},
-		"genSignedCert": func(cn string, ips, alternateDNS []any, days int, ca certificate) (certificate, error) {
-			return genSignedCert(s, cn, ips, alternateDNS, days, ca)
-		},
-		"genSignedCertWithKey": func(cn string, ips, alternateDNS []any, days int, ca certificate, _ string) (certificate, error) {
-			return genSignedCert(s, cn, ips, alternateDNS, days, ca)
-		},
+func certFuncs(s *stream, fm template.FuncMap) {
+	fm["genPrivateKey"] = func(typ string) string { return genPrivateKey(s, typ) }
+	fm["genCA"] = func(cn string, days int) (certificate, error) { return genCA(s, cn, days) }
+	fm["genCAWithKey"] = func(cn string, days int, _ string) (certificate, error) { return genCA(s, cn, days) }
+	fm["genSelfSignedCert"] = func(cn string, ips, alternateDNS []any, days int) (certificate, error) {
+		return genSelfSignedCert(s, certConfig{cn: cn, ips: ips, alternateDNS: alternateDNS, days: days})
+	}
+	fm["genSelfSignedCertWithKey"] = func(cn string, ips, alternateDNS []any, days int, _ string) (certificate, error) {
+		return genSelfSignedCert(s, certConfig{cn: cn, ips: ips, alternateDNS: alternateDNS, days: days})
+	}
+	fm["genSignedCert"] = func(cn string, ips, alternateDNS []any, days int, ca certificate) (certificate, error) {
+		return genSignedCert(s, certConfig{cn: cn, ips: ips, alternateDNS: alternateDNS, days: days}, ca)
+	}
+	fm["genSignedCertWithKey"] = func(cn string, ips, alternateDNS []any, days int, ca certificate, _ string) (certificate, error) {
+		return genSignedCert(s, certConfig{cn: cn, ips: ips, alternateDNS: alternateDNS, days: days}, ca)
 	}
 }
 
@@ -59,12 +56,15 @@ type certificate struct {
 	Key  string
 }
 
-// issue generates a deterministic ed25519 key, finishes the template (serial from
-// the stream, validity from FixedTime), signs it, and PEM-encodes both. A nil
-// signerKey means self-signed (parent and signer are the freshly generated cert
-// and key). x509.CreateCertificate is handed the stream, but never reads it: the
-// serial is pre-set and ed25519 signing consumes no randomness.
-func issue(s *stream, tmpl, parent *x509.Certificate, signerKey ed25519.PrivateKey, days int) (certificate, error) {
+type certConfig struct {
+	cn                string
+	ips, alternateDNS []any
+	days              int
+}
+
+// A nil signerKey means self-signed. x509.CreateCertificate never reads the
+// stream: the serial is pre-set and ed25519 signing consumes no randomness.
+func (s *stream) issue(tmpl, parent *x509.Certificate, signerKey ed25519.PrivateKey, days int) (certificate, error) {
 	pub, priv, err := ed25519.GenerateKey(s)
 	if err != nil {
 		return certificate{}, fmt.Errorf("generating ed25519 key: %w", err)
@@ -74,8 +74,8 @@ func issue(s *stream, tmpl, parent *x509.Certificate, signerKey ed25519.PrivateK
 		return certificate{}, fmt.Errorf("generating serial: %w", err)
 	}
 	tmpl.SerialNumber = serial
-	tmpl.NotBefore = FixedTime
-	tmpl.NotAfter = FixedTime.Add(24 * time.Hour * time.Duration(days))
+	tmpl.NotBefore = fixedTime
+	tmpl.NotAfter = fixedTime.Add(24 * time.Hour * time.Duration(days))
 	if signerKey == nil {
 		parent, signerKey = tmpl, priv
 	}
@@ -119,27 +119,27 @@ func genCA(s *stream, cn string, days int) (certificate, error) {
 	}
 	tmpl.IsCA = true
 	tmpl.KeyUsage |= x509.KeyUsageCertSign
-	return issue(s, tmpl, nil, nil, days)
+	return s.issue(tmpl, nil, nil, days)
 }
 
-func genSelfSignedCert(s *stream, cn string, ips, alternateDNS []any, days int) (certificate, error) {
-	tmpl, err := baseTemplate(cn, ips, alternateDNS)
+func genSelfSignedCert(s *stream, cfg certConfig) (certificate, error) {
+	tmpl, err := baseTemplate(cfg.cn, cfg.ips, cfg.alternateDNS)
 	if err != nil {
 		return certificate{}, err
 	}
-	return issue(s, tmpl, nil, nil, days)
+	return s.issue(tmpl, nil, nil, cfg.days)
 }
 
-func genSignedCert(s *stream, cn string, ips, alternateDNS []any, days int, ca certificate) (certificate, error) {
+func genSignedCert(s *stream, cfg certConfig, ca certificate) (certificate, error) {
 	parent, signerKey, err := parseCA(ca)
 	if err != nil {
 		return certificate{}, err
 	}
-	tmpl, err := baseTemplate(cn, ips, alternateDNS)
+	tmpl, err := baseTemplate(cfg.cn, cfg.ips, cfg.alternateDNS)
 	if err != nil {
 		return certificate{}, err
 	}
-	return issue(s, tmpl, parent, signerKey, days)
+	return s.issue(tmpl, parent, signerKey, cfg.days)
 }
 
 // parseCA decodes the CA certificate and key from a certificate produced by
@@ -171,7 +171,7 @@ func parseCA(ca certificate) (*x509.Certificate, ed25519.PrivateKey, error) {
 
 func genPrivateKey(s *stream, typ string) string {
 	switch typ {
-	case "", "rsa", "ecdsa", "ed25519":
+	case "", "rsa", "ecdsa", "ed25519", "dsa":
 		_, priv, err := ed25519.GenerateKey(s)
 		if err != nil {
 			return fmt.Sprintf("failed to generate private key: %s", err)

@@ -3,15 +3,56 @@ package diff
 import (
 	"strings"
 	"testing"
+
+	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/pkg/manifest"
 )
 
 func renderDiff(t *testing.T, left, right []Doc, opts Options) string {
 	t.Helper()
-	out, err := RenderDocs(left, right, opts)
+	out, _, err := RenderDocs(left, right, opts)
 	if err != nil {
 		t.Fatalf("RenderDocs: %v", err)
 	}
 	return string(out)
+}
+
+func TestRenderDocs_NormalizeBeforePair(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"changes", "json", "diff", "html", "github"} {
+		t.Run(format, func(t *testing.T) {
+			t.Parallel()
+			left, right := cm("old", "ns", "owner", "same"), cm("new", "ns", "owner", "same")
+			before := []Doc{left, right}
+			for i := range before {
+				before[i].Manifest = manifest.DeepCopyMap(before[i].Manifest)
+			}
+			calls := map[string]int{}
+			opts := Options{Format: Format(format), Normalize: func(m map[string]any) {
+				meta := m["metadata"].(map[string]any)
+				calls[meta["name"].(string)]++
+				meta["name"] = "normalized"
+				m["data"].(map[string]any)["k"] = "normalized"
+			}}
+			switch format {
+			case "changes":
+				changes, warnings := Changes([]Doc{left}, []Doc{right}, opts)
+				assert.Equal(t, len(changes), 0)
+				assert.Equal(t, len(warnings), 0)
+			case "json":
+				got := jsonChanges(t, []Doc{left}, []Doc{right}, opts)
+				if len(got) != 0 {
+					t.Errorf("normalized identities should produce zero JSON changes, got %d: %+v", len(got), got)
+				}
+			default:
+				if out := renderDiff(t, []Doc{left}, []Doc{right}, opts); out != "" {
+					t.Errorf("normalized identities should pair without a diff, got:\n%s", out)
+				}
+			}
+			assert.Diff(t, calls, map[string]int{"old": 1, "new": 1})
+			assert.Diff(t, []Doc{left, right}, before)
+		})
+	}
 }
 
 // TestNormalize_StripAttrsRemovesNoise pins that Options.StripAttrs is
@@ -19,6 +60,7 @@ func renderDiff(t *testing.T, left, right []Doc, opts Options) string {
 // anything else yields no diff. This is the chart-bump noise filter —
 // `helm.sh/chart` rotates on every chart upgrade.
 func TestNormalize_StripAttrsRemovesNoise(t *testing.T) {
+	t.Parallel()
 	mk := func(chartLabel string) []Doc {
 		return []Doc{{
 			Manifest: map[string]any{
@@ -48,6 +90,7 @@ func TestNormalize_StripAttrsRemovesNoise(t *testing.T) {
 // hash yields no diff. The plural key previously slipped past the
 // exact-match list.
 func TestNormalize_StripsChecksumPrefixOnPodTemplate(t *testing.T) {
+	t.Parallel()
 	mk := func(sum string) []Doc {
 		return []Doc{{
 			Manifest: map[string]any{
@@ -79,6 +122,7 @@ func TestNormalize_StripsChecksumPrefixOnPodTemplate(t *testing.T) {
 // rotated timestamp yields no diff, while a genuinely-changed sibling
 // spec field still surfaces.
 func TestNormalize_StripsSpecFieldPath(t *testing.T) {
+	t.Parallel()
 	mk := func(unlock, repo string) []Doc {
 		return []Doc{{
 			Manifest: map[string]any{
@@ -119,6 +163,7 @@ func TestNormalize_StripsSpecFieldPath(t *testing.T) {
 // the diff, so a rotated binary hook payload surfaces as a one-line
 // "this changed" rather than two walls of base64.
 func TestNormalize_RedactsConfigMapBinaryData(t *testing.T) {
+	t.Parallel()
 	mk := func(blob, data string) []Doc {
 		return []Doc{{
 			Manifest: map[string]any{

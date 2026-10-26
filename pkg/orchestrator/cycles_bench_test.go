@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
@@ -35,14 +36,11 @@ import (
 // Phase 2.6 target: ≥10× improvement.
 func BenchmarkFailDependsOnCycles_Incremental(b *testing.B) {
 	const N = 1000
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 
 	ids := make([]manifest.NamedResource, N)
 	for i := range N {
-		ids[i] = manifest.NamedResource{
-			Kind: manifest.KindKustomization, Namespace: "ns",
-			Name: fmt.Sprintf("ks-%05d", i),
-		}
+		ids[i] = testutil.KustomizationID("ns", fmt.Sprintf("ks-%05d", i))
 	}
 	// Build an acyclic chain: ks-i depends on ks-(i+1). The last
 	// object has no deps. Single linear DAG keeps the bench
@@ -74,14 +72,11 @@ func BenchmarkFailDependsOnCycles_Incremental(b *testing.B) {
 // listener fires; the incremental path takes over after.
 func BenchmarkFailDependsOnCycles_Bootstrap(b *testing.B) {
 	const N = 1000
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 
 	ids := make([]manifest.NamedResource, N)
 	for i := range N {
-		ids[i] = manifest.NamedResource{
-			Kind: manifest.KindKustomization, Namespace: "ns",
-			Name: fmt.Sprintf("ks-%05d", i),
-		}
+		ids[i] = testutil.KustomizationID("ns", fmt.Sprintf("ks-%05d", i))
 	}
 	for i := range N {
 		var deps []manifest.NamedResource
@@ -95,5 +90,48 @@ func BenchmarkFailDependsOnCycles_Bootstrap(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		o.failDependsOnCycles()
+	}
+}
+
+func BenchmarkDependencyGraph_RegisterHealthyChain(b *testing.B) {
+	ids := make([]manifest.NamedResource, 100)
+	for i := range ids {
+		ids[i] = testutil.KustomizationID("ns", fmt.Sprintf("node-%03d", i))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		g := newDependencyGraph()
+		for i, id := range ids {
+			var deps []manifest.NamedResource
+			if i > 0 {
+				deps = []manifest.NamedResource{ids[i-1]}
+			}
+			g.ReplaceEdges(id, deps)
+		}
+	}
+}
+
+func BenchmarkDependencyGraph_RegisterWhileCycleFailed(b *testing.B) {
+	for _, fan := range []int{0, 100, 1000} {
+		b.Run(fmt.Sprintf("fan=%d", fan), func(b *testing.B) {
+			a, c, leaf := testutil.KustomizationID("ns", "a"), testutil.KustomizationID("ns", "b"), testutil.KustomizationID("ns", "leaf")
+			deps := []manifest.NamedResource{c}
+			for i := range fan {
+				deps = append(deps, testutil.KustomizationID("ns", fmt.Sprintf("fan-%04d", i)))
+			}
+			ids := make([]manifest.NamedResource, 500)
+			for i := range ids {
+				ids[i] = testutil.KustomizationID("ns", fmt.Sprintf("node-%04d", i))
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				g := newDependencyGraph()
+				g.ReplaceEdges(a, deps)
+				g.ReplaceEdges(c, []manifest.NamedResource{a})
+				for _, id := range ids {
+					g.ReplaceEdges(id, []manifest.NamedResource{leaf})
+				}
+			}
+		})
 	}
 }

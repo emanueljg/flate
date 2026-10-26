@@ -5,13 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"slices"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/home-operations/flate/pkg/baseline"
+	"github.com/home-operations/flate/pkg/change"
+	"github.com/home-operations/flate/pkg/discovery"
+	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
-	"github.com/home-operations/flate/pkg/source/cacheroot"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/store"
 )
 
 // Tree is one cluster directory to render for comparison. RepoRoot is the
@@ -20,27 +24,24 @@ import (
 // to RepoRoot when empty (a cluster whose Flux entry is a subdir passes the
 // subdir as Path and the root as RepoRoot). SelfURLs are the remote URL(s)
 // the tree represents, for self-referential GitRepository aliasing. A
-// consumer rendering extracted trees with no .git supplies all three
-// explicitly; nothing here is inferred from a .git ancestor.
+// consumer rendering extracted trees with no .git supplies the source root
+// and scan path explicitly.
 type Tree struct {
 	RepoRoot string
 	Path     string
 	SelfURLs []string
 }
 
-// Rendered is one side of a RenderTrees comparison: the Orchestrator
-// (already Stopped — its background reconcile loops are released, but its
-// Store stays readable for diff doc gathering) paired with its render
-// Result and that side's render error. Result is nil only on a fatal
-// (Bootstrap) error; a per-resource render failure keeps Result non-nil
-// (the failures are in Result.Failed) and is reported in Err.
+// Rendered pairs a completed orchestrator and result with its error.
+// A failed bootstrap retains only Result.Warnings and no Orchestrator;
+// per-resource failures retain the completed result and readable Store.
 type Rendered struct {
 	*Orchestrator
 	Result *Result
 	Err    error
 }
 
-// RenderTrees renders two cluster directories for comparison — the engine
+// RenderTrees prepares two cluster directories for changed-only rendering: the engine
 // behind `flate diff`, exposed so an SDK consumer (a PR-diff bot, a CI
 // gate) doesn't re-implement the two-orchestrator dance.
 //
@@ -51,97 +52,182 @@ type Rendered struct {
 // outputs (e.g. via diff.Changes) yields the same diff a full render
 // would: an unchanged resource renders on neither side.
 //
-// Both sides share one source.Cache so a chart / OCI layer / git source
-// fetched for one side is reused by the other (and concurrent slot
-// allocation is serialized), and they run concurrently. cfg supplies the
-// render tuning; cfg.Path / RepoRoot / PathOrig / SelfURLs are set from
-// baseTree/headTree (any values on cfg are ignored), and cfg.SourceCache,
-// when nil, is created from cfg.CacheDir (falling back to the OS tempdir).
-// A consumer that renders many comparisons (one per PR) should pass its
-// own long-lived cfg.SourceCache so artifacts persist across calls.
+// Both sides discover concurrently, share one immutable input selection, then render
+// concurrently with the common cache owner. Caller-injected
+// cfg.Cache remains caller-owned; an internal owner closes after both sides stop.
+// cfg.Path, RepoRoot, PathOrig and SelfURLs come from the supplied trees.
+// cfg.BaseInput and cfg.Input supply authoritative base and head bytes, respectively.
+// cfg.HeadOnly renders only head after resolving both discovery indexes; base is
+// stopped and returned empty. Preparation failures retain both warning snapshots
+// without completed orchestrators. Base cleanup failures remain invocation errors.
 //
 // Both orchestrators are Stopped before return; their Stores remain
 // readable. err is non-nil if either side had any failure; callers that
-// still want the partial diff check Rendered.Result != nil (nil only on a
-// fatal Bootstrap error) and treat err as advisory. baseTree is the
+// still want a partial diff require both Orchestrator and Result, and treat
+// per-resource errors as advisory. baseTree is the
 // left/old side and headTree the right/new — matching diff.Changes(left,
 // right). Each side reconciles changed-only against the OTHER tree's
 // RepoRoot.
 func RenderTrees(ctx context.Context, baseTree, headTree Tree, cfg Config) (base, head Rendered, err error) {
-	if cfg.SourceCache == nil {
-		root := cmp.Or(cfg.CacheDir, filepath.Join(os.TempDir(), "flate-cache"))
-		cfg.SourceCache = source.NewCache(cacheroot.New(root))
+	inputs := [2]*store.SourceArtifact{cfg.BaseInput, cfg.Input}
+	sides := []*Rendered{&base, &head}
+	defer func() {
+		if err == nil || base.Orchestrator != nil || head.Orchestrator != nil {
+			return
+		}
+		for i, side := range sides {
+			if side.Result == nil && inputs[i] != nil {
+				side.Result = &Result{Warnings: slices.Clone(inputs[i].Warnings)}
+			}
+		}
+	}()
+	if cfg.Network == nil {
+		cfg.Network = new(source.Network)
+		defer cfg.Network.Close()
+	}
+	if cfg.Cache == nil {
+		cfg.Cache, err = sourcecache.New(ctx, cfg.CacheDir)
+		if err != nil {
+			return base, head, err
+		}
+		defer func() { err = errors.Join(err, cfg.Cache.Close()) }()
+	}
+	directoryInputs := inputs[0] == nil && inputs[1] == nil
+	for i, side := range []*Tree{&baseTree, &headTree} {
+		if inputs[i] == nil {
+			path := cmp.Or(side.Path, side.RepoRoot)
+			if path == "" {
+				return base, head, fmt.Errorf("%w: tree path is required", manifest.ErrInput)
+			}
+			inputs[i], side.Path, err = baseline.AdmitDirectory(ctx, path, side.RepoRoot)
+			if err != nil {
+				return base, head, err
+			}
+		}
+		if inputs[i].FS == nil || inputs[i].LocalPath == "" {
+			return base, head, fmt.Errorf("%w: tree input content unavailable", manifest.ErrInput)
+		}
+		side.RepoRoot = inputs[i].LocalPath
+	}
+	if directoryInputs && baseTree.RepoRoot == headTree.RepoRoot {
+		inputs[1] = inputs[0]
 	}
 	baseCfg := cfg
 	baseCfg.RepoRoot = baseTree.RepoRoot
 	baseCfg.Path = cmp.Or(baseTree.Path, baseTree.RepoRoot)
 	baseCfg.PathOrig = headTree.RepoRoot
 	baseCfg.SelfURLs = baseTree.SelfURLs
+	baseCfg.Input, baseCfg.BaseInput = inputs[0], inputs[1]
 	headCfg := cfg
 	headCfg.RepoRoot = headTree.RepoRoot
 	headCfg.Path = cmp.Or(headTree.Path, headTree.RepoRoot)
 	headCfg.PathOrig = baseTree.RepoRoot
 	headCfg.SelfURLs = headTree.SelfURLs
+	headCfg.Input, headCfg.BaseInput = inputs[1], inputs[0]
 
+	configs := [2]Config{baseCfg, headCfg}
+	var orchestrators [2]*Orchestrator
+	var prepared [2]*discovery.Result
+	defer func() {
+		for i, o := range orchestrators {
+			if o != nil {
+				sides[i].Err = errors.Join(sides[i].Err, o.Stop())
+			}
+		}
+		err = joinTreeErrors(base.Err, head.Err)
+		if cfg.HeadOnly {
+			base = Rendered{}
+		}
+	}()
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		o, res, e := renderOne(gctx, baseCfg)
-		base = Rendered{Orchestrator: o, Result: res, Err: e}
-		// A fatal Bootstrap error yields a nil orchestrator — propagate
-		// it so the errgroup cancels the sibling. Per-resource failures
-		// keep the orchestrator non-nil; defer them so the caller still
-		// gets a diff before flipping its exit code.
-		if o == nil {
+	for i := range 2 {
+		g.Go(func() error {
+			o, e := New(gctx, configs[i])
+			orchestrators[i] = o
+			if e == nil {
+				prepared[i], e = o.prepareBootstrap(gctx)
+			}
+			sides[i].Err = e
+			if o != nil {
+				sides[i].Result = &Result{Warnings: o.store.Warnings()}
+			}
 			return e
-		}
-		return nil
-	})
-	g.Go(func() error {
-		o, res, e := renderOne(gctx, headCfg)
-		head = Rendered{Orchestrator: o, Result: res, Err: e}
-		if o == nil {
-			return e
-		}
-		return nil
-	})
+		})
+	}
 	if e := g.Wait(); e != nil {
-		return base, head, e
+		return base, head, joinTreeErrors(base.Err, head.Err)
 	}
-	return base, head, joinTreeErrors(base.Err, head.Err)
+	changes := cfg.ExternalChanges
+	if changes != nil || inputs[0] != inputs[1] {
+		changes, err = change.Qualify(ctx, changes, orchestrators[0].store, orchestrators[1].store)
+		if err != nil {
+			base.Err, head.Err = err, err
+			return base, head, err
+		}
+	} else {
+		// The shared direct input keeps the implicit full-render exception.
+		for i, o := range orchestrators {
+			if _, err := o.computeChangeSet(ctx, o.repoRoot); err != nil {
+				sides[i].Err = err
+				return base, head, err
+			}
+		}
+	}
+	changes = changes.WithReaders(orchestrators[0].index, orchestrators[1].index)
+	g, gctx = errgroup.WithContext(ctx)
+	for i := range 2 {
+		if cfg.HeadOnly && i == 0 {
+			continue
+		}
+		g.Go(func() error {
+			o := orchestrators[i]
+			o.cfg.ExternalChanges = changes
+			o.completeBootstrap(prepared[i], o.cfg.ExternalChanges)
+			res, e := o.Render(gctx)
+			*sides[i] = Rendered{Result: res, Err: e}
+			if res == nil {
+				return e
+			}
+			sides[i].Orchestrator = o
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return base, head, err
 }
 
-// renderOne runs one orchestrator end to end: New → Render → Stop. Stop
-// fires unconditionally so background loops are released even on the
-// failure paths; the Store stays readable afterward. A nil Result (fatal
-// Bootstrap error) drops the orchestrator so callers gate on it cleanly,
-// mirroring the CLI's single-tree runner.
-func renderOne(ctx context.Context, cfg Config) (*Orchestrator, *Result, error) {
-	o, err := New(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	res, err := o.Render(ctx)
-	o.Stop()
-	if res == nil {
-		return nil, nil, err
-	}
-	return o, res, err
+// treeErrors retains side attribution so Select can project resource failures
+// without discarding outer errors from shared cache teardown.
+type treeErrors struct {
+	base error
+	head error
 }
 
-// joinTreeErrors composes the per-side render errors into one non-nil
-// error when either side failed; both nil → nil.
-func joinTreeErrors(base, head error) error {
+func (e *treeErrors) Error() string {
 	switch {
-	case base != nil && head != nil:
-		return errors.Join(
-			errors.New("both trees had reconcile failures"),
-			fmt.Errorf("base tree: %w", base),
-			fmt.Errorf("head tree: %w", head),
-		)
-	case base != nil:
-		return fmt.Errorf("base tree: %w", base)
-	case head != nil:
-		return fmt.Errorf("head tree: %w", head)
+	case e.base != nil && e.head != nil:
+		return "both trees had reconcile failures\nbase tree: " + e.base.Error() + "\nhead tree: " + e.head.Error()
+	case e.base != nil:
+		return "base tree: " + e.base.Error()
+	default:
+		return "head tree: " + e.head.Error()
 	}
-	return nil
+}
+
+func (e *treeErrors) Unwrap() []error {
+	var out []error
+	if e.base != nil {
+		out = append(out, fmt.Errorf("base tree: %w", e.base))
+	}
+	if e.head != nil {
+		out = append(out, fmt.Errorf("head tree: %w", e.head))
+	}
+	return out
+}
+
+func joinTreeErrors(base, head error) error {
+	if base == nil && head == nil {
+		return nil
+	}
+	return &treeErrors{base: base, head: head}
 }

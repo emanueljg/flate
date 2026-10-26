@@ -5,131 +5,123 @@ package bucket
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"net/url"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/minio/minio-go/v7"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
+	"github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// Fetcher pulls a Flux Bucket CR into the on-disk cache. Only the
+// Fetcher acquires a Flux Bucket into an immutable filesystem. Only the
 // "generic" provider (any S3-API-compatible storage) is wired up
 // today via minio-go. The aws/gcp/azure providers parse and route
 // here but return a clear "not implemented" error rather than silently
 // falling back, unless ForceGeneric sends them down the generic path.
 type Fetcher struct {
-	Cache   *source.Cache
-	Secrets source.SecretGetter
+	Cache *cache.Cache
+
+	// Network is the required non-nil invocation owner, borrowed by this fetcher.
+	Network *source.Network
 
 	// ForceGeneric skips the provider gate; the generic path then needs
 	// static credentials (a SecretRef) or it fails.
 	ForceGeneric bool
 }
 
-// Fetch implements source.TypedFetcher[*manifest.Bucket]. The typed
-// signature is wrapped via source.Wrap at orchestrator registration.
-func (f *Fetcher) Fetch(ctx context.Context, b *manifest.Bucket) (*store.SourceArtifact, error) {
+// Fetch implements source.TypedFetcher[*manifest.Bucket].
+type operation struct {
+	*Fetcher
+	reads   *store.ReadSet
+	secrets source.SecretGetter
+}
+
+// Fetch acquires content using one execution's captured credentials and declarations.
+func (f *Fetcher) Fetch(ctx context.Context, b *manifest.Bucket, reads *store.ReadSet, policy cache.Policy) (*store.SourceArtifact, error) {
+	operation := operation{Fetcher: f, reads: reads, secrets: source.SecretLookup(reads)}
+	return operation.fetchSource(ctx, b, policy)
+}
+
+func (f *operation) fetchSource(ctx context.Context, b *manifest.Bucket, policy cache.Policy) (*store.SourceArtifact, error) {
 	if !f.ForceGeneric && b.Provider != "" && b.Provider != sourcev1.BucketProviderGeneric {
-		return nil, source.ErrUnsupportedProvider("Bucket",
-			b.Namespace, b.Name, b.Provider, sourcev1.BucketProviderGeneric,
+		return nil, source.ErrUnsupportedProvider(b.Named(), b.Provider, sourcev1.BucketProviderGeneric,
 			"S3-compatible")
 	}
 
-	client, endpoint, secure, err := f.newMinioClient(b)
+	client, material, err := f.newMinioClient(b)
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache key: bucket+prefix. Unlike OCI / Git, the bucket fetcher
-	// has no "is the cached slot still valid?" check — walkBucket is
-	// write-only, so any file present in the slot from a previous run
-	// that was DELETED upstream between runs would be served as a
-	// ghost file. The revision hash is computed from the upstream
-	// listing, so it correctly reflects "no change" while the slot
-	// still holds the dead file. We treat every fetch as a miss:
-	// write to a fresh staging dir, then atomic-rename into the final
-	// slot on success.
-	slot, err := f.Cache.Slot(ctx, endpoint+"/"+b.BucketName, b.Prefix, authIdentity(b))
+	endpoint, secure := client.EndpointURL().Host, client.EndpointURL().Scheme == "https"
+	ignore := ""
+	if b.Ignore != nil {
+		ignore = *b.Ignore
+	}
+	key := cache.ArchiveKey{Content: struct{ Source, Transport any }{b.Content(endpoint, secure), material}, Ignore: ignore, Policy: "", Required: []string{"revision", "object-count"}}
+	input, desc, id, err := f.Cache.Acquire(ctx, key, policy, func(ctx context.Context, w cache.ProducerInput) (cache.ProducerResult, error) {
+		desc, err := walkBucket(ctx, client, b, w)
+		return cache.ProducerResult{Descriptor: desc}, err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("%s cache slot: %w", bucketID(b), err)
-	}
-	defer slot.Release()
-	if slot.Exists {
-		// Drop the prior committed slot and re-stage so the upcoming
-		// walk writes into an empty staging dir.
-		if err := slot.Refresh(); err != nil {
-			return nil, fmt.Errorf("%s refresh: %w", bucketID(b), err)
-		}
-	}
-
-	objectCount, revHash, err := walkBucket(ctx, client, b.BucketName, b.Prefix, slot.Path)
-	if err != nil {
-		return nil, fmt.Errorf("%s walk: %w", bucketID(b), err)
-	}
-	// Bucket uses the no-defaults ignore variant — matches upstream
-	// source-controller's bucket_controller.go, which constructs an
-	// ignore Matcher without VCS / extension defaults. Buckets are
-	// object stores with no VCS semantics; .jpg / .flux.yaml / etc.
-	// are legitimate content and must reach the artifact.
-	if err := source.ApplyIgnoreNoDefaults(slot.Path, b.Ignore); err != nil {
-		return nil, fmt.Errorf("%s: %w", bucketID(b), err)
-	}
-	if err := slot.Commit(); err != nil {
-		return nil, fmt.Errorf("%s: commit slot: %w", bucketID(b), err)
+		return nil, fmt.Errorf("%s: %w", source.QualifiedName(manifest.KindBucket, b.Namespace, b.Name), err)
 	}
 
 	return &store.SourceArtifact{
-		Kind:      manifest.KindBucket,
-		URL:       fmt.Sprintf("%s://%s/%s", schemeFor(secure), endpoint, b.BucketName),
-		LocalPath: slot.Path,
-		Revision:  revHash,
+		Kind:     manifest.KindBucket,
+		URL:      fmt.Sprintf("%s://%s/%s", schemeFor(secure), endpoint, b.BucketName),
+		FS:       input,
+		Key:      id,
+		Revision: desc.Annotations["flate.revision"],
 		Metadata: map[string]string{
-			"objectCount": strconv.Itoa(objectCount),
+			"objectCount": desc.Annotations["flate.object-count"],
 		},
 	}, nil
 }
 
-// newMinioClient resolves credentials, endpoint, and TLS/proxy transport for b
-// and constructs the minio client. Returns the resolved endpoint + secure flag
-// too, since the slot key and artifact URL both need them.
-func (f *Fetcher) newMinioClient(b *manifest.Bucket) (client *minio.Client, endpoint string, secure bool, err error) {
+func (f *operation) newMinioClient(b *manifest.Bucket) (*minio.Client, any, error) {
 	creds, err := f.resolveCredentials(b)
 	if err != nil {
-		return nil, "", false, err
+		return nil, nil, err
 	}
-	endpoint, secure, err = normalizeEndpoint(b.Endpoint, b.Insecure)
+	endpoint, secure, err := normalizeEndpoint(b.Endpoint, b.Insecure)
 	if err != nil {
-		return nil, "", false, err
+		return nil, nil, err
 	}
-	transport, err := f.resolveTransport(b)
-	if err != nil {
-		return nil, "", false, err
-	}
-	client, err = minio.New(endpoint, &minio.Options{
-		Creds:     creds,
-		Secure:    secure,
-		Region:    b.Region,
-		Transport: transport,
+	owner := b.Named()
+	owner.Name = b.Namespace + "/" + b.Name
+	resolved, err := source.ResolveTransport(f.secrets, owner, []source.TransportInput{
+		{Reference: b.ProxySecretRef, Use: source.TransportProxy},
+		{Reference: b.CertSecretRef, Use: source.TransportCert},
 	})
 	if err != nil {
-		return nil, "", false, fmt.Errorf("%s: minio client: %w", bucketID(b), err)
+		return nil, nil, err
 	}
-	return client, endpoint, secure, nil
-}
-
-// bucketID is the "Bucket <namespace>/<name>" error prefix, via the shared
-// source.QualifiedName so every fetcher formats kind/ns/name identically.
-func bucketID(b *manifest.Bucket) string {
-	return source.QualifiedName("Bucket", b.Namespace, b.Name)
-}
-
-// authIdentity returns the cache-key auth tag for a Bucket. Combines
-// SecretRef (S3 access creds), CertSecretRef (TLS), and
-// ProxySecretRef. Returns "" when all are unset.
-func authIdentity(b *manifest.Bucket) string {
-	return source.AuthIdentityFromRefs(b.Namespace,
-		b.SecretRef, b.CertSecretRef, b.ProxySecretRef)
+	if _, err := resolved.ProxyURL(&url.URL{Scheme: schemeFor(secure), Host: endpoint}); err != nil {
+		return nil, nil, fmt.Errorf("%w: resolve bucket proxy: invalid proxy configuration", manifest.ErrInput)
+	}
+	value, _ := creds.GetWithContext(nil)
+	var credentials any
+	if value.AccessKeyID != "" || value.SecretAccessKey != "" {
+		credentials = value
+	}
+	material := resolved.Identity(credentials)
+	tr, err := f.Network.HTTPTransport(source.HTTPTransportConfig{Material: resolved, Credentials: credentials})
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := minio.New(endpoint, &minio.Options{
+		MaxRetries: 1,
+		Creds:      creds,
+		Secure:     secure,
+		Region:     b.Region,
+		Transport:  tr,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: minio client: %w", source.QualifiedName(manifest.KindBucket, b.Namespace, b.Name), err)
+	}
+	return client, material, nil
 }

@@ -7,13 +7,14 @@ import (
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// Example shows the SDK wiring an external consumer uses to turn two
-// renders into a structured diff: orchestrator.Result.Manifests →
-// DocsFromManifests → Changes. (Here the two manifest maps are hand-built
-// for a self-contained example; in practice they're baseRes.Manifests and
-// headRes.Manifests from two orchestrator.Render calls.)
+// Example compares explicitly attributed documents and retains chart metadata
+// even when normalization strips the chart label from the compared manifests.
 func Example() {
-	parent := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "media", Name: "sonarr"}
+	parentID := manifest.NamedResource{
+		Group: manifest.HelmReleaseDomain, Kind: manifest.KindHelmRelease,
+		Namespace: "media", Name: "sonarr",
+	}
+	parent := diff.Parent{NamedResource: parentID}
 	deployment := func(chartVer, image string) map[string]any {
 		return map[string]any{
 			"apiVersion": "apps/v1", "kind": "Deployment",
@@ -28,12 +29,11 @@ func Example() {
 			},
 		}
 	}
-	base := map[manifest.NamedResource][]map[string]any{parent: {deployment("4.0.0", "ghcr.io/home-operations/sonarr:4.0.0")}}
-	head := map[manifest.NamedResource][]map[string]any{parent: {deployment("4.1.0", "ghcr.io/home-operations/sonarr:4.1.0")}}
+	base := []diff.Doc{{Parent: parent, Manifest: deployment("4.0.0", "ghcr.io/home-operations/sonarr:4.0.0")}}
+	head := []diff.Doc{{Parent: parent, Manifest: deployment("4.1.0", "ghcr.io/home-operations/sonarr:4.1.0")}}
 
-	changes := diff.Changes(
-		diff.DocsFromManifests(base, nil),
-		diff.DocsFromManifests(head, nil),
+	changes, _ := diff.Changes(
+		base, head,
 		diff.Options{StripAttrs: diff.DefaultStripAttrs, StripFields: diff.DefaultStripFields},
 	)
 

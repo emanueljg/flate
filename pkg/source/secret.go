@@ -1,10 +1,12 @@
 package source
 
 import (
-	"encoding/base64"
+	"context"
 	"fmt"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/store"
+	"github.com/home-operations/flate/pkg/values"
 )
 
 // MissingSecretError reports that a source's auth SecretRef couldn't be
@@ -21,11 +23,16 @@ type MissingSecretError struct {
 	Secret manifest.NamedResource
 	// Detail is the human reason ("not found", "missing username/password").
 	Detail string
+	// RegistryConfig is the global credential path for an eligible retry;
+	// empty selects Docker's default config.
+	RegistryConfig string
+	// RetryWithRegistryConfig retries using global credentials or reports a
+	// config error. Nil means no matching credential. Call only after rendered
+	// Secrets are exhausted.
+	RetryWithRegistryConfig func(context.Context, string) (*store.SourceArtifact, error)
 }
 
-// Error renders the same string the previous fmt.Errorf form produced, so the
-// skip reason surfaced via base.go (SkippedPrefix + TrimSentinelPrefix) is
-// byte-identical to before.
+// Error identifies the source and its unavailable Secret material.
 func (e *MissingSecretError) Error() string {
 	return fmt.Sprintf("%s: %s %s/%s: secret %s/%s %s",
 		manifest.ErrMissingSecret, e.Owner.Kind, e.Owner.Namespace, e.Owner.Name,
@@ -35,82 +42,55 @@ func (e *MissingSecretError) Error() string {
 // Unwrap keeps errors.Is(err, manifest.ErrMissingSecret) working.
 func (e *MissingSecretError) Unwrap() error { return manifest.ErrMissingSecret }
 
-// MissingSecretErr builds a *MissingSecretError. The signature is unchanged
-// from the prior string-only form so every call site compiles untouched. The
-// owner and secret share the namespace ns (a SecretRef is same-namespace).
-func MissingSecretErr(kind, ns, name, secretRef, reason string) error {
+// MissingSecretErr builds a *MissingSecretError for a source-group owner.
+func MissingSecretErr(owner manifest.NamedResource, secretRef, reason string) error {
+	owner.Group = manifest.SourceDomain
 	return &MissingSecretError{
-		Owner:  manifest.NamedResource{Kind: kind, Namespace: ns, Name: name},
-		Secret: manifest.NamedResource{Kind: manifest.KindSecret, Namespace: ns, Name: secretRef},
+		Owner:  owner,
+		Secret: manifest.NamedResource{Kind: manifest.KindSecret, Namespace: owner.Namespace, Name: secretRef},
 		Detail: reason,
 	}
 }
 
-// resolveSecretRef fetches the Secret a set *SecretRef points at, shared
-// by ResolveProxy and ResolveCertSecret. field names the spec field
-// (e.g. "proxySecretRef") for diagnostics. Callers handle the nil-ref
-// "not configured" case before calling; once ref is set, an unwired
-// SecretGetter or a missing Secret is a loud error matching
-// source-controller's fail-loud behavior.
-func resolveSecretRef(secrets SecretGetter, ns, ownerKind, ownerID, field string, ref *manifest.LocalObjectReference) (*manifest.Secret, error) {
+// An unwired getter is configuration failure; missing material retains the
+// source and Secret identities for the existing whole-source skip policy.
+func resolveSecretRef(secrets SecretGetter, owner manifest.NamedResource, field string, ref *manifest.LocalObjectReference) (*manifest.Secret, error) {
 	if secrets == nil {
 		return nil, fmt.Errorf("%s %s references %s but no source.SecretGetter is wired",
-			ownerKind, ownerID, field)
+			owner.Kind, owner.Name, field)
 	}
-	sec := secrets(ns, ref.Name)
+	sec := secrets(owner.Namespace, ref.Name)
 	if sec == nil {
-		return nil, MissingSecretErr(ownerKind, ns, ownerID, ref.Name, "not found")
+		return nil, MissingSecretErr(owner, ref.Name, "not found")
 	}
 	return sec, nil
 }
 
-// StringFromSecret reads a key from a Secret, preferring StringData
-// over Data. Data values are base64-decoded (per k8s Secret semantics)
-// before being returned, so the same string surface holds regardless
-// of whether the source manifest used `data:` or `stringData:`.
-// PLACEHOLDER_-wiped values (the result of flate's secret wiping
-// pre-processing) are reported as empty so callers surface a clear
-// "missing keys" error rather than authenticating with the literal
-// placeholder.
-//
-// Used by per-kind Fetchers (git, oci, bucket) to resolve auth + TLS
-// material from the Secret a SecretRef points at.
-func StringFromSecret(sec *manifest.Secret, key string) string {
-	if v, ok := sec.StringData[key].(string); ok {
-		if manifest.IsValuePlaceholder(v) {
-			return ""
-		}
-		return v
+// BasicAuthFromSecret rejects malformed credentials and reports absent or wiped
+// credentials through MissingSecretError.
+func BasicAuthFromSecret(sec *manifest.Secret, owner manifest.NamedResource, secretRef string) (username, password string, err error) {
+	username, _, err = sec.Value("username")
+	if err != nil {
+		return "", "", fmt.Errorf("%s: secret %s/%s: %w", QualifiedName(owner.Kind, owner.Namespace, owner.Name), owner.Namespace, secretRef, err)
 	}
-	if v, ok := sec.Data[key].(string); ok {
-		// `data:` is base64-encoded YAML-side; decode so the returned
-		// value is the actual material (PEM block, dockerconfigjson,
-		// password, …) rather than its base64 envelope. Real k8s
-		// Secrets that ship a `cosign.pub` or `tls.crt` use this form.
-		decoded, err := base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			return ""
-		}
-		s := string(decoded)
-		if manifest.IsValuePlaceholder(s) {
-			return ""
-		}
-		return s
+	password, _, err = sec.Value("password")
+	if err != nil {
+		return "", "", fmt.Errorf("%s: secret %s/%s: %w", QualifiedName(owner.Kind, owner.Namespace, owner.Name), owner.Namespace, secretRef, err)
 	}
-	return ""
-}
-
-// BasicAuthFromSecret extracts the username/password pair every HTTP-auth
-// fetcher reads from a Secret (git HTTPS, HelmRepository). It returns a uniform
-// MissingSecretErr when either field is absent or PLACEHOLDER-wiped — empty
-// covers both the missing-key and ExternalSecret-stub cases, so a caller's
-// --allow-missing-secrets gate (errors.Is ErrMissingSecret) treats them
-// alike. ownerKind/ns/name/secretRef only shape that error message.
-func BasicAuthFromSecret(sec *manifest.Secret, ownerKind, ns, name, secretRef string) (username, password string, err error) {
-	username = StringFromSecret(sec, "username")
-	password = StringFromSecret(sec, "password")
-	if username == "" || password == "" {
-		return "", "", MissingSecretErr(ownerKind, ns, name, secretRef, "missing username/password")
+	if username == "" || password == "" || manifest.HasValuePlaceholder(username) || manifest.HasValuePlaceholder(password) {
+		return "", "", MissingSecretErr(owner, secretRef, "missing username/password")
 	}
 	return username, password, nil
+}
+
+// SecretLookup binds credential reads to one execution's captured inputs.
+func SecretLookup(reads *store.ReadSet) SecretGetter {
+	if reads == nil {
+		return nil
+	}
+	provider := values.NewStoreProvider(reads, true, nil)
+	return func(namespace, name string) *manifest.Secret {
+		secret, _ := provider.Data(manifest.NamedResource{Kind: manifest.KindSecret, Namespace: namespace, Name: name}).(*manifest.Secret)
+		return secret
+	}
 }

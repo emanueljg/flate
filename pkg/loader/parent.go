@@ -1,222 +1,180 @@
 package loader
 
 import (
+	"io/fs"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
+
+	"github.com/home-operations/flate/internal/kustomizeinput"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/safepath"
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// NormalizePrefix turns a Kustomization spec.path into a slash-
-// terminated repo-relative prefix suitable for HasPrefix matching.
-// Applies filepath.ToSlash first so Windows-style spec.path values
-// (rare, but possible since the Flux CRD doesn't constrain it)
-// normalize to the same shape as loader.SourceFiles entries.
-func NormalizePrefix(p string) string {
-	return manifest.NormalizeClaimBase(p) + "/"
+// Claims builds final-store claims for reporting, including external sources
+// and committed source coordinates. Discovery MUST use Loader.Claims instead.
+func Claims(s *store.Store, repoRoot string) []manifest.KSClaim {
+	reader := documentReader{cache: map[string]document{}}
+	reader.mountSources(s)
+	return buildClaims(s, repoRoot, reader, s.ListAs[*manifest.Kustomization](manifest.FluxKustomizeDomain, manifest.KindKustomization))
 }
 
-// KSPathPrefix pairs a Kustomization id with one of its
-// slash-terminated, repo-relative claimed-path prefixes. A KS may
-// produce multiple prefixes — one for spec.path plus one per
-// spec.components entry, plus any on-disk `components:` referenced
-// from the kustomization.yaml living at spec.path. Sharing the same
-// ID across multiple prefixes is intentional: parent-index lookup
-// returns the longest-matching entry, and a child file inside a
-// component directory is correctly attributed to the parent that
-// includes that component.
-type KSPathPrefix struct {
-	ID     manifest.NamedResource
-	Prefix string
+// Claims reuses discovery's source-view documents while the Loader is mutable.
+func (l *Loader) Claims(repoRoot string) []manifest.KSClaim {
+	l.mountSources()
+	var kss []*manifest.Kustomization
+	for _, child := range l.eligibleKustomizations(l.admit(repoRoot)) {
+		ks := child.Obj.(*manifest.Kustomization)
+		if _, _, external := SourceView(l.Store, ks.SourceID(), repoRoot); !external {
+			kss = append(kss, ks)
+		}
+	}
+	return buildClaims(l.Store, repoRoot, l.documents, kss)
 }
 
-// ExternalSourcedKSIDs returns the ids of Kustomizations whose sourceRef points
-// at a genuine EXTERNAL source rather than the working tree, so callers can keep
-// their spec.path from being resolved against the local checkout.
-//
-// flate renders the local tree. A KS sourced from the bootstrap/self source (or
-// a bare sourceRef, which anchors on the seeded BootstrapSourceID) renders that
-// local tree, so its spec.path legitimately claims local prefixes. But a KS
-// sourced from an in-tree GitRepository/OCIRepository CR that was NOT aliased to
-// the working tree — a private side-repo synced into the cluster, e.g.
-// `shelly-fleet` (ssh://…/shelly-fleet.git) with `path: ./kubernetes` — renders
-// THAT repo's tree, which flate can't see. Letting such a KS claim local
-// prefixes makes it the false structural parent/producer of everything beneath a
-// wide spec.path like ./kubernetes, so when its source soft-skips (missing auth
-// Secret) the skip cascades to the entire cluster (179 passed / 209 blocked on
-// lunevans/talos-cluster, issue #752).
-//
-// A source is "local" — excluded from the result — when: the sourceRef is bare
-// (→ BootstrapSourceID), the id IS BootstrapSourceID, the source carries a
-// working-tree artifact (aliased by discovery, LocalPath == repoRoot), or no
-// source object exists yet (a missing sourceRef that bootstrap aliasing
-// resolves). Only an in-tree, non-bootstrap, non-aliased source CR is external.
-func ExternalSourcedKSIDs(s *store.Store, repoRoot string) map[manifest.NamedResource]struct{} {
-	out := map[manifest.NamedResource]struct{}{}
-	for _, ks := range s.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
-		if ks.Path == "" || ks.SourceName == "" {
+func buildClaims(s *store.Store, repoRoot string, documents documentReader, kss []*manifest.Kustomization) []manifest.KSClaim {
+	var qualified []*manifest.Kustomization
+	var components map[manifest.NamedResource][]string
+	for i, ks := range kss {
+		root, _, external := SourceView(s, ks.SourceID(), repoRoot)
+		if external {
 			continue
 		}
-		src := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
-		if src == manifest.BootstrapSourceID {
-			continue
+		base := documents.claimBase(root, ks.Path)
+		if base != manifest.NormalizeClaimBase(ks.Path) {
+			c := *ks
+			c.Path = base
+			if c.Path == "" {
+				c.Path = "."
+			}
+			ks = &c
+			kss[i] = ks
 		}
-		if art, ok := s.GetArtifact(src).(*store.SourceArtifact); ok && art.LocalPath == repoRoot {
-			continue
+		if root != "" && root != repoRoot {
+			qualified = append(qualified, ks)
+			if origin := documents.localBase(root, repoRoot); origin != "." {
+				c := *ks
+				c.Path = filepath.ToSlash(filepath.Join(origin, base))
+				kss[i] = &c
+			}
 		}
-		if s.GetObject(src) == nil {
-			continue
+		if root != "" {
+			var refs []string
+			spec, _ := documents.read(filepath.Join(root, base))
+			for ref := range kustomizeinput.Kustomization(spec) {
+				if ref.Role == kustomizeinput.Component {
+					refs = append(refs, ref.Path)
+				}
+			}
+			if len(refs) != 0 {
+				if components == nil {
+					components = map[manifest.NamedResource][]string{}
+				}
+				components[ks.Named()] = refs
+			}
 		}
-		out[ks.Named()] = struct{}{}
 	}
-	return out
+	claims := manifest.BuildKSClaims(kss, components)
+	for _, ks := range qualified {
+		root, _, _ := SourceView(s, ks.SourceID(), repoRoot)
+		base, err := filepath.Rel(repoRoot, root)
+		if err != nil {
+			continue
+		}
+		for _, c := range manifest.BuildKSClaims([]*manifest.Kustomization{ks}, components) {
+			claims = append(claims, manifest.KSClaim{ID: c.ID, Prefix: filepath.ToSlash(filepath.Join(base, c.Prefix)) + "/"})
+		}
+	}
+	if len(qualified) != 0 {
+		slices.SortStableFunc(claims, func(a, b manifest.KSClaim) int { return len(b.Prefix) - len(a.Prefix) })
+	}
+	return claims
 }
 
-// KSPathPrefixesLocalOnly is KSPathPrefixesWithCache with external-sourced
-// Kustomizations' claims dropped (see ExternalSourcedKSIDs). Use this for the
-// parent index, orphan promotion, and any other local-tree path attribution so
-// an external-sourced KS never becomes the structural parent of local resources.
-func KSPathPrefixesLocalOnly(s *store.Store, repoRoot string, cache *manifest.ComponentCache) []KSPathPrefix {
-	all := KSPathPrefixesWithCache(s, repoRoot, cache)
-	external := ExternalSourcedKSIDs(s, repoRoot)
-	if len(external) == 0 {
-		return all
+// Failed resolution retains the lexical claim; reconciliation reports path errors.
+func (r documentReader) claimBase(root, p string) string {
+	base := manifest.NormalizeClaimBase(p)
+	if root == "" || !strings.Contains(base, "/../") && !strings.HasSuffix(base, "/..") {
+		return base
 	}
-	out := make([]KSPathPrefix, 0, len(all))
-	for _, p := range all {
-		if _, skip := external[p.ID]; !skip {
-			out = append(out, p)
-		}
+	resolved, err := securejoin.SecureJoinVFS(root, base, r)
+	if err != nil {
+		return base
 	}
-	return out
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return base
+	}
+	return manifest.NormalizeClaimBase(rel)
 }
 
-// KSPathPrefixesWithCache returns one or more entries per loaded
-// Kustomization with a non-empty spec.path. Each KS contributes:
-//
-//  1. Its spec.path (always).
-//  2. Each spec.components entry (when present, resolved against
-//     spec.path).
-//  3. Each entry from `components:` declared in the kustomization.yaml
-//     at spec.path (when readable from repoRoot; missing or
-//     malformed files are silently skipped — pure best-effort, the
-//     spec.path entry is enough to keep the index sound).
-//
-// Entries are sorted by prefix length descending so the first
-// HasPrefix match on a given file is the deepest claimant — a child
-// file under a parent's component dir wins over the parent's
-// spec.path. Emitting (2)+(3) keeps loader's parent index in line with
-// change/ownership's attribution, eliminating the false-orphan class
-// where a child KS lives inside a parent's component subtree.
-//
-// repoRoot is the filesystem root the kustomization-file reads
-// resolve relative to. Pass "" to skip on-disk component lookup
-// entirely (only spec.path + spec.components are recorded).
-//
-// A shared component cache is threaded in via cache. The orchestrator
-// instantiates one cache per Bootstrap and passes it to every consumer
-// (discovery's orphan promotion, the orchestrator's finalize detectOrphans,
-// change.buildOwnership) so the
-// kustomization.yaml at each spec.path is read once per Bootstrap
-// instead of once per consumer. Pass nil to fall back to a per-call
-// cache so a single call doesn't re-read the same kustomization.yaml
-// across KSes that share a spec.path.
-func KSPathPrefixesWithCache(s *store.Store, repoRoot string, cache *manifest.ComponentCache) []KSPathPrefix {
-	// Thin adapter over the canonical builder in pkg/manifest — the claim
-	// construction (spec.path + spec.components + on-disk components:, the
-	// reject/clean resolver, longest-first sort) is single-sourced there so
-	// it can't drift from change.buildOwnership. This side keeps only the
-	// KSPathPrefix shape and the LongestParent lookup semantics.
-	claims := manifest.BuildKSClaims(s.ListAs[*manifest.Kustomization](manifest.KindKustomization), repoRoot, cache)
-	out := make([]KSPathPrefix, len(claims))
-	for i, c := range claims {
-		out[i] = KSPathPrefix{ID: c.ID, Prefix: c.Prefix}
-	}
-	return out
+// Lstat keeps SecureJoin inside the mounted source filesystem.
+func (r documentReader) Lstat(file string) (fs.FileInfo, error) {
+	input, name := r.input(filepath.Clean(file))
+	return fs.Lstat(input, name)
 }
 
-// LongestParent returns the deepest KS whose spec.path covers file
-// (slash-normalized repo-relative path), excluding self. The second
-// return reports whether a parent was found. prefixes is expected to
-// be the sorted output of KSPathPrefixesWithCache.
-func LongestParent(prefixes []KSPathPrefix, file string, self manifest.NamedResource) (manifest.NamedResource, bool) {
-	// A nil selfPrefixes set skips no candidate as a peer, which is exactly
-	// "deepest ancestor excluding self" — see longestStrictParent.
-	return longestStrictParent(prefixes, file, self, nil)
+// Readlink uses the same mounted source view as Lstat.
+func (r documentReader) Readlink(file string) (string, error) {
+	input, name := r.input(filepath.Clean(file))
+	return fs.ReadLink(input, name)
 }
 
-// longestStrictParent is LongestParent restricted to a *strict*
-// ancestor: besides skipping self, it skips any candidate whose prefix
-// the child itself claims (selfPrefixes). Two Kustomizations pointing
-// at the same spec.path directory each claim that directory, so each
-// would otherwise match the other as a parent — a mutual edge that
-// becomes a depwait deadlock in collectDeps (both wait on the other to
-// reach Ready, then both time out). Peers sharing a directory don't
-// render each other, so neither is the other's parent. selfPrefixes is
-// the set of prefixes the child contributes to KSPathPrefixesWithCache; nil/empty
-// (e.g. a HelmRelease child, which contributes none) reduces to
-// LongestParent.
-func longestStrictParent(prefixes []KSPathPrefix, file string, self manifest.NamedResource, selfPrefixes map[string]struct{}) (manifest.NamedResource, bool) {
-	slashFile := filepath.ToSlash(file)
-	for _, p := range prefixes {
-		if p.ID == self {
-			continue
-		}
-		if _, claimed := selfPrefixes[p.Prefix]; claimed {
-			continue
-		}
-		if strings.HasPrefix(slashFile, p.Prefix) {
-			return p.ID, true
-		}
-	}
-	return manifest.NamedResource{}, false
+type sourceStore interface {
+	GetObject(manifest.NamedResource) manifest.BaseManifest
+	GetArtifact(manifest.NamedResource) store.Artifact
 }
 
-// BuildParentIndexFromPrefixes maps each childKind resource to its enclosing
-// Flux Kustomization — the KS whose spec.path or component directory is the
-// deepest strict ancestor of the child's source file. Excludes self-matches.
-// The KS path-prefix list is passed in precomputed: discovery.Run derives the
-// prefixes once (an O(KS) walk + sort + component reads) and reuses them for
-// the KS-parent index, the HR-parent index, AND orphan promotion — three
-// consumers that previously each rebuilt the identical list.
-//
-// Real Flux's reconcile chain enforces this parent→child ordering naturally: a
-// parent Kustomization renders and applies its children, then the downstream
-// controller reconciles each. flate's controllers fire on AddObject and would
-// otherwise race the parent's render — the child controllers use this index to
-// gate reconcile on the parent's Ready, so parent-render-time spec mutations
-// (`replacements:` injecting spec.targetNamespace, `patches:` rewriting
-// HelmRelease driftDetection) are visible to the child's first reconcile.
-//
-// sourceFiles is the orchestrator's NamedResource → repo-relative source-file
-// map; entries without a recorded file are skipped. childKind=KindKustomization
-// for the KS→KS parent map; pass KindHelmRelease for the HR→KS map.
-func BuildParentIndexFromPrefixes(prefixes []KSPathPrefix, s *store.Store, sourceFiles map[manifest.NamedResource]string, childKind string) map[manifest.NamedResource]manifest.NamedResource {
-	// Group each id's own claimed prefixes so a peer KS claiming the same
-	// spec.path directory isn't mistaken for an enclosing parent (which
-	// would mutually deadlock the pair through collectDeps). Children
-	// that contribute no prefixes (HelmReleases) get an empty set, so
-	// their attribution is unchanged.
-	ownPrefixes := make(map[manifest.NamedResource]map[string]struct{})
-	for _, p := range prefixes {
-		set := ownPrefixes[p.ID]
-		if set == nil {
-			set = make(map[string]struct{})
-			ownPrefixes[p.ID] = set
-		}
-		set[p.Prefix] = struct{}{}
+// SourceView classifies an admitted source coordinate, committed pin and external ownership.
+// Unavailable sources MUST NOT borrow bootstrap bytes or claim unrelated working-tree files.
+func SourceView(s sourceStore, ref manifest.NamedResource, repoRoot string) (root string, pinned, external bool) {
+	if ref.Name == "" || ref == manifest.BootstrapSourceID {
+		return repoRoot, false, false
 	}
-	out := map[manifest.NamedResource]manifest.NamedResource{}
-	for _, obj := range s.ListObjects(childKind) {
-		id := obj.Named()
-		file, ok := sourceFiles[id]
-		if !ok {
-			continue
+	if art, ok := s.GetArtifact(ref).(*store.SourceArtifact); ok && art.FS != nil {
+		if art.LocalPath == repoRoot {
+			return repoRoot, false, false
 		}
-		if parent, ok := longestStrictParent(prefixes, file, id, ownPrefixes[id]); ok {
-			out[id] = parent
+		if art.LocalRoot != "" && (art.LocalRoot == repoRoot || art.InputAlias && safepath.Contains(repoRoot, art.LocalRoot)) {
+			// Derived input keys pin selected bootstrap bytes, never authored refs.
+			return art.LocalPath, art.Key != "" && !art.InputAlias, false
 		}
 	}
-	return out
+	if s.GetObject(ref) != nil {
+		return repoRoot, false, true
+	}
+	obj, _ := ref.DecodeIdentity()
+	_, entry := obj.(interface {
+		BootstrapAlias(string) (manifest.BaseManifest, *manifest.GitRepository)
+	})
+	return repoRoot, false, entry
+}
+
+// Input aliases map source-relative readers and claims to their physical origin.
+func (r documentReader) localBase(root, repoRoot string) string {
+	if origin := OriginPath(r.artifacts[root], root); origin != root {
+		base, _ := filepath.Rel(repoRoot, origin)
+		return filepath.ToSlash(base)
+	}
+	return "."
+}
+
+func (r documentReader) localPath(file string) string {
+	return OriginPath(r.artifacts[r.mountedRoot(file)], file)
+}
+
+// OriginPath projects mutable inputs and aliases onto their physical input origin.
+// file MUST be within the admitted artifact's LocalPath.
+func OriginPath(art *store.SourceArtifact, file string) string {
+	if art != nil && art.LocalRoot != "" && (art.InputAlias || art.Key == "") {
+		if art.LocalRoot == art.LocalPath {
+			return filepath.Clean(file)
+		}
+		rel, _ := filepath.Rel(art.LocalPath, file)
+		return filepath.Join(art.LocalRoot, rel)
+	}
+	return file
 }

@@ -3,10 +3,8 @@
 //
 // The types here mirror the Flux CRDs (GitRepository, OCIRepository,
 // HelmRepository, HelmRelease, Kustomization, ...) together with the
-// supporting Kubernetes core kinds (ConfigMap, Secret). Each resource type
-// can be decoded from raw YAML (the form Flux stores in a repo) via its
-// ParseDoc-equivalent constructor, and re-encoded to a canonical YAML
-// representation for export.
+// supporting Kubernetes core kinds (ConfigMap, Secret). ParseDoc decodes
+// raw YAML documents into these types for canonical YAML export.
 //
 // flate renders the user's own repo offline, not a live cluster, so Secret
 // values pass through verbatim — plaintext, public keys, certs, binary data.
@@ -18,14 +16,14 @@
 //
 // # Shadow fields
 //
-// HelmRelease and Kustomization embed the upstream Flux Spec struct and
-// also expose projected top-level fields (Values, DependsOn, Chart,
-// Path, SourceKind, ...) that mirror commonly-read pieces of that
-// nested spec. Reads should use the projected fields; the embedded
-// Spec is retained for round-tripping unknown fields back out via
-// pkg/manifest's encoders. Writing to the embedded Spec.* after parse
-// is a bug — the projections are populated once during ParseDoc and
-// later reads will diverge.
+// HelmRelease and Kustomization embed the upstream Flux Spec struct.
+// Values and Chart project fields whose decoded shapes differ.
+// Dependency and source identities come from References over the authored spec.
+// Embedded specs MUST remain immutable after parse so projections cannot diverge.
+//
+// References expose borrowed source files and authored chart paths. Discovery
+// expands these reads into exact DiscoveryRecord.Inputs without render ownership;
+// DiscoveryIndex.Readers contains only Kustomize graph ownership evidence.
 //
 // # Mutation contract
 //

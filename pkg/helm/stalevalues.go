@@ -1,6 +1,7 @@
 package helm
 
 import (
+	"bytes"
 	"context"
 	"slices"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
+
+const valuesToken = ".Values"
 
 // StaleValuePaths returns the top-level release-value keys a HelmRelease supplies
 // that NO chart template references — the #744 signal that an override has gone
@@ -36,31 +39,39 @@ import (
 // Schema-independent and advisory only: fail-open (nil) on a load error or a
 // chart with no templates. The controller surfaces the result as a
 // manifest.Warning; this function never logs or fails a render.
-func (c *Client) StaleValuePaths(ctx context.Context, hr *manifest.HelmRelease, values map[string]any) []string {
+func (c *Client) StaleValuePaths(ctx context.Context, hr *manifest.HelmRelease, values map[string]any, sources Sources) []string {
 	if len(values) == 0 {
 		return nil
 	}
-	loaded, err := c.LoadChart(ctx, hr)
-	if err != nil || loaded.Chart == nil {
+	loaded, err := c.describeChart(ctx, hr, sources)
+	if err == nil && loaded.analysis == nil {
+		err = c.decodeChart(ctx, &loaded)
+	}
+	if err != nil {
 		return nil
 	}
-	return unreferencedValuePaths(chartTemplateText(loaded.Chart), values, knownTopLevelKeys(loaded.Chart))
+	return loaded.analyze().unreferencedValuePaths(values)
 }
 
-// unreferencedValuePaths returns the sorted top-level value keys absent from the
-// template source, skipping the always-used allowlist. It is pure and fail-open:
-// empty source or any opaque whole-.Values access yields nil (never a misleading
-// warning).
-func unreferencedValuePaths(src string, values map[string]any, allow map[string]struct{}) []string {
-	if src == "" || opaqueValuesAccess(src) {
+func requiresChartLoader(ch *chart.Chart) bool {
+	for _, file := range ch.Raw {
+		if file != nil && (file.Name == "requirements.yaml" || file.Name == "requirements.lock") {
+			return true
+		}
+	}
+	return slices.ContainsFunc(ch.Dependencies(), requiresChartLoader)
+}
+
+func (a *chartAnalysis) unreferencedValuePaths(values map[string]any) []string {
+	if a.Templates == "" {
 		return nil
 	}
 	var out []string
 	for k := range values {
-		if _, ok := allow[k]; ok {
+		if _, ok := a.Allowed[k]; ok {
 			continue
 		}
-		if !valuesKeyReferenced(src, k) {
+		if !valuesKeyReferenced(a.Templates, k) {
 			out = append(out, k)
 		}
 	}
@@ -68,16 +79,14 @@ func unreferencedValuePaths(src string, values map[string]any, allow map[string]
 	return out
 }
 
-// knownTopLevelKeys are release top-level keys always treated as used,
-// regardless of the parent chart's templates: Helm's shared "global" key,
-// every declared dependency's name/alias (values addressed to a subchart nest
-// under these and are consumed by the subchart, not the parent), and every key
-// gating a dependency (see addDependencyGateKeys).
+// Nested conditions resolve under their parent dependency's name; tags share
+// the root values table at every depth.
 func knownTopLevelKeys(ch *chart.Chart) map[string]struct{} {
 	allow := map[string]struct{}{"global": {}}
 	if ch == nil {
 		return allow
 	}
+	var hasTags bool
 	if ch.Metadata != nil {
 		for _, d := range ch.Metadata.Dependencies {
 			if d == nil {
@@ -89,46 +98,24 @@ func knownTopLevelKeys(ch *chart.Chart) map[string]struct{} {
 			if d.Alias != "" {
 				allow[d.Alias] = struct{}{}
 			}
+			for cond := range strings.SplitSeq(d.Condition, ",") {
+				if top, _, _ := strings.Cut(strings.TrimSpace(cond), "."); top != "" {
+					allow[top] = struct{}{}
+				}
+			}
+			hasTags = hasTags || len(d.Tags) > 0
 		}
 	}
 	for _, sub := range ch.Dependencies() {
 		if n := sub.Name(); n != "" {
 			allow[n] = struct{}{}
 		}
+		hasTags = hasTags || anyDependencyTags(sub)
 	}
-	addDependencyGateKeys(ch, allow)
-	return allow
-}
-
-// addDependencyGateKeys allowlists the keys Helm's dependency evaluation
-// consumes from the release's top-level values: the top-level segment of each
-// root-chart dependencies[].condition path (a comma-separated list of dotted
-// paths), and the shared "tags" block when any dependency in the tree declares
-// tags (#930). Only the root chart's conditions are harvested — Helm prefixes a
-// nested chart's condition with its parent path, so those resolve under the
-// dependency's name, which is already allowlisted; flattening them here would
-// suppress a valid warning for an unrelated root key of the same name. Tag
-// evaluation reads the unprefixed top-level "tags" table at every depth, so the
-// whole tree is walked for tags.
-func addDependencyGateKeys(ch *chart.Chart, allow map[string]struct{}) {
-	if ch == nil {
-		return
-	}
-	if ch.Metadata != nil {
-		for _, d := range ch.Metadata.Dependencies {
-			if d == nil {
-				continue
-			}
-			for cond := range strings.SplitSeq(d.Condition, ",") {
-				if top, _, _ := strings.Cut(strings.TrimSpace(cond), "."); top != "" {
-					allow[top] = struct{}{}
-				}
-			}
-		}
-	}
-	if anyDependencyTags(ch) {
+	if hasTags {
 		allow["tags"] = struct{}{}
 	}
+	return allow
 }
 
 // anyDependencyTags reports whether any dependency in ch's tree declares tags.
@@ -146,28 +133,33 @@ func anyDependencyTags(ch *chart.Chart) bool {
 	return slices.ContainsFunc(ch.Dependencies(), anyDependencyTags)
 }
 
-// chartTemplateText concatenates every template (including _helpers.tpl and
-// NOTES.txt) of ch and its subcharts. Subchart templates are included because a
-// parent that passes context to a common/library chart has its values consumed
-// there — so a `.Values.<key>` reference anywhere in the tree counts.
+// Opaque .Values access suppresses every warning, so its source MUST not be retained.
 func chartTemplateText(ch *chart.Chart) string {
 	var b strings.Builder
-	var add func(*chart.Chart)
-	add = func(c *chart.Chart) {
+	var add func(*chart.Chart) bool
+	add = func(c *chart.Chart) bool {
 		if c == nil {
-			return
+			return true
 		}
 		for _, f := range c.Templates {
 			if f != nil {
+				if opaqueValuesAccess(f.Data) {
+					return false
+				}
 				b.Write(f.Data)
 				b.WriteByte('\n')
 			}
 		}
 		for _, sub := range c.Dependencies() {
-			add(sub)
+			if !add(sub) {
+				return false
+			}
 		}
+		return true
 	}
-	add(ch)
+	if !add(ch) {
+		return ""
+	}
 	return b.String()
 }
 
@@ -181,14 +173,13 @@ func chartTemplateText(ch *chart.Chart) string {
 // The test is structural: every `.Values` token whose next non-space byte is
 // neither `.` (a field selector, .Values.foo) nor `"` (a literal index,
 // `.Values "foo"` / `index .Values "foo"`) accesses the map as a whole.
-func opaqueValuesAccess(src string) bool {
-	const tok = ".Values"
+func opaqueValuesAccess(src []byte) bool {
 	for i := 0; ; {
-		j := strings.Index(src[i:], tok)
+		j := bytes.Index(src[i:], []byte(valuesToken))
 		if j < 0 {
 			return false
 		}
-		next := i + j + len(tok)
+		next := i + j + len(valuesToken)
 		for next < len(src) && (src[next] == ' ' || src[next] == '\t') {
 			next++
 		}
@@ -198,7 +189,7 @@ func opaqueValuesAccess(src string) bool {
 		if c := src[next]; c != '.' && c != '"' {
 			return true
 		}
-		i += j + len(tok)
+		i += j + len(valuesToken)
 	}
 }
 
@@ -211,7 +202,7 @@ func valuesKeyReferenced(src, key string) bool {
 	if strings.Contains(src, `"`+key+`"`) {
 		return true
 	}
-	needle := ".Values." + key
+	needle := valuesToken + "." + key
 	for i := 0; ; {
 		j := strings.Index(src[i:], needle)
 		if j < 0 {

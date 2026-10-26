@@ -1,341 +1,259 @@
 package kustomize
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"maps"
+	"io"
+	"io/fs"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
-	fluxkustomize "github.com/fluxcd/pkg/kustomize"
-	fluxfilesys "github.com/fluxcd/pkg/kustomize/filesys"
+	"github.com/go-git/go-git/v5/plumbing"
+	"oras.land/oras-go/v2/errdef"
 	"sigs.k8s.io/kustomize/api/resmap"
-	"sigs.k8s.io/kustomize/kyaml/filesys"
 
+	kustomizestate "github.com/home-operations/flate/internal/kustomize"
 	"github.com/home-operations/flate/pkg/manifest"
-	"github.com/home-operations/flate/pkg/source/sourceignore"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/store"
+	"github.com/home-operations/flate/pkg/task"
 )
 
-// BuildMutex serializes every krusty/kustomize build flate runs in a
-// process. kustomize's krusty pipeline mutates package-global state
-// (the openapi schema registry + builtin-plugin/transformer factories)
-// that is NOT goroutine-safe — fluxcd/pkg/kustomize guards its own
-// Build with an internal mutex for exactly this reason, but that mutex
-// does not extend to OTHER krusty entrypoints in the same process
-// (flate's helm postRenderer runs krusty.Run directly). Two concurrent
-// builds — one KS Build, one HR postRender — race on the shared globals
-// and produce nondeterministic corruption: empty / torn rendered output
-// surfacing as "missing metadata.name" decode errors, dropped resources,
-// or cascade failures that flip run-to-run. Every flate-owned krusty
-// invocation MUST hold this lock.
-var BuildMutex sync.Mutex
+// RenderRequest carries the authoritative source and its mount label. Label is
+// metadata and need not name an existing host path.
+type RenderRequest struct {
+	// HeldSlot is TreeCache's borrowed service when this render holds its slot.
+	// Standalone callers leave it nil.
+	HeldSlot *task.Service
+	// Source.FS supplies content; nil Source or FS is unavailable.
+	// Empty Source.Key denotes mutable content validated on every cache hit.
+	Source *store.SourceArtifact
+	// ApplyIgnore selects source-controller exclusions for admitted local aliases.
+	ApplyIgnore bool
+	// Label mounts source content in kyaml; empty uses Source.LocalPath.
+	Label string
+	// SubPath selects the source directory to build.
+	SubPath string
+	// Spec is the prepared Flux Kustomization; nil builds without a Flux owner.
+	Spec *manifest.Kustomization
+}
 
-// RenderFlux renders a Flux kustomize.toolkit.fluxcd.io Kustomization
-// entirely in memory, using the same merge + build the kustomize-controller
-// performs.
-//
-// sourceRoot is resolved and wrapped in a secure on-disk FS once per root
-// (memoized in cache.diskRootFor); each render derives its own private
-// memory-over-disk overlay from that shared disk FS, writes the merged
-// kustomization.yaml + any pre-fetched remote resources into the overlay's
-// in-memory layer, and builds with fluxkustomize.Build. The source tree is
-// never copied or mutated and no two renders share mutable state, so renders
-// run fully parallel with no staging lock. The secure disk layer confines reads
-// to the root (a path escaping it simply does not resolve), giving
-// SecureBuild's security posture for free.
-//
-// applyIgnore selects whether source-controller's file exclusions (its
-// defaults — .sops.yaml, binaries, CI dirs — plus every in-tree .sourceignore,
-// loaded from the source root exactly as source-controller does) are hidden
-// from the build's disk layer — true for working-tree / self-referential
-// sources that never passed through a fetcher's artifact filtering, false for
-// already-filtered fetched artifacts. With the filter in place a spec.path or
-// kustomization resource that only exists outside the artifact fails to
-// resolve here as it would in-cluster. spec.commonMetadata is applied post-build
-// (the Generator does not handle it, mirroring kustomize-controller's
-// apply-time pass).
-//
-// ctx is honored at coarse boundaries (entry, before build) because
-// fluxkustomize.Build does not itself accept a ctx.
-func RenderFlux(ctx context.Context, cache *TreeCache, sourceRoot string, applyIgnore bool, subPath string, rawSpec map[string]any) ([]byte, error) {
+// Render returns unstamped renderer documents from an admitted source and a private overlay.
+// Generated files never mutate the source. Cancellation is checked around the
+// upstream build, which does not accept a context.
+func Render(ctx context.Context, cache *TreeCache, req RenderRequest, retry sourcecache.RetryConfig) ([]map[string]any, error) {
 	if cache == nil {
-		return nil, errors.New("kustomize: nil tree cache")
-	}
-	if sourceRoot == "" {
-		return nil, fmt.Errorf("%w: empty source root", manifest.ErrInput)
-	}
-	if rawSpec == nil {
-		return nil, fmt.Errorf("%w: nil flux Kustomization spec", manifest.ErrInput)
+		return nil, fmt.Errorf("%w: incomplete render request", manifest.ErrInput)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	// Resolve the source root and build its secure on-disk FS once per root.
-	// Both are pure functions of sourceRoot and the secure FS is an immutable,
-	// goroutine-safe value, so cache.diskRootFor memoizes them across every KS
-	// that shares this root — sparing each render a duplicate EvalSymlinks +
-	// CleanedAbs syscall pair.
-	dr, err := cache.diskRootFor(sourceRoot)
+	if req.Source == nil || req.Source.FS == nil {
+		return nil, fmt.Errorf("%w: source artifact content unavailable", manifest.ErrInput)
+	}
+	lower, root := req.Source.FS, cmp.Or(req.Label, req.Source.LocalPath, string(filepath.Separator)+"flate-source")
+	var ignore any
+	if req.ApplyIgnore {
+		input, err := cache.sourceRootFor(ctx, req.Source, root)
+		if err != nil {
+			return nil, err
+		}
+		lower, ignore = input.fs, input.ignore
+	}
+	var err error
+	root, err = filepath.Abs(root)
 	if err != nil {
+		return nil, fmt.Errorf("%w: source label: %w", manifest.ErrInput, err)
+	}
+	var maxAge time.Duration
+	if req.Spec != nil {
+		maxAge = req.Spec.Interval.Duration
+	}
+	key := renderKey(req, root, ignore)
+	blobKey := sourcecache.BlobKey{Content: key, PersistOnly: true}
+	reader, _, _, err := cache.owner.Blob(ctx, blobKey, sourcecache.Policy{MaxAge: sourcecache.Forever}, nil)
+	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		return nil, fmt.Errorf("kustomize render cache lookup: %w", err)
+	}
+	if err == nil {
+		raw, readErr := io.ReadAll(reader)
+		if err := errors.Join(readErr, reader.Close()); err != nil {
+			return nil, fmt.Errorf("%w: read kustomize render cache: %w", manifest.ErrFlux, err)
+		}
+		snap, output, err := decodeFrame(raw)
+		if err != nil {
+			slog.Debug("kustomize: decode render frame", "err", err)
+		} else {
+			valid, err := snap.stillValid(ctx, cache, &treeFS{lower: lower, retry: retry, maxAge: maxAge, slot: req.HeldSlot}, req.Source.Key != "")
+			if err != nil {
+				return nil, err
+			}
+			if valid {
+				if docs, err := manifest.DecodeRender(output); err == nil {
+					return docs, nil
+				}
+			}
+		}
+	}
+	rec := newReadSet(root)
+	rec.immutable = req.Source.Key != ""
+	memFS := newTreeFS(lower, root, rec)
+	memFS.retry = retry
+	memFS.slot = req.HeldSlot
+	memFS.maxAge = maxAge
+	subDir := root + string(filepath.Separator) + strings.TrimLeft(req.SubPath, "/")
+	canonicalDir, file, err := memFS.CleanedAbs(subDir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: kustomization path is not a directory: %s: %w", manifest.ErrInput, req.SubPath, err)
+	}
+	if file != "" {
+		return nil, fmt.Errorf("%w: kustomization path is not a directory: %s", manifest.ErrInput, req.SubPath)
+	}
+	subDir = canonicalDir.String()
+	var ks map[string]any
+	var data []byte
+	var kfile string
+	if req.Spec != nil {
+		ks, err = req.Spec.RenderDocument()
+		if err != nil {
+			return nil, err
+		}
+		data, kfile, err = generateManifest(memFS, subDir, ks)
+		if err != nil {
+			return nil, fmt.Errorf("flux kustomize generator: %w", err)
+		}
+		if err := memFS.WriteFile(kfile, data); err != nil {
+			return nil, fmt.Errorf("write kustomization.yaml: %w", err)
+		}
+	} else {
+		kfile, _ = kustomizationFileIn(memFS, subDir)
+	}
+	subPath := req.SubPath
+
+	if err := preflightRemoteResources(ctx, cache, memFS, subDir); err != nil {
 		return nil, err
 	}
-	sourceRoot = dr.root
-
-	// Working-tree sources read through the source-controller-filtered view of
-	// the disk (see ignorefs.go); the cache key carries the .sourceignore
-	// fingerprint because those files are loaded off-overlay, invisible to the
-	// read-set, so an in-place edit must miss by key instead.
-	diskFS, ignoreKey := dr.diskFS, ""
-	if applyIgnore {
-		ig, ierr := dr.ignored()
-		if ierr != nil {
-			return nil, ierr
+	if kfile != "" {
+		data, err = memFS.ReadFile(kfile)
+		if err != nil {
+			return nil, err
 		}
-		diskFS, ignoreKey = ig.fs, ig.key
-	}
-
-	// Cross-run render cache: a stored render whose recorded disk inputs still
-	// validate against the live tree reproduces the output exactly, so krusty is
-	// skipped entirely. The readSet (see readset.go) makes a hit sound even for
-	// `..`-escaping / transitive inputs a spec hash alone would miss. Validation
-	// replays against the same (possibly filtered) disk view the build read.
-	key := renderKey(rawSpec, dr.root, subPath, ignoreKey)
-	if rc := cache.render; rc != nil && key != "" {
-		if snap, output, ok := rc.get(key); ok && snap.stillValid(diskFS, dr.root) {
-			return output, nil
-		}
-	}
-	// On a miss, record this build's disk reads so the next run can validate it.
-	// A nil recorder (cache disabled or unkeyable) keeps the overlay byte-identical.
-	var rec *readSet
-	if cache.render != nil && key != "" {
-		rec = newReadSet(dr.root)
-	}
-
-	// Memory-over-disk overlay: source files are read from the secure on-disk
-	// FS rooted at sourceRoot (no real-FS reach beyond root; symlinks
-	// evaluated), while the merged kustomization.yaml + any pre-fetched remote
-	// resources are written to an in-memory layer that shadows disk. The source
-	// tree is never copied or mutated, and renders stay fully parallel (each
-	// gets its own overlay). Reading source from disk also sidesteps the
-	// in-memory fs's filename restriction, so trees with exotic names (spaces,
-	// etc.) render.
-	memFS := newOverlayFS(diskFS, rec)
-
-	subDir := filepath.Join(sourceRoot, subPath)
-	if !memFS.IsDir(subDir) {
-		return nil, fmt.Errorf("%w: kustomization path is not a directory: %s", manifest.ErrInput, subPath)
-	}
-
-	// Pre-fetch any HTTP/HTTPS entries and remote git bases in kustomization
-	// resources: into the memory layer so the build only ever sees local files
-	// and never reaches the network (kustomize's git/HTTP fallback would
-	// otherwise run outside the fs sandbox). Scoped to subDir. See preflight.go.
-	injected, err := preflightRemoteResources(ctx, cache, memFS, subDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Merge spec.patches/images/components/targetNamespace/namePrefix/nameSuffix
-	// into the kustomization.yaml exactly as flux's Generator does, then write it
-	// into the memory layer for the build to consume. See generate.go.
-	data, kfile, err := generateManifest(memFS, subDir, rawSpec)
-	if err != nil {
-		return nil, fmt.Errorf("flux kustomize generator: %w", err)
-	}
-	if err := memFS.WriteFile(kfile, data); err != nil {
-		return nil, fmt.Errorf("write kustomization.yaml: %w", err)
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	rm, err := func() (resmap.ResMap, error) {
-		BuildMutex.Lock()
-		defer BuildMutex.Unlock()
-		return fluxkustomize.Build(memFS, subDir)
+		kustomizestate.BuildMutex.Lock()
+		defer kustomizestate.BuildMutex.Unlock()
+		return kustomizestate.Build(memFS, subDir)
 	}()
 	if err != nil {
-		built := fmt.Errorf("kustomize build %s: %w", subPath, err)
+		built := fmt.Errorf("%w: kustomize build %s: %w", manifest.ErrFlux, subPath, err)
 		// On a duplicate-resource-id failure, name every accumulated path that
-		// emits the colliding resource so a localized duplicate is locatable
-		// (no-op for any other error — see duplicateProducers).
-		if attr := duplicateProducers(err, memFS, subDir, subPath, data); attr != "" {
-			return nil, fmt.Errorf("%w\n%s", built, attr)
+		// emits the colliding resource so a localized duplicate is locatable.
+		if strings.Contains(err.Error(), "already registered id") {
+			if attr := duplicateProducers(memFS, subDir, subPath, data); attr != "" {
+				return nil, fmt.Errorf("%w\n%s", built, attr)
+			}
 		}
 		return nil, built
 	}
-	// Owner labels first so user-supplied spec.commonMetadata wins on a key
-	// collision. Matches kustomize-controller's ordering: SetOwnerLabels runs at
-	// reconcile setup, SetCommonMetadata runs at apply time and overwrites.
-	if err := applyOwnerLabels(rm, rawSpec); err != nil {
-		return nil, fmt.Errorf("apply owner labels %s: %w", subPath, err)
+	// AsYAML converts through JSON, so label scalar spelling MUST be retained first.
+	if req.Spec != nil && req.Spec.EmissionPolicy().StringLabels {
+		for _, r := range rm.Resources() {
+			if err := r.SetLabels(r.GetLabels()); err != nil {
+				return nil, fmt.Errorf("%w: normalize labels: %w", manifest.ErrInput, err)
+			}
+		}
 	}
-	if err := applyCommonMetadata(rm, rawSpec); err != nil {
-		return nil, fmt.Errorf("apply commonMetadata %s: %w", subPath, err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+
 	out, err := rm.AsYaml()
 	if err != nil {
 		return nil, fmt.Errorf("kustomize render %s: %w", subPath, err)
 	}
-	// Persist for the next run, unless the build consumed inputs the disk
-	// read-set can't validate: pre-fetched remote content (injected) or an
-	// unrepresentable read such as a Glob (rec.bypassed).
-	if rec != nil && !injected && !rec.bypassed() {
-		cache.render.put(key, rec.snapshot(), out)
-	}
-	return out, nil
-}
-
-// renderKey is the cross-run render-cache lookup key for a RenderFlux call: a
-// stable fingerprint of everything that determines the output BEFORE the source
-// tree's content is consulted (the read-set validates that content). The full
-// rawSpec is hashed — generateManifest's merge and the post-build
-// applyOwnerLabels/applyCommonMetadata all derive from it. ignoreKey is the
-// source root's .sourceignore fingerprint for a working-tree render, "" for a
-// fetched artifact. Empty (caching off for this render) when the spec can't be
-// hashed.
-func renderKey(rawSpec map[string]any, sourceRoot, subPath, ignoreKey string) string {
-	return manifest.Fingerprint(struct {
-		Spec       map[string]any
-		SourceRoot string
-		SubPath    string
-		Ignore     string
-	}{rawSpec, sourceRoot, subPath, ignoreKey})
-}
-
-// diskRoot holds the per-sourceRoot invariants RenderFlux reuses across every
-// Kustomization that targets the same root: the symlink-resolved absolute root
-// and its secure on-disk FS. diskFS is an immutable fsSecure value over a
-// stateless MakeFsOnDisk, so it is safe to share read-only across goroutines.
-// ignored lazily derives the working-tree view — diskFS behind the
-// source-controller ignore matcher loaded from root — plus the .sourceignore
-// fingerprint that keys it; built once per root because loading the matcher
-// walks the whole tree.
-type diskRoot struct {
-	root    string
-	diskFS  filesys.FileSystem
-	ignored func() (ignoredRoot, error)
-}
-
-type ignoredRoot struct {
-	fs  filesys.FileSystem
-	key string
-}
-
-// diskRootFor returns the cached diskRoot for sourceRoot, computing and
-// memoizing it on first use. The (EvalSymlinks, MakeFsOnDiskSecure) pair it
-// performs is a pure function of sourceRoot, so the result is shared across the
-// run's renders of that root. Errors are not cached — they are rare and the
-// caller wants each to surface — and carry the same wrapping the inline path
-// used. Keyed by the raw input sourceRoot (already validated non-empty).
-func (c *TreeCache) diskRootFor(sourceRoot string) (*diskRoot, error) {
-	if v, ok := c.diskRoots.Load(sourceRoot); ok {
-		return v.(*diskRoot), nil
-	}
-	resolved := sourceRoot
-	if r, err := filepath.EvalSymlinks(sourceRoot); err == nil {
-		resolved = r
-	}
-	diskFS, err := fluxfilesys.MakeFsOnDiskSecure(resolved)
+	docs, err := manifest.SplitDocs(out)
 	if err != nil {
-		return nil, fmt.Errorf("kustomize: secure fs %s: %w", resolved, err)
+		return nil, err
 	}
-	dr := &diskRoot{root: resolved, diskFS: diskFS}
-	dr.ignored = sync.OnceValues(func() (ignoredRoot, error) {
-		matcher, err := sourceignore.New(resolved, nil, true)
+	reader, _, _, err = cache.owner.Blob(ctx, blobKey, sourcecache.Policy{MaxAge: 0}, func(_ context.Context, w sourcecache.ProducerInput) (sourcecache.ProducerResult, error) {
+		payload, err := manifest.EncodeRender(docs)
 		if err != nil {
-			return ignoredRoot{}, err
+			return sourcecache.ProducerResult{}, err
 		}
-		key, err := sourceignore.Fingerprint(resolved)
+		frame, err := encodeFrame(rec.snapshot(), payload)
 		if err != nil {
-			return ignoredRoot{}, err
+			return sourcecache.ProducerResult{}, fmt.Errorf("encode kustomize render frame: %w", err)
 		}
-		return ignoredRoot{fs: newIgnoreFS(diskFS, resolved, matcher), key: key}, nil
+		_, err = io.Copy(w, bytes.NewReader(frame))
+		return sourcecache.ProducerResult{}, err
 	})
-	actual, _ := c.diskRoots.LoadOrStore(sourceRoot, dr)
-	return actual.(*diskRoot), nil
+	if err != nil {
+		return nil, fmt.Errorf("kustomize render cache publish: %w", err)
+	}
+	if err := reader.Close(); err != nil {
+		return nil, fmt.Errorf("%w: close kustomize render frame: %w", manifest.ErrFlux, err)
+	}
+	return docs, nil
 }
 
-// applyCommonMetadata merges spec.commonMetadata.labels and
-// spec.commonMetadata.annotations into every rendered resource —
-// mirroring kustomize-controller's ssautil.SetCommonMetadata pass,
-// which fluxcd/pkg/kustomize.Generator does NOT perform.
-func applyCommonMetadata(rm resmap.ResMap, rawSpec map[string]any) error {
-	spec, _ := rawSpec["spec"].(map[string]any)
-	cm, _ := spec["commonMetadata"].(map[string]any)
-	labels := stringMap(cm["labels"])
-	annotations := stringMap(cm["annotations"])
-	if len(labels) == 0 && len(annotations) == 0 {
-		return nil
+// Mutable files are validated by the read set; immutable generations are part
+// of the render content. Filesystem handles and retry/storage policy are never encoded.
+func renderKey(req RenderRequest, root string, ignore any) string {
+	var immutable any
+	if req.Source.Key != "" {
+		immutable = struct{ Key, Revision, Digest string }{req.Source.Key, req.Source.Revision, req.Source.Digest}
 	}
-	for _, r := range rm.Resources() {
-		if len(labels) > 0 {
-			if err := r.SetLabels(overlayStringMap(r.GetLabels(), labels)); err != nil {
-				return err
-			}
-		}
-		if len(annotations) > 0 {
-			if err := r.SetAnnotations(overlayStringMap(r.GetAnnotations(), annotations)); err != nil {
-				return err
-			}
-		}
+	var spec any
+	if req.Spec != nil {
+		spec = req.Spec.Content(nil)
 	}
-	return nil
+	return manifest.Fingerprint(struct {
+		Spec        any
+		SourceRoot  string
+		SubPath     string
+		ApplyIgnore bool
+		Ignore      any
+		Immutable   any
+	}{spec, root, req.SubPath, req.ApplyIgnore, ignore, immutable})
 }
 
-// applyOwnerLabels stamps every rendered resource with the parent's
-// "kustomize.toolkit.fluxcd.io/name" + "/namespace" labels — matching
-// what kustomize-controller injects via ssa.ResourceManager.SetOwnerLabels
-// before apply. These labels are how real Flux tracks ownership for
-// pruning + selection (kubectl get -l kustomize.toolkit.fluxcd.io/name=...).
-//
-// Inject during render so flate's output matches what lands in-cluster
-// rather than what's on disk.
-func applyOwnerLabels(rm resmap.ResMap, rawSpec map[string]any) error {
-	md, _ := rawSpec["metadata"].(map[string]any)
-	name, _ := md["name"].(string)
-	if name == "" {
-		return nil
-	}
-	namespace, _ := md["namespace"].(string)
-	const group = "kustomize.toolkit.fluxcd.io"
-	// Build owner overlay with only non-empty values so a cluster-scoped
-	// Kustomization (no namespace) doesn't clobber an existing namespace label.
-	owner := make(map[string]string, 2)
-	owner[group+"/name"] = name
-	if namespace != "" {
-		owner[group+"/namespace"] = namespace
-	}
-	for _, r := range rm.Resources() {
-		if err := r.SetLabels(overlayStringMap(r.GetLabels(), owner)); err != nil {
-			return err
-		}
-	}
-	return nil
+type sourceRoot struct {
+	fs     fs.FS
+	ignore any
 }
 
-// overlayStringMap returns a copy of base with every entry from overlay
-// merged in. overlay wins on key collisions. RNode.GetLabels /
-// GetAnnotations always return a non-nil map, so base is never nil here.
-func overlayStringMap(base, overlay map[string]string) map[string]string {
-	out := maps.Clone(base)
-	maps.Copy(out, overlay)
-	return out
-}
-
-func stringMap(v any) map[string]string {
-	m, ok := v.(map[string]any)
-	if !ok || len(m) == 0 {
-		return nil
+// Source admission belongs to the run owner. Every reader of a source MUST use
+// the same view; the checkout MUST remain stable until all readers finish.
+func (c *TreeCache) sourceRootFor(ctx context.Context, artifact *store.SourceArtifact, root string) (*sourceRoot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	out := make(map[string]string, len(m))
-	for k, val := range m {
-		if s, ok := val.(string); ok {
-			out[k] = s
+	key := struct {
+		source *store.SourceArtifact
+		root   string
+	}{artifact, root}
+	if cached, ok := c.sourceRoots.Load(key); ok {
+		return cached.(func() (*sourceRoot, error))()
+	}
+	// Shared admission belongs to the cache lifetime, not the first reader's cancellation.
+	load := sync.OnceValues(func() (*sourceRoot, error) {
+		input, _, err := gittree.New(context.Background(), nil, plumbing.ZeroHash, gittree.ViewOptions{Mode: gittree.Source, Current: artifact.FS})
+		if err != nil {
+			return nil, err
 		}
-	}
-	return out
+		return &sourceRoot{fs: input, ignore: input.PolicyEvidence()}, nil
+	})
+	actual, _ := c.sourceRoots.LoadOrStore(key, load)
+	return actual.(func() (*sourceRoot, error))()
 }

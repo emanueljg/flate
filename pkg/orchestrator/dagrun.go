@@ -3,129 +3,117 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"slices"
 
+	"github.com/home-operations/flate/pkg/controllers/base"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/schedule"
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// dagDispatcher implements schedule.Dispatcher: it routes a node by Kind to the
-// owning controller's ReconcileNode and maps the blocked result into a
-// scheduler Outcome. This is the single composition point where the scheduler,
-// the controllers, and the store meet — pkg/schedule itself imports none of
-// them. NodeID is manifest.NamedResource, so the blocked slice flows through
-// untranslated.
 type dagDispatcher struct{ o *Orchestrator }
 
-func (d dagDispatcher) Dispatch(ctx context.Context, id schedule.NodeID, drainLevel int) (schedule.Outcome, []schedule.NodeID) {
+// Go admits scheduler bodies through the invocation's shared task service.
+func (d dagDispatcher) Go(ctx context.Context, name string, fn func(context.Context)) {
+	d.o.tasks.Go(ctx, name, fn)
+}
+
+// BlockTillDone cancels remote owners before joining the shared task service.
+func (d dagDispatcher) BlockTillDone() {
+	d.o.ksc.Trees.Close()
+	d.o.inputs.Close()
+	d.o.tasks.BlockTillDone()
+}
+
+func (d dagDispatcher) Dispatch(ctx context.Context, id schedule.NodeID, level manifest.DrainLevel) schedule.Result {
 	o := d.o
-	var blocked []manifest.NamedResource
+	var execution *base.Execution
 	switch {
-	case id.Kind == manifest.KindKustomization:
-		blocked = o.ksc.ReconcileNode(ctx, id, drainLevel)
-	case id.Kind == manifest.KindHelmRelease:
-		blocked = o.hrc.ReconcileNode(ctx, id, drainLevel)
-	case id.Kind == manifest.KindResourceSet:
-		blocked = o.rsc.ReconcileNode(ctx, id, drainLevel)
+	case id.Group == manifest.FluxKustomizeDomain && id.Kind == manifest.KindKustomization:
+		execution = o.ksc.ReconcileNode(ctx, id, level)
+	case id.Group == manifest.HelmReleaseDomain && id.Kind == manifest.KindHelmRelease:
+		execution = o.hrc.ReconcileNode(ctx, id, level)
+	case id.Group == manifest.FluxOperatorDomain && id.Kind == manifest.KindResourceSet:
+		execution = o.rsc.ReconcileNode(ctx, id, level)
+	case id.Group == "source.extensions.fluxcd.io" && id.Kind == "ArtifactGenerator":
+		execution = o.agc.ReconcileNode(ctx, id, level)
 	case o.src.Owns(id):
-		blocked = o.src.ReconcileNode(ctx, id, drainLevel)
-	default:
-		// Not a schedulable kind (should never be dispatched) — terminal no-op.
-		return schedule.OutcomeTerminal, nil
+		execution = o.src.ReconcileNode(ctx, id, level)
 	}
-	if len(blocked) > 0 {
-		return schedule.OutcomeBlocked, blocked
+	if execution == nil {
+		return schedule.Result{}
 	}
-	return schedule.OutcomeTerminal, nil
+	return schedule.Result{Assessment: execution}
 }
 
-// dagSchedulable reports whether id is a node the scheduler runs
-// (Kustomization/HelmRelease/ResourceSet/source) versus pure data
-// (ConfigMap/Secret/RSIP) that only WAKES nodes parked on it. A
-// ResourceSetInputProvider is deliberately excluded: a render-emitted
-// RSIP fires EventObjectAdded to wake RSes parked on it, but it is not a
-// runnable node (flate exports its inputs statically, there is nothing to
-// reconcile).
-func (o *Orchestrator) dagSchedulable(id manifest.NamedResource) bool {
-	return isReconcilableKind(id.Kind) ||
-		id.Kind == manifest.KindResourceSet ||
-		o.src.Owns(id)
+func (d dagDispatcher) Sweep(ctx context.Context, quiescent bool) []schedule.NodeID {
+	changed := slices.Collect(d.o.store.Sweep())
+	if !quiescent || len(changed) != 0 || ctx.Err() != nil {
+		return changed
+	}
+	d.o.classifyCompleted()
+	return slices.Collect(d.o.store.Sweep())
 }
 
-// seedNodes returns every file-loaded reconcilable + ResourceSet + source
-// object currently in the store — the scheduler's initial frontier.
-// ResourceSetInputProviders are NOT seeded: they are pure data, not
-// runnable nodes (see dagSchedulable).
 func (o *Orchestrator) seedNodes() []manifest.NamedResource {
 	var ids []manifest.NamedResource
-	for _, kind := range reconcilableKinds {
-		for _, obj := range o.store.ListObjects(kind) {
-			ids = append(ids, obj.Named())
+	for info := range manifest.Kinds() {
+		if !info.Runnable {
+			continue
 		}
-	}
-	for _, obj := range o.store.ListObjects(manifest.KindResourceSet) {
-		ids = append(ids, obj.Named())
-	}
-	for kind := range o.src.Fetchers {
-		for _, obj := range o.store.ListObjects(kind) {
-			if id := obj.Named(); o.src.Owns(id) {
-				ids = append(ids, id)
+		for _, obj := range o.store.ListObjects(info.Group, info.Kind) {
+			if o.schedulable(obj) {
+				o.store.SetIncluded(obj.Named(), o.filter.ShouldReconcile(obj.Named()))
+				ids = append(ids, obj.Named())
 			}
 		}
 	}
 	return ids
 }
 
-// runDAG drives reconciliation with the re-entrant fixpoint scheduler instead
-// of the event-driven dispatch loop. The cycle-detect listener is already
-// registered by Run (shared with the event path), so preflight cycle failures
-// are recorded before any node runs.
 func (o *Orchestrator) runDAG(ctx context.Context) error {
-	defer o.Stop()
-	sched := schedule.New(o.tasks, dagDispatcher{o})
-	// A selector-inputsFrom ResourceSet has no nameable input provider to park
-	// on, so the scheduler re-expands it at the structural fixpoint (against the
-	// now-complete store). Only ResourceSets ever opt in.
-	sched.SetRerunAtDrain(func(id manifest.NamedResource) bool {
-		return id.Kind == manifest.KindResourceSet && o.rsc.WantsDrainRerun(id)
-	})
+	dispatcher := dagDispatcher{o}
+	sched := schedule.New(dispatcher, dispatcher)
 
-	// Start the controllers. This registers lifecycle state + the HR producer
-	// index (flush=true replay), but no dispatch listeners — the scheduler owns
-	// dispatch. No render runs here, so no children are emitted before the wake
-	// adapters below are registered.
-	o.src.Start(ctx)
-	o.ksc.Start(ctx)
-	o.hrc.Start(ctx)
-	o.rsc.Start(ctx)
+	o.src.StartLifecycle()
+	o.ksc.StartLifecycle()
+	o.hrc.StartLifecycle()
+	o.rsc.StartLifecycle()
+	o.agc.StartLifecycle()
 
-	// Store → scheduler adapters (fire-only, flush=false), registered AFTER the
-	// shared cycle-detect listener so cycle preflight runs first.
-	//
-	//   EventObjectAdded: discover render-emitted nodes, wake nodes parked on
-	//   an arriving dep (source/CM/KS), and re-dispatch a terminal producer
-	//   whose Refire status-reset re-arrival signals a changed-only
-	//   resurrection. The listener runs OUTSIDE the store shard lock (AddObject
-	//   fires it post-unlock), and dagStatusReady's read completes before
-	//   sched.OnArrival takes sched.mu — so there is no store-lock ↔ sched.mu
-	//   inversion.
-	unsubAdd := o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
-		sched.OnArrival(id, o.dagSchedulable(id))
-	}, false)
-	defer unsubAdd()
-	//   EventStatusUpdated: wake nodes parked on a dep that reached a terminal
-	//   status. Terminal-gated inside OnStatusWake (Pending writes are ignored).
-	unsubStatus := o.store.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
-		info, ok := payload.(store.StatusInfo)
-		if !ok {
-			return
-		}
-		sched.OnStatusWake(id, info.Status == store.StatusReady, info.Status == store.StatusFailed)
-	}, false)
-	defer unsubStatus()
+	unsubscribe := o.watchDAG(sched)
+	defer unsubscribe()
 
 	sched.Seed(o.seedNodes())
-	sched.Run(ctx)
+	err := sched.Run(ctx)
 
-	return errors.Join(o.finalize(), ctx.Err())
+	return errors.Join(err, o.finalize())
+}
+
+func (o *Orchestrator) schedulable(obj manifest.BaseManifest) bool {
+	if obj == nil {
+		return false
+	}
+	info := manifest.KindOf(obj)
+	return info.Runnable && (info.Group != manifest.SourceDomain || o.src.Owns(obj.Named()))
+}
+
+func (o *Orchestrator) watchDAG(sched *schedule.Scheduler) func() {
+	unsubAdd := o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, payload any) {
+		obj, _ := payload.(manifest.BaseManifest)
+		if obj == nil {
+			sched.OnArrival(id, false)
+			return
+		}
+		sched.OnArrival(id, o.schedulable(obj))
+	}, false)
+
+	publication := func(manifest.NamedResource, any) { sched.OnPublication() }
+	unsubStatus := o.store.AddListener(store.EventStatusUpdated, publication, false)
+	unsubArtifact := o.store.AddListener(store.EventArtifactUpdated, publication, false)
+	return func() {
+		unsubAdd()
+		unsubStatus()
+		unsubArtifact()
+	}
 }

@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path"
 	"slices"
+	"strings"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // HelmChart is the embedded chart template inside a HelmRelease.spec.chart
@@ -17,16 +20,69 @@ type HelmChart struct {
 	// Name is the chart name within the source repository.
 	Name string `json:"name" yaml:"name"`
 	// Version is omitted from output for tidy diffs but kept in memory.
-	Version string `json:"-" yaml:"-"`
-	// RepoName, RepoNamespace, RepoKind identify the sourceRef.
-	RepoName      string `json:"repoName" yaml:"repoName"`
-	RepoNamespace string `json:"repoNamespace" yaml:"repoNamespace"`
-	RepoKind      string `json:"repoKind" yaml:"repoKind"`
+	Version string        `json:"-" yaml:"-"`
+	Source  NamedResource `json:"source" yaml:"source"`
 }
 
-// RepoFullName is "<namespace>-<name>" — the canonical id of the source.
+// Materializes reports whether the chart requires HelmRepository acquisition.
+func (h HelmChart) Materializes() bool {
+	return h.Source.Group == SourceDomain && (h.Source.Kind == "" || h.Source.Kind == KindHelmRepository)
+}
+
+// ChartLocation validates the source kind and selects a source path or artifact discovery.
+func (h HelmChart) ChartLocation() (string, bool, error) {
+	if h.hasSourceChartPath() {
+		return path.Clean(h.Name), false, nil
+	}
+	switch h.Source.Kind {
+	case KindOCIRepository, KindHelmChart:
+		return "", true, nil
+	case KindHelmRepository, "":
+		return "", false, inputf("HelmRepository chart %s reached chart loading unmaterialized: render via the orchestrator", h.RepoFullName())
+	default:
+		return "", false, inputf("unsupported chart repo kind %s", h.Source.Kind)
+	}
+}
+
+func (h HelmChart) hasSourceChartPath() bool {
+	return h.Source.Kind == KindGitRepository || h.Source.Kind == KindBucket || h.Source.Kind == KindExternalArtifact
+}
+
+// UsesSourceValuesFiles reports whether values files are relative to the source artifact root.
+func (h HelmChart) UsesSourceValuesFiles() bool {
+	return h.Source.Kind == KindGitRepository || h.Source.Kind == KindBucket
+}
+
+func (h *HelmChart) sourceInputs(files []string) (string, []string) {
+	if h.Source.Group != SourceDomain {
+		return "", nil
+	}
+	if !h.UsesSourceValuesFiles() {
+		files = nil
+	}
+	if !h.hasSourceChartPath() || h.Name == "" || strings.HasPrefix(h.Name, "/") || strings.IndexByte(h.Name, 0) >= 0 {
+		return "", files
+	}
+	// Reference iteration MUST validate without allocating a normalized path.
+	depth := 0
+	for part := range strings.SplitSeq(h.Name, "/") {
+		switch part {
+		case "", ".":
+		case "..":
+			depth--
+		default:
+			depth++
+		}
+		if depth < 0 {
+			return "", files
+		}
+	}
+	return h.Name, files
+}
+
+// RepoFullName returns the source namespace-name display label.
 func (h HelmChart) RepoFullName() string {
-	return h.RepoNamespace + "-" + h.RepoName
+	return h.Source.Namespace + "-" + h.Source.Name
 }
 
 // ChartName is "<repoFullName>/<chartName>" — used as the helm chart ref.
@@ -34,37 +90,7 @@ func (h HelmChart) ChartName() string {
 	return h.RepoFullName() + "/" + h.Name
 }
 
-// IsResolved reports whether this HelmChart is in its final form —
-// i.e. NOT an unresolved chartRef placeholder. A chartRef pointing
-// at a HelmChart CRD lands in the store with RepoKind=KindHelmChart
-// and no chart Name; ResolveChartRef rewrites the HelmChart in
-// place by looking up the referenced HelmChartSource and setting
-// the chart name + version + the underlying source kind. Callers
-// that read h.Name / h.Version must either run after Prepare /
-// ResolveChartRef, or check IsResolved first — see also the empty
-// Name guarantee in chartFromHelmRelease.
-//
-// chartRef → Bucket / GitRepository / OCIRepository also lands with
-// Name="" intentionally (the underlying source's content determines
-// the chart layout, not the ref name). IsResolved keys on both
-// "RepoKind has a real name" AND "the bytes-determining field —
-// Name for HelmRepository, Version for chartRef-HelmChart — is
-// non-empty" so a caller that branches on IsResolved to safely
-// dereference Name doesn't get an empty subpath silently.
-func (h HelmChart) IsResolved() bool {
-	if h.Name == "" {
-		return false
-	}
-	if h.RepoKind == KindHelmChart && h.Version == "" {
-		return false
-	}
-	return true
-}
-
-// chartFromHelmRelease projects the chart reference out of a typed
-// HelmRelease spec, unifying spec.chartRef and spec.chart into one
-// resolved shape. defaultNamespace fills in an omitted ref namespace.
-func chartFromHelmRelease(spec *helmv2.HelmReleaseSpec, defaultNamespace string) (HelmChart, error) {
+func chartFromHelmRelease(spec *helmv2.HelmReleaseSpec) (HelmChart, error) {
 	if ref := spec.ChartRef; ref != nil {
 		if ref.Kind == "" {
 			return HelmChart{}, inputf("HelmRelease missing spec.chartRef.kind")
@@ -72,21 +98,13 @@ func chartFromHelmRelease(spec *helmv2.HelmReleaseSpec, defaultNamespace string)
 		if ref.Name == "" {
 			return HelmChart{}, inputf("HelmRelease missing spec.chartRef.name")
 		}
-		// Leave Name empty for a chartRef → HelmChart CRD: the
-		// referenced HelmChartSource carries the actual chart name,
-		// which ResolveChartRef materializes via helmChartFromSource.
-		// The previous Name=ref.Name placeholder gave callers a wrong
-		// "<refName>" string if they read it before resolve — and
-		// IsResolved() now exposes the unresolved state explicitly so
-		// consumers can branch. For non-HelmChart chartRefs
-		// (OCIRepository/Bucket), the RepoKind is already final and
-		// Name stays empty intentionally — the underlying source's
-		// content determines the chart layout, not the ref name.
-		return HelmChart{
-			RepoName:      ref.Name,
-			RepoNamespace: cmp.Or(ref.Namespace, defaultNamespace),
-			RepoKind:      ref.Kind,
-		}, nil
+		// A chartRef name identifies the source, not the chart inside it.
+		// ResolveChartRef reads the chart name from a HelmChartSource;
+		// other source kinds determine it from their artifact's layout.
+		return HelmChart{Source: NamedResource{
+			Group: referenceGroup(ref.Kind, ref.APIVersion), Kind: ref.Kind,
+			Namespace: ref.Namespace, Name: ref.Name,
+		}}, nil
 	}
 	tmpl := spec.Chart
 	if tmpl == nil {
@@ -101,25 +119,21 @@ func chartFromHelmRelease(spec *helmv2.HelmReleaseSpec, defaultNamespace string)
 		return HelmChart{}, inputf("HelmRelease missing spec.chart.spec.sourceRef.name")
 	}
 	return HelmChart{
-		Name:          chartName,
-		Version:       tmpl.Spec.Version,
-		RepoName:      srcName,
-		RepoNamespace: cmp.Or(tmpl.Spec.SourceRef.Namespace, defaultNamespace),
-		RepoKind:      cmp.Or(tmpl.Spec.SourceRef.Kind, KindHelmRepository),
+		Name: chartName, Version: tmpl.Spec.Version,
+		Source: NamedResource{
+			Group: referenceGroup(cmp.Or(tmpl.Spec.SourceRef.Kind, KindHelmRepository), tmpl.Spec.SourceRef.APIVersion),
+			Kind:  cmp.Or(tmpl.Spec.SourceRef.Kind, KindHelmRepository), Namespace: tmpl.Spec.SourceRef.Namespace, Name: srcName,
+		},
 	}, nil
 }
 
-// helmChartFromSource constructs a HelmChart from a resolved
-// HelmChartSource. The Repo* fields are read from the embedded
-// SourceRef (which always shares the HelmChart's namespace per Flux
-// schema).
 func helmChartFromSource(src *HelmChartSource) HelmChart {
 	return HelmChart{
-		Name:          src.Chart,
-		Version:       src.Version,
-		RepoName:      src.SourceRef.Name,
-		RepoNamespace: src.Namespace,
-		RepoKind:      cmp.Or(src.SourceRef.Kind, KindHelmRepository),
+		Name: src.Chart, Version: src.Version,
+		Source: NamedResource{
+			Group: referenceGroup(cmp.Or(src.SourceRef.Kind, KindHelmRepository), src.SourceRef.APIVersion),
+			Kind:  cmp.Or(src.SourceRef.Kind, KindHelmRepository), Namespace: src.Namespace, Name: src.SourceRef.Name,
+		},
 	}
 }
 
@@ -137,10 +151,8 @@ func helmChartFromSource(src *HelmChartSource) HelmChart {
 //   - Values is the decoded form of spec.values (map[string]any) so
 //     consumers don't have to JSON-decode on every access. Shadows
 //     the embedded Spec.Values (*apiextensionsv1.JSON).
-//   - DependsOn is normalized to []DependencyRef (with ReadyExpr).
-//     Shadows the embedded Spec.DependsOn ([]DependencyReference).
 //   - CRDsPolicy collapses spec.install.crds vs spec.upgrade.crds.
-//   - DisableSchema/OpenAPIValidation collapse Install vs Upgrade.
+//   - DisableSchemaValidation projects install policy; OpenAPI combines both actions.
 //   - ChartValuesFiles + IgnoreMissingValuesFiles are sourced from
 //     spec.chart.spec.valuesFiles OR the referenced HelmChart CRD.
 type HelmRelease struct {
@@ -157,10 +169,6 @@ type HelmRelease struct {
 	// Spec.Values (*apiextensionsv1.JSON).
 	Values map[string]any `json:"-" yaml:"-"`
 
-	// DependsOn is the normalized form of spec.dependsOn (carrying any
-	// ReadyExpr). Shadows the embedded Spec.DependsOn ([]DependencyReference).
-	DependsOn []DependencyRef `json:"-" yaml:"-"`
-
 	Labels      map[string]string `json:"-" yaml:"-"`
 	Annotations map[string]string `json:"-" yaml:"-"`
 
@@ -170,53 +178,69 @@ type HelmRelease struct {
 	// helm-controller's "upgrade-after-install" model.
 	CRDsPolicy string `json:"-" yaml:"-"`
 
-	// DisableSchemaValidation / DisableOpenAPIValidation collapse the
-	// install vs upgrade equivalents into single flags.
+	// DisableSchemaValidation projects install policy. DisableOpenAPIValidation
+	// combines install and upgrade policy.
 	DisableSchemaValidation  bool `json:"-" yaml:"-"`
 	DisableOpenAPIValidation bool `json:"-" yaml:"-"`
 
-	// ChartValuesFiles are values files baked into the chart that
-	// should be merged BEFORE the HR's own Values overrides.
+	// ChartValuesFiles are selected source or chart files merged before release values.
 	ChartValuesFiles         []string `json:"-" yaml:"-"`
 	IgnoreMissingValuesFiles bool     `json:"-" yaml:"-"`
 }
 
+// Suspended reports whether reconciliation is paused.
+func (h *HelmRelease) Suspended() bool { return h.Suspend }
+
 // Named identifies the release.
 func (h *HelmRelease) Named() NamedResource {
-	return NamedResource{Kind: KindHelmRelease, Namespace: h.Namespace, Name: h.Name}
+	return NamedResource{Group: kindTable[kindHelmRelease].Group, Kind: KindHelmRelease, Namespace: h.Namespace, Name: h.Name}
 }
 
-// Clone returns a copy of h safe for in-place mutation during a single
-// reconcile pass. Deep-copies every mutable reference field —
-// reconcile bodies, prepare passes, and orchestrator stamping all
-// observe the same canonical store-owned object across goroutines,
-// so a partial clone is a footgun the moment any of those grow a
-// new mutation. Cheap: typical HR has <10 labels/annotations and
-// short DependsOn / ChartValuesFiles.
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (h *HelmRelease) WithNamespace(namespace string) BaseManifest {
+	out := *h
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (h *HelmRelease) ProjectionCompatible(BaseManifest) bool { return true }
+
+// TracksDigest reports whether chartRef directly selects an OCIRepository chart identity.
+func (h *HelmRelease) TracksDigest() bool {
+	return h.ChartRef != nil && h.ChartRef.Kind == KindOCIRepository &&
+		referenceGroup(h.ChartRef.Kind, h.ChartRef.APIVersion) == kindTable[kindOCIRepository].Group
+}
+
+// Clone deep-copies mutable fields; store-owned specs MUST remain immutable.
 func (h *HelmRelease) Clone() *HelmRelease {
 	out := *h
-	// Deep-copy the embedded helmv2.HelmReleaseSpec: it owns several
-	// pointer/slice fields (Install, Upgrade, Test, Rollback,
-	// DriftDetection, Uninstall, KubeConfig, WaitStrategy, Chart,
-	// ChartRef, CommonMetadata, MaxHistory, Timeout, ValuesFrom,
-	// PostRenderers, HealthCheckExprs) that a shallow `out := *h`
-	// silently aliases to the store-owned canonical. Use the upstream
-	// generated DeepCopyInto.
 	h.DeepCopyInto(&out.HelmReleaseSpec)
 	out.Values = DeepCopyMap(h.Values)
 	out.ChartValuesFiles = slices.Clone(h.ChartValuesFiles)
-	out.DependsOn = slices.Clone(h.DependsOn)
 	out.Labels = maps.Clone(h.Labels)
 	out.Annotations = maps.Clone(h.Annotations)
 	return &out
 }
 
-// GetLabels returns the HelmRelease's metadata.labels. Implements the
-// shared accessor pkg/depwait projectObject uses for CEL exposure.
+// GetLabels returns the HelmRelease's metadata.labels.
 func (h *HelmRelease) GetLabels() map[string]string { return h.Labels }
 
 // GetAnnotations returns the HelmRelease's metadata.annotations.
 func (h *HelmRelease) GetAnnotations() map[string]string { return h.Annotations }
+
+// RenderDocument derives a Flux desired document; callers MUST keep it immutable.
+func (h *HelmRelease) RenderDocument() (map[string]any, error) {
+	doc, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&helmv2.HelmRelease{
+		APIVersion: HelmReleaseDomain + "/v2", Kind: KindHelmRelease,
+		Name: h.Name, Namespace: h.Namespace, Labels: h.Labels, Annotations: h.Annotations,
+		Spec: h.HelmReleaseSpec,
+	})
+	if err != nil {
+		return nil, inputf("project HelmRelease spec: %w", err)
+	}
+	return doc, nil
+}
 
 // ReleaseName returns the resolved Helm release name — spec.releaseName
 // when set, otherwise metadata.name — passed through release.ShortenName
@@ -249,32 +273,31 @@ func (h *HelmRelease) ReleaseNamespace() string {
 	return cmp.Or(h.TargetNamespace, h.Namespace)
 }
 
-// HelmChartLookup returns the HelmChartSource at (namespace, name) or
-// nil when not present. The shape ResolveChartRef accepts so callers
-// can pass either a SourceResolver method (orchestrator path) or a
-// custom lookup (embedders with their own source registry).
-type HelmChartLookup func(namespace, name string) *HelmChartSource
+// ChartSource returns the effective source reference used by the chart.
+func (h *HelmRelease) ChartSource() NamedResource {
+	var source NamedResource
+	for ref := range References(h, ReferenceRelations) {
+		if ref.Use == "chart" || ref.Use == "source" {
+			source = ref.NamedResource
+		}
+	}
+	return source
+}
 
-// ResolveChartRef replaces a chartRef placeholder with the resolved
-// source. When the chartRef resolves to a HelmChart CRD, its
-// spec.valuesFiles + spec.ignoreMissingValuesFiles propagate onto the
-// HelmRelease so the rendering pipeline can merge them ahead of
-// HR.Values.
-//
-// The chart rewrite is unconditional once we find the source — even
-// when the HelmChart CRD has no spec.version, we need RepoKind to flip
-// from KindHelmChart to the underlying real source (HelmRepository /
-// OCIRepository / GitRepository) so downstream chart loading can
-// dispatch. Without it, LocateChart would see RepoKind=HelmChart and
-// fall through with an "unsupported chart repo kind" error.
+// HelmChartLookup returns the HelmChartSource at the full identity, or nil when absent.
+type HelmChartLookup func(NamedResource) *HelmChartSource
+
+// ResolveChartRef replaces an unresolved HelmChart reference and propagates its values files.
+// Versionless HelmCharts MUST resolve to their underlying source for acquisition.
 func (h *HelmRelease) ResolveChartRef(lookup HelmChartLookup) error {
-	if h.Chart.RepoKind != KindHelmChart || h.Chart.Version != "" {
+	if h.Chart.Source.Kind != KindHelmChart || h.Chart.Source.Group != kindTable[kindHelmChartSource].Group || h.Chart.Version != "" {
 		return nil
 	}
-	src := lookup(h.Chart.RepoNamespace, h.Chart.RepoName)
+	id := h.ChartSource()
+	src := lookup(id)
 	if src == nil {
 		return fmt.Errorf("%w: HelmChartSource %s not found for HelmRelease %s",
-			ErrObjectNotFound, h.Chart.RepoFullName(), h.Named().NamespacedName())
+			ErrObjectNotFound, id.NamespacedName(), h.Named().NamespacedName())
 	}
 	h.Chart = helmChartFromSource(src)
 	if len(src.ValuesFiles) > 0 {
@@ -300,13 +323,13 @@ func parseHelmRelease(doc map[string]any) (*HelmRelease, error) {
 	// both the value lookup and its cache key see the same string. Bare
 	// ${VAR} (no default) is left for postBuild substitution.
 	for i := range cr.Spec.ValuesFrom {
-		cr.Spec.ValuesFrom[i].ValuesKey = ResolveEnvsubstDefaults(cr.Spec.ValuesFrom[i].ValuesKey)
-		cr.Spec.ValuesFrom[i].Name = ResolveEnvsubstDefaults(cr.Spec.ValuesFrom[i].Name)
+		cr.Spec.ValuesFrom[i].ValuesKey = resolveEnvsubstDefaults(cr.Spec.ValuesFrom[i].ValuesKey)
+		cr.Spec.ValuesFrom[i].Name = resolveEnvsubstDefaults(cr.Spec.ValuesFrom[i].Name)
 	}
 	// metadata.namespace is optional — Flux Kustomizations commonly
 	// inject it via spec.targetNamespace. Treat the empty string as
 	// "inherit later".
-	chart, err := chartFromHelmRelease(&cr.Spec, cr.Namespace)
+	chart, err := chartFromHelmRelease(&cr.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -316,30 +339,15 @@ func parseHelmRelease(doc map[string]any) (*HelmRelease, error) {
 			return nil, inputf("HelmRelease spec.values: %w", err)
 		}
 	}
-	disableSchema := (cr.Spec.Install != nil && cr.Spec.Install.DisableSchemaValidation) ||
-		(cr.Spec.Upgrade != nil && cr.Spec.Upgrade.DisableSchemaValidation)
-	disableOpenAPI := (cr.Spec.Install != nil && cr.Spec.Install.DisableOpenAPIValidation) ||
-		(cr.Spec.Upgrade != nil && cr.Spec.Upgrade.DisableOpenAPIValidation)
-	// Upgrade.CRDs wins over Install.CRDs — helm-controller's
-	// upgrade-after-install model means the upgrade policy is what
-	// the running cluster sees once any release is past its first
-	// install.
-	crdsPolicy := ""
-	if cr.Spec.Install != nil {
-		crdsPolicy = string(cr.Spec.Install.CRDs)
-	}
-	if cr.Spec.Upgrade != nil && cr.Spec.Upgrade.CRDs != "" {
-		crdsPolicy = string(cr.Spec.Upgrade.CRDs)
-	}
-	dependsOn := make([]DependencyRef, 0, len(cr.Spec.DependsOn))
+	install, upgrade := cr.GetInstall(), cr.GetUpgrade()
+	disableSchema := install.DisableSchemaValidation
+	disableOpenAPI := install.DisableOpenAPIValidation || upgrade.DisableOpenAPIValidation
+	// The upgrade policy takes precedence after the first install.
+	crdsPolicy := string(cmp.Or(upgrade.CRDs, install.CRDs))
 	for _, dep := range cr.Spec.DependsOn {
 		if dep.Name == "" {
 			return nil, inputf("HelmRelease missing dependsOn.name")
 		}
-		dependsOn = append(dependsOn, DependencyRef{
-			Kind: KindHelmRelease, Namespace: cmp.Or(dep.Namespace, cr.Namespace), Name: dep.Name,
-			ReadyExpr: dep.ReadyExpr,
-		})
 	}
 	// spec.chart.spec.valuesFiles (inline template). spec.chartRef
 	// case is handled later by ResolveChartRef once HelmChartSource is
@@ -357,7 +365,6 @@ func parseHelmRelease(doc map[string]any) (*HelmRelease, error) {
 		HelmReleaseSpec:          cr.Spec,
 		Chart:                    chart,
 		Values:                   values,
-		DependsOn:                dependsOn,
 		Labels:                   cr.Labels,
 		Annotations:              cr.Annotations,
 		DisableSchemaValidation:  disableSchema,
@@ -366,4 +373,110 @@ func parseHelmRelease(doc map[string]any) (*HelmRelease, error) {
 		IgnoreMissingValuesFiles: ignoreMissingValuesFiles,
 		CRDsPolicy:               crdsPolicy,
 	}, nil
+}
+
+func (h *HelmRelease) references(yield func(Reference) bool) {
+	if h.hasChartReferences() {
+		source := Resolve(h.Chart.Source, "", h.Namespace)
+		chartPath, files := h.Chart.sourceInputs(h.ChartValuesFiles)
+		var authored NamedResource
+		gate := func(id NamedResource) (GateStage, bool) {
+			if id != source || id.Name == "" {
+				return 0, false
+			}
+			stage := GateArtifacts
+			if id.Group == SourceDomain && id.Kind == KindHelmChart && h.Chart.Version == "" {
+				stage |= GateInputs
+			}
+			return stage, true
+		}
+		if ref := h.ChartRef; ref != nil {
+			authored = Resolve(NamedResource{Group: referenceGroup(ref.Kind, ref.APIVersion), Kind: ref.Kind, Namespace: ref.Namespace, Name: ref.Name}, "", h.Namespace)
+			if source.Kind == "" && source.Name == "" {
+				source = authored
+			}
+			stage, artifact := gate(authored)
+			if !yield(Reference{NamedResource: authored, Use: "chart", Content: true, Gate: stage, Artifact: artifact, ChartSource: artifact, ArtifactStages: GateArtifacts}) {
+				return
+			}
+		} else if tmpl := h.HelmReleaseSpec.Chart; tmpl != nil {
+			ref := tmpl.Spec.SourceRef
+			authored = Resolve(NamedResource{Group: referenceGroup(cmp.Or(ref.Kind, KindHelmRepository), ref.APIVersion), Kind: cmp.Or(ref.Kind, KindHelmRepository), Namespace: ref.Namespace, Name: ref.Name}, "", h.Namespace)
+			refFiles := files
+			refChartPath := chartPath
+			if authored != source {
+				refFiles = nil
+				refChartPath = ""
+			}
+			if source.Kind == "" && source.Name == "" {
+				source = authored
+			}
+			stage, artifact := gate(authored)
+			if !yield(Reference{NamedResource: authored, Use: "source", Content: true, Files: refFiles, ChartPath: refChartPath, Gate: stage, Artifact: artifact, ChartSource: artifact, ArtifactStages: GateArtifacts}) {
+				return
+			}
+		}
+		if source.Kind != "" && authored != source {
+			stage, artifact := gate(source)
+			if !yield(Reference{
+				NamedResource: source,
+				Use:           "source", Content: true, Files: files, ChartPath: chartPath, Gate: stage, Artifact: artifact, ChartSource: artifact,
+				ArtifactStages: GateArtifacts,
+			}) {
+				return
+			}
+		}
+	}
+
+	for i := range h.DependsOn {
+		dep := &h.DependsOn[i]
+		if !yield(Reference{
+			NamedResource: Resolve(NamedResource{Group: kindTable[kindHelmRelease].Group, Kind: KindHelmRelease, Namespace: dep.Namespace, Name: dep.Name}, "", h.Namespace),
+			Use:           "dependsOn", Position: i, ReadyExpr: referenceExpression(&dep.ReadyExpr), Gate: GateInputs, Ordering: true,
+		}) {
+			return
+		}
+	}
+	for i := range h.ValuesFrom {
+		ref := &h.ValuesFrom[i]
+		if !yield(Reference{
+			Kind: ref.Kind, Name: ref.Name, Namespace: h.Namespace,
+			Use: "valuesFrom", Position: i, Optional: ref.Optional, Content: true,
+		}) {
+			return
+		}
+	}
+}
+
+func (h *HelmRelease) kind() KindInfo { return kindTable[kindHelmRelease].KindInfo }
+
+// Content returns effective render inputs; emission metadata does not affect replay.
+func (h *HelmRelease) Content(source any, omitted []NamedResource) any {
+	return struct {
+		Omitted                  []NamedResource
+		Source                   any
+		ReleaseName              string
+		ReleaseNamespace         string
+		Chart                    HelmChart
+		Values                   map[string]any
+		Spec                     helmv2.HelmReleaseSpec
+		ChartValuesFiles         []string
+		IgnoreMissingValuesFiles bool
+		CRDsPolicy               string
+		DisableSchemaValidation  bool
+		DisableOpenAPIValidation bool
+	}{
+		Omitted:                  omitted,
+		Source:                   source,
+		ReleaseName:              h.ReleaseName(),
+		ReleaseNamespace:         h.ReleaseNamespace(),
+		Chart:                    h.Chart,
+		Values:                   h.Values,
+		Spec:                     h.HelmReleaseSpec,
+		ChartValuesFiles:         h.ChartValuesFiles,
+		IgnoreMissingValuesFiles: h.IgnoreMissingValuesFiles,
+		CRDsPolicy:               h.CRDsPolicy,
+		DisableSchemaValidation:  h.DisableSchemaValidation,
+		DisableOpenAPIValidation: h.DisableOpenAPIValidation,
+	}
 }

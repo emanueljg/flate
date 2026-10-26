@@ -1,163 +1,88 @@
 package manifest
 
 import (
-	"cmp"
+	"bytes"
+	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"maps"
-	"slices"
+	"reflect"
+	"sync"
+	"sync/atomic"
 
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	kjson "k8s.io/apimachinery/pkg/util/json"
 )
 
 // Kustomization is the Flux Kustomization CR. It bundles the path of a
 // local kustomize tree together with the in-cluster materials it produces
 // (HelmReleases, HelmRepositories, ConfigMaps, ...).
-//
-// The embedded kustomizev1.KustomizationSpec promotes Path, Suspend,
-// TargetNamespace, Components, SourceRef, PostBuild, Patches, Images,
-// CommonMetadata, NamePrefix, NameSuffix, Wait, Prune, Force,
-// HealthChecks, etc. to the top level. Shadowed by flate-only fields
-// where the projected shape differs from the upstream (DependsOn,
-// PostBuildSubstitute, PostBuildSubstituteFrom — see field docs).
 type Kustomization struct {
 	Name      string `json:"name"                yaml:"name"`
 	Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
 
 	kustomizev1.KustomizationSpec `json:",inline" yaml:",inline"`
 
-	// SourcePath is the location on disk this Kustomization was loaded
-	// from (config.kubernetes.io/path annotation).
-	SourcePath string `json:"-" yaml:"-"`
-
-	// SourceKind / SourceName / SourceNamespace mirror the embedded
-	// Spec.SourceRef with the namespace defaulted to the Kustomization's
-	// own namespace (matching Flux's behavior). The embedded struct's
-	// SourceRef is accessible at k.SourceRef when callers need the raw
-	// upstream typed form.
-	SourceKind      string `json:"-" yaml:"-"`
-	SourceName      string `json:"-" yaml:"-"`
-	SourceNamespace string `json:"-" yaml:"-"`
-
-	// Contents is the raw decoded YAML document. Retained because
-	// RenderFlux still feeds it to fluxcd/pkg/kustomize.NewGenerator
-	// as an unstructured.Unstructured.
-	Contents map[string]any `json:"-" yaml:"-"`
-
-	// PostBuildSubstitute holds the resolved substitution variables
-	// (after evaluating spec.postBuild.substituteFrom against the
-	// store). Shadows the upstream Spec.PostBuild.Substitute (which
-	// holds the spec'd unresolved values).
-	PostBuildSubstitute map[string]any `json:"-" yaml:"-"`
-
-	// PostBuildSubstituteFrom captures the typed substituteFrom refs
-	// from spec.postBuild.
-	PostBuildSubstituteFrom []SubstituteReference `json:"-" yaml:"-"`
-
-	// DependsOn is the normalized form of spec.dependsOn carrying any
-	// ReadyExpr. Shadows the embedded Spec.DependsOn ([]DependencyReference).
-	DependsOn []DependencyRef `json:"-" yaml:"-"`
+	projection *atomic.Pointer[kustomizationProjection]
 
 	Labels      map[string]string `json:"-" yaml:"-"`
 	Annotations map[string]string `json:"-" yaml:"-"`
 }
 
-// GetLabels returns the Kustomization's metadata.labels. Implements
-// the shared accessor pkg/depwait projectObject uses for CEL exposure.
+// GetLabels returns the Kustomization's metadata.labels.
 func (k *Kustomization) GetLabels() map[string]string { return k.Labels }
 
 // GetAnnotations returns the Kustomization's metadata.annotations.
 func (k *Kustomization) GetAnnotations() map[string]string { return k.Annotations }
 
+// Suspended reports whether reconciliation is paused.
+func (k *Kustomization) Suspended() bool { return k.Suspend }
+
 // Named identifies the Kustomization.
 func (k *Kustomization) Named() NamedResource {
-	return NamedResource{Kind: KindKustomization, Namespace: k.Namespace, Name: k.Name}
+	return NamedResource{Group: kindTable[kindKustomization].Group, Kind: KindKustomization, Namespace: k.Namespace, Name: k.Name}
 }
 
-// Clone returns a copy of k safe for in-place mutation during a single
-// reconcile pass. Deep-copies every mutable reference field —
-// reconcile bodies, prepare passes, and orchestrator stamping all
-// observe the same canonical store-owned object across goroutines,
-// so a partial clone is a footgun the moment any of those grow a
-// new mutation. Cheap: typical KS has <10 labels/annotations and
-// short DependsOn / PostBuildSubstituteFrom.
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (k *Kustomization) WithNamespace(namespace string) BaseManifest {
+	out := *k
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (k *Kustomization) ProjectionCompatible(previous BaseManifest) bool {
+	return k.TargetNamespace == previous.(*Kustomization).TargetNamespace
+}
+
+// Clone deep-copies mutable fields; store-owned specs MUST remain immutable.
 func (k *Kustomization) Clone() *Kustomization {
 	out := *k
-	// Deep-copy the embedded kustomizev1.KustomizationSpec: it owns
-	// pointer/slice fields (PostBuild.Substitute / SubstituteFrom,
-	// Decryption, KubeConfig, Patches, Images, HealthChecks,
-	// HealthCheckExprs, Components, spec DependsOn, Timeout, Interval)
-	// that a shallow `out := *k` silently aliases to the store-owned
-	// canonical. Use the upstream generated DeepCopyInto.
 	k.DeepCopyInto(&out.KustomizationSpec)
-	out.Contents = DeepCopyMap(k.Contents)
-	out.PostBuildSubstitute = maps.Clone(k.PostBuildSubstitute)
-	out.PostBuildSubstituteFrom = slices.Clone(k.PostBuildSubstituteFrom)
-	out.DependsOn = slices.Clone(k.DependsOn)
 	out.Labels = maps.Clone(k.Labels)
 	out.Annotations = maps.Clone(k.Annotations)
 	return &out
 }
 
-// UpdatePostBuildSubstitutions merges the given map into the substitution
-// table AND into the raw contents doc, mirroring upstream behavior so the
-// raw document is consistent for serialization.
-func (k *Kustomization) UpdatePostBuildSubstitutions(subs map[string]any) {
-	if k.PostBuildSubstitute == nil {
-		k.PostBuildSubstitute = make(map[string]any, len(subs))
+func (k *Kustomization) equal(other *Kustomization) bool {
+	if k == other {
+		return true
 	}
-	maps.Copy(k.PostBuildSubstitute, subs)
-	if k.Contents == nil {
-		return
-	}
-	spec := childMap(k.Contents, "spec")
-	post := childMap(spec, "postBuild")
-	sub := childMap(post, "substitute")
-	maps.Copy(sub, subs)
+	return k != nil && other != nil && k.Name == other.Name && k.Namespace == other.Namespace &&
+		reflect.DeepEqual(&k.KustomizationSpec, &other.KustomizationSpec) &&
+		reflect.DeepEqual(k.Labels, other.Labels) && reflect.DeepEqual(k.Annotations, other.Annotations)
 }
 
-// childMap returns parent[key] as a map[string]any, lazily creating one
-// when absent (or present as a non-map). Used by the Contents dual-write
-// helpers to walk into spec.postBuild.substitute without re-spelling the
-// type-assert-and-create dance at each level.
-func childMap(parent map[string]any, key string) map[string]any {
-	child, _ := parent[key].(map[string]any)
-	if child == nil {
-		child = make(map[string]any)
-		parent[key] = child
-	}
-	return child
-}
-
-// SetTargetNamespace sets spec.targetNamespace on both the typed field
-// and the raw Contents doc so RenderFlux (which feeds Contents to
-// kustomize) and the typed readers stay consistent. Mirrors
-// UpdatePostBuildSubstitutions' dual-write contract.
-func (k *Kustomization) SetTargetNamespace(ns string) {
-	k.TargetNamespace = ns
-	if k.Contents == nil {
-		return
-	}
-	childMap(k.Contents, "spec")["targetNamespace"] = ns
-}
-
-// parseKustomization decodes a Flux Kustomization CR via the
-// kustomize-controller typed schema. The raw doc is retained in
-// Contents because RenderFlux still feeds it to fluxcd/pkg/kustomize
-// as an unstructured.Unstructured.
 func parseKustomization(doc map[string]any) (*Kustomization, error) {
 	var cr kustomizev1.Kustomization
 	if err := decodeCR(doc, &cr, "Kustomization", FluxKustomizeDomain); err != nil {
 		return nil, err
 	}
-	// Pre-resolve envsubst defaults so flate's path / dep resolution
-	// matches what real Flux's postBuild.substitute would produce.
-	// Bare ${VAR} (no default) is left for the postBuild step to
-	// fill — only ${VAR:=default} and ${VAR:-default} collapse here.
-	cr.Spec.Path = ResolveEnvsubstDefaults(cr.Spec.Path)
-	cr.Spec.SourceRef.Name = ResolveEnvsubstDefaults(cr.Spec.SourceRef.Name)
-	cr.Spec.SourceRef.Namespace = ResolveEnvsubstDefaults(cr.Spec.SourceRef.Namespace)
+	cr.Spec.Path = resolveEnvsubstDefaults(cr.Spec.Path)
+	cr.Spec.SourceRef.Name = resolveEnvsubstDefaults(cr.Spec.SourceRef.Name)
+	cr.Spec.SourceRef.Namespace = resolveEnvsubstDefaults(cr.Spec.SourceRef.Namespace)
 	for i := range cr.Spec.DependsOn {
-		cr.Spec.DependsOn[i].Name = ResolveEnvsubstDefaults(cr.Spec.DependsOn[i].Name)
-		cr.Spec.DependsOn[i].Namespace = ResolveEnvsubstDefaults(cr.Spec.DependsOn[i].Namespace)
+		cr.Spec.DependsOn[i].Namespace = resolveEnvsubstDefaults(cr.Spec.DependsOn[i].Namespace)
 	}
 	// sourceRef validation catches the truncated-YAML case where
 	// `name:` (no value, e.g. file ends mid-mapping) decodes silently
@@ -168,47 +93,163 @@ func parseKustomization(doc map[string]any) (*Kustomization, error) {
 		return nil, inputf("Kustomization %s/%s: spec.sourceRef.kind=%q but spec.sourceRef.name is empty (check for truncated YAML)",
 			cr.Namespace, cr.Name, cr.Spec.SourceRef.Kind)
 	}
-	// namespace is optional — a parent Kustomization's
-	// spec.targetNamespace may fill it in at apply time.
-	ns := cr.Namespace
-	srcNamespace := cmp.Or(cr.Spec.SourceRef.Namespace, ns)
 
-	var substituteFrom []SubstituteReference
-	var subst map[string]any
-	if pb := cr.Spec.PostBuild; pb != nil {
-		substituteFrom = slices.Clone(pb.SubstituteFrom)
-		if len(pb.Substitute) > 0 {
-			subst = make(map[string]any, len(pb.Substitute))
-			for k, v := range pb.Substitute {
-				subst[k] = v
-			}
-		}
-	}
-
-	dependsOn := make([]DependencyRef, 0, len(cr.Spec.DependsOn))
 	for _, dep := range cr.Spec.DependsOn {
 		if dep.Name == "" {
 			return nil, inputf("Kustomization missing dependsOn.name")
 		}
-		dependsOn = append(dependsOn, DependencyRef{
-			Kind: KindKustomization, Namespace: cmp.Or(dep.Namespace, ns), Name: dep.Name,
-			ReadyExpr: dep.ReadyExpr,
-		})
 	}
 
 	return &Kustomization{
-		Name:                    cr.Name,
-		Namespace:               ns,
-		KustomizationSpec:       cr.Spec,
-		SourcePath:              cr.Annotations["config.kubernetes.io/path"],
-		SourceKind:              cr.Spec.SourceRef.Kind,
-		SourceName:              cr.Spec.SourceRef.Name,
-		SourceNamespace:         srcNamespace,
-		Contents:                doc,
-		PostBuildSubstitute:     subst,
-		PostBuildSubstituteFrom: substituteFrom,
-		DependsOn:               dependsOn,
-		Labels:                  cr.Labels,
-		Annotations:             cr.Annotations,
+		Name:              cr.Name,
+		Namespace:         cr.Namespace,
+		KustomizationSpec: cr.Spec,
+		Labels:            cr.Labels,
+		Annotations:       cr.Annotations,
+		projection:        new(atomic.Pointer[kustomizationProjection]),
 	}, nil
+}
+
+// SourceID resolves the authored source against the effective namespace.
+func (k *Kustomization) SourceID() NamedResource {
+	return Resolve(NamedResource{Group: referenceGroup(k.SourceRef.Kind, k.SourceRef.APIVersion), Kind: k.SourceRef.Kind, Namespace: k.SourceRef.Namespace, Name: k.SourceRef.Name}, "", k.Namespace)
+}
+
+// IsFragment identifies patch fragments without a render path or source name.
+func (k *Kustomization) IsFragment() bool { return k.Path == "" && k.SourceRef.Name == "" }
+
+// SubstituteStrategy returns the upstream post-build substitution policy.
+func (k *Kustomization) SubstituteStrategy() kustomizev1.SubstituteStrategy {
+	return (kustomizev1.Kustomization{Spec: k.KustomizationSpec}).GetSubstituteStrategy()
+}
+
+func (k *Kustomization) mapDependsOn(name, namespace func(string) string) *Kustomization {
+	var out *Kustomization
+	for i, dep := range k.DependsOn {
+		resolvedName := name(dep.Name)
+		resolvedNamespace := dep.Namespace
+		if namespace != nil {
+			resolvedNamespace = namespace(dep.Namespace)
+		}
+		if resolvedName == dep.Name && resolvedNamespace == dep.Namespace {
+			continue
+		}
+		if out == nil {
+			out = k.Clone()
+		}
+		out.DependsOn[i].Name = resolvedName
+		out.DependsOn[i].Namespace = resolvedNamespace
+	}
+	if out == nil {
+		return k
+	}
+	return out
+}
+
+func (k *Kustomization) references(yield func(Reference) bool, view ReferenceView) {
+	authoredSource := k.SourceRef.Kind != "" || k.SourceRef.Name != ""
+	implicitSource := view == ReferenceAll && k.Path != ""
+	if authoredSource || implicitSource {
+		src := k.SourceID()
+		content := src.Kind != "" && src.Name != ""
+		use := "source"
+		if !content && k.Path != "" {
+			src = BootstrapSourceID
+			use = ""
+		}
+		if (view == ReferenceAll || use != "") && !yield(Reference{
+			NamedResource: src,
+			Use:           use, Content: content, Gate: GateInputs | GateArtifacts, Artifact: true,
+			ArtifactStages:      GateInputs | GateArtifacts,
+			UnknownArtifactRoot: src.Group == SourceDomain && src.Kind == KindOCIRepository,
+		}) {
+			return
+		}
+	}
+	for i := range k.DependsOn {
+		dep := &k.DependsOn[i]
+		if !yield(Reference{
+			NamedResource: Resolve(NamedResource{Group: kindTable[kindKustomization].Group, Kind: KindKustomization, Namespace: dep.Namespace, Name: dep.Name}, "", k.Namespace),
+			Use:           "dependsOn", Position: i, ReadyExpr: referenceExpression(&dep.ReadyExpr), Gate: GateInputs, Ordering: true,
+		}) {
+			return
+		}
+	}
+	if k.PostBuild == nil {
+		return
+	}
+	for i, ref := range k.PostBuild.SubstituteFrom {
+		if ref.Kind != KindConfigMap && ref.Kind != KindSecret {
+			continue
+		}
+		content := !ref.Optional && ref.Name != ""
+		if !yield(Reference{
+			NamedResource: Resolve(NamedResource{Kind: ref.Kind, Name: ref.Name}, "", k.Namespace),
+			Use:           "substituteFrom", Position: i, Optional: ref.Optional, Content: content,
+		}) {
+			return
+		}
+	}
+}
+
+func (k *Kustomization) kind() KindInfo { return kindTable[kindKustomization].KindInfo }
+
+// Content returns prepared render inputs without emission labels or annotations.
+func (k *Kustomization) Content(source any) any {
+	return struct {
+		Source          any
+		Name, Namespace string
+		Spec            *kustomizev1.KustomizationSpec
+	}{source, k.Name, k.Namespace, &k.KustomizationSpec}
+}
+
+type kustomizationProjection struct {
+	raw      []byte
+	document map[string]any
+}
+
+type kustomizationEncoder struct {
+	buffer  bytes.Buffer
+	encoder *jsontext.Encoder
+	object  kustomizev1.Kustomization
+}
+
+var kustomizationEncoders = sync.Pool{New: func() any {
+	state := new(kustomizationEncoder)
+	state.encoder = jsontext.NewEncoder(&state.buffer)
+	return state
+}}
+
+// RenderDocument derives a Flux desired document; callers MUST keep it immutable.
+func (k *Kustomization) RenderDocument() (map[string]any, error) {
+	state := kustomizationEncoders.Get().(*kustomizationEncoder)
+	state.buffer.Reset()
+	state.encoder.Reset(&state.buffer)
+	state.object = kustomizev1.Kustomization{
+		APIVersion: FluxKustomizeDomain + "/v1", Kind: KindKustomization,
+		Name: k.Name, Namespace: k.Namespace, Labels: k.Labels, Annotations: k.Annotations,
+		Spec: k.KustomizationSpec,
+	}
+	defer func() {
+		state.object = kustomizev1.Kustomization{}
+		kustomizationEncoders.Put(state)
+	}()
+	err := jsonv2.MarshalEncode(state.encoder, &state.object, json.DefaultOptionsV1())
+	raw := state.buffer.Bytes()
+	if err != nil {
+		return nil, inputf("project Kustomization spec: %w", err)
+	}
+	if k.projection != nil {
+		if cached := k.projection.Load(); cached != nil && bytes.Equal(raw, cached.raw) {
+			return cached.document, nil
+		}
+	}
+	var doc map[string]any
+	if err := kjson.Unmarshal(raw, &doc); err != nil {
+		return nil, inputf("project Kustomization spec: %w", err)
+	}
+	if k.projection != nil {
+		k.projection.Store(&kustomizationProjection{raw: bytes.Clone(raw), document: doc})
+	}
+	return doc, nil
 }

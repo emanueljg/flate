@@ -1,20 +1,33 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
+	helmv2 "github.com/fluxcd/helm-controller/api/v2"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
 
 func makeKS(name, ns string, deps ...manifest.NamedResource) *manifest.Kustomization {
+	refs := make([]kustomizev1.DependencyReference, len(deps))
+	for i, dep := range deps {
+		refs[i] = kustomizev1.DependencyReference{Name: dep.Name, Namespace: dep.Namespace}
+	}
 	return &manifest.Kustomization{
 		Name: name, Namespace: ns,
 		Path:      "./" + name,
-		DependsOn: testutil.DepRefs(deps...),
+		DependsOn: refs,
 	}
 }
 
@@ -22,12 +35,13 @@ func makeKS(name, ns string, deps ...manifest.NamedResource) *manifest.Kustomiza
 // behavior the user cares about: cycle members fail before render, while
 // their Flux dependsOn graph remains intact.
 func TestFailDependsOnCycles_RecordsPreflightFailures(t *testing.T) {
-	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
+	t.Parallel()
+	idA := testutil.KustomizationID("ns", "a")
+	idB := testutil.KustomizationID("ns", "b")
 	// `extra` is an acyclic dep — it must not be marked failed.
-	idExtra := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "extra"}
+	idExtra := testutil.KustomizationID("ns", "extra")
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB, idExtra))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.store.AddObject(makeKS("extra", "ns"))
@@ -54,10 +68,11 @@ func TestFailDependsOnCycles_RecordsPreflightFailures(t *testing.T) {
 }
 
 func TestFailDependsOnCycles_ClearsResolvedCycle(t *testing.T) {
-	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
+	t.Parallel()
+	idA := testutil.KustomizationID("ns", "a")
+	idB := testutil.KustomizationID("ns", "b")
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.failDependsOnCycles()
@@ -74,14 +89,19 @@ func TestFailDependsOnCycles_ClearsResolvedCycle(t *testing.T) {
 	}
 }
 
-func TestFailDependsOnCycles_RefiresResolvedMembers(t *testing.T) {
-	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
+func TestFailDependsOnCycles_InvalidatesResolvedMembers(t *testing.T) {
+	t.Parallel()
+	idA := testutil.KustomizationID("ns", "a")
+	idB := testutil.KustomizationID("ns", "b")
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.store.AddObject(makeKS("b", "ns", idA))
 	o.failDependsOnCycles()
+	var reads store.ReadSet
+	reads.Init(o.store, idB, nil)
+	reads.GetObject(idB)
+	defer reads.Retire()
 
 	seen := map[manifest.NamedResource]int{}
 	o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
@@ -91,8 +111,9 @@ func TestFailDependsOnCycles_RefiresResolvedMembers(t *testing.T) {
 	o.store.AddObject(makeKS("a", "ns"))
 	o.failDependsOnCycles()
 
-	if seen[idB] == 0 {
-		t.Fatal("resolved cycle member b was not refired after preflight failure cleared")
+	changed := slices.Collect(o.store.Sweep())
+	if reads.Valid() || !slices.Contains(changed, idB) || seen[idB] != 0 {
+		t.Fatal("cleared preflight did not invalidate its retained assessment without an arrival")
 	}
 }
 
@@ -109,32 +130,47 @@ func TestFailDependsOnCycles_RefiresResolvedMembers(t *testing.T) {
 // e2e suite — but pinning the load-bearing behavior here keeps the
 // listener honest if it ever gets refactored.
 func TestFailDependsOnCycles_RenderEmittedCycle(t *testing.T) {
-	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
+	t.Parallel()
 
-	o := &Orchestrator{store: store.New()}
-	// Bootstrap-time graph: just one acyclic KS. No cycles to break.
-	o.store.AddObject(makeKS("acyclic", "ns"))
-	o.failDependsOnCycles()
-
-	// Now simulate the render-emit: a parent KS adds two children
-	// whose dependsOn closes a loop. Bootstrap's pass missed these.
-	o.store.AddObject(makeKS("a", "ns", idB))
-	o.store.AddObject(makeKS("b", "ns", idA))
-	// Re-run the cycle detector (the post-Bootstrap listener fires
-	// this on every KS/HR add).
-	o.failDependsOnCycles()
-
-	a, _ := o.store.GetObject(idA).(*manifest.Kustomization)
-	b, _ := o.store.GetObject(idB).(*manifest.Kustomization)
-	if a == nil || b == nil {
-		t.Fatal("emitted children went missing")
-	}
-	for _, id := range []manifest.NamedResource{idA, idB} {
-		msg, ok := o.preflightFailure(id)
-		if !ok || !strings.Contains(msg, "dependency cycle detected") {
-			t.Fatalf("%s preflight failure = %q, %v", id, msg, ok)
+	root := t.TempDir()
+	testutil.WriteFile(t, root, "flux/parent.yaml", ksYAML("parent", "parent", ""))
+	testutil.WriteFile(t, root, "parent/kustomization.yaml", "resources: [trigger.yaml]\n")
+	testutil.WriteFile(t, root, "parent/trigger.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: trigger, namespace: ns}\n")
+	o, err := New(t.Context(), Config{Path: root, RepoRoot: root, CacheDir: t.TempDir(), Concurrency: 2})
+	assert.NoError(t, err)
+	defer o.Stop()
+	assert.NoError(t, o.Bootstrap(t.Context()))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	manifest.KindOf(&manifest.RawObject{APIVersion: manifest.FluxOperatorDomain + "/v1", Kind: manifest.KindResourceSet}).Namespaced()
+	var injected atomic.Bool
+	o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, payload any) {
+		if id.Kind != manifest.KindConfigMap || id.Name != "trigger" || payload == nil || !injected.CompareAndSwap(false, true) {
+			return
 		}
+		defer cancel()
+		idA := testutil.KustomizationID("ns", "a")
+		idB := idA
+		idB.Name = "b"
+		o.store.AddObject(makeKS("a", "ns", idB))
+		o.store.AddObject(makeKS("b", "ns", idA))
+		for _, id := range []manifest.NamedResource{idA, idB} {
+			if msg, ok := o.preflightFailure(id); !ok || !strings.Contains(msg, "dependency cycle detected") {
+				t.Errorf("%s preflight failure = %q, %v", id, msg, ok)
+			}
+		}
+		for _, pair := range [][2]string{{"rs-a", "rs-b"}, {"rs-b", "rs-a"}} {
+			o.store.AddObject(&manifest.ResourceSet{Name: pair[0], Namespace: "ns", DependsOn: []fluxopv1.Dependency{{APIVersion: manifest.FluxOperatorDomain + "/v1", Kind: manifest.KindResourceSet, Name: pair[1], Namespace: "ns"}}})
+		}
+		for _, name := range []string{"rs-a", "rs-b"} {
+			id := manifest.NamedResource{Group: manifest.FluxOperatorDomain, Kind: manifest.KindResourceSet, Namespace: "ns", Name: name}
+			if msg, ok := o.preflightFailure(id); ok {
+				t.Errorf("non-render %s admitted to cycle graph: %s", id, msg)
+			}
+		}
+	}, false)
+	if err := o.Run(ctx); err == nil || !injected.Load() {
+		t.Fatalf("render-emitted fixture: injected=%t error=%v", injected.Load(), err)
 	}
 }
 
@@ -145,13 +181,14 @@ func TestFailDependsOnCycles_RenderEmittedCycle(t *testing.T) {
 // Bootstrap listener: every store add hits updateDependencyGraphFor
 // with exactly one id, no batched DFS.
 func TestUpdateDependencyGraphFor_LargeAcyclicAddThenCycle(t *testing.T) {
+	t.Parallel()
 	const N = 10000
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 
 	// Chain: ks-0 → ks-1 → ks-2 → ... → ks-(N-1). Pure DAG.
 	ids := make([]manifest.NamedResource, N)
 	for i := range N {
-		ids[i] = manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: fmt.Sprintf("ks-%05d", i)}
+		ids[i] = testutil.KustomizationID("ns", fmt.Sprintf("ks-%05d", i))
 	}
 	for i := range N {
 		var deps []manifest.NamedResource
@@ -189,11 +226,12 @@ func TestUpdateDependencyGraphFor_LargeAcyclicAddThenCycle(t *testing.T) {
 // stand up a cycle via the incremental API, then rewrite one id's
 // dependsOn to break it; every previously-failed member must clear.
 func TestUpdateDependencyGraphFor_BreaksCycle(t *testing.T) {
-	idA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	idB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
-	idC := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "c"}
+	t.Parallel()
+	idA := testutil.KustomizationID("ns", "a")
+	idB := testutil.KustomizationID("ns", "b")
+	idC := testutil.KustomizationID("ns", "c")
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(makeKS("a", "ns", idB))
 	o.updateDependencyGraphFor(idA)
 	o.store.AddObject(makeKS("b", "ns", idC))
@@ -222,18 +260,19 @@ func TestUpdateDependencyGraphFor_BreaksCycle(t *testing.T) {
 // incremental update works for HelmRelease objects — the listener
 // dispatches both kinds through one path.
 func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
-	idX := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "x"}
-	idY := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "y"}
+	t.Parallel()
+	idX := testutil.HelmReleaseID("ns", "x")
+	idY := testutil.HelmReleaseID("ns", "y")
 
-	o := &Orchestrator{store: store.New()}
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(&manifest.HelmRelease{
 		Name: "x", Namespace: "ns",
-		DependsOn: testutil.DepRefs(idY),
+		DependsOn: []helmv2.DependencyReference{{Name: idY.Name, Namespace: idY.Namespace}},
 	})
 	o.updateDependencyGraphFor(idX)
 	o.store.AddObject(&manifest.HelmRelease{
 		Name: "y", Namespace: "ns",
-		DependsOn: testutil.DepRefs(idX),
+		DependsOn: []helmv2.DependencyReference{{Name: idX.Name, Namespace: idX.Namespace}},
 	})
 	o.updateDependencyGraphFor(idY)
 
@@ -241,5 +280,50 @@ func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
 		if msg, ok := o.preflightFailure(id); !ok || !strings.Contains(msg, "dependency cycle detected") {
 			t.Fatalf("HR %s preflight = %q, %v", id, msg, ok)
 		}
+	}
+}
+
+func TestSameKindDepTargets_CallerBuffer(t *testing.T) {
+	for _, count := range []int{1, 8, 12} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			want := make([]manifest.NamedResource, count)
+			for i := range want {
+				want[i] = testutil.KustomizationID("ns", fmt.Sprint(i))
+			}
+			ks := makeKS("app", "ns", want...)
+			var buf [8]manifest.NamedResource
+			assert.Diff(t, sameKindDepTargets(ks, buf[:0]), want)
+			if count <= len(buf) {
+				allocs := testing.AllocsPerRun(100, func() {
+					_ = sameKindDepTargets(ks, buf[:0])
+				})
+				assert.Equal(t, allocs, float64(0))
+			}
+		})
+	}
+}
+
+func TestDependencyCycles_WarningsDeduplicate(t *testing.T) {
+	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
+	const members = 32
+	var wg sync.WaitGroup
+	for i := range members {
+		from := testutil.KustomizationID("ns", fmt.Sprintf("ks-%02d", i))
+		to := testutil.KustomizationID("ns", fmt.Sprintf("ks-%02d", (i+1)%members))
+		wg.Go(func() {
+			o.depGraph.ReplaceEdges(from, []manifest.NamedResource{to})
+			o.syncPreflightFailures()
+		})
+	}
+	wg.Wait()
+	for range 2 {
+		o.syncPreflightFailures()
+		warnings := o.store.Warnings()
+		if len(warnings) != 1 || warnings[0].Category != manifest.WarnDependencyCycle || warnings[0].Count != 1 || len(o.preflightFailures) != members {
+			t.Fatalf("cycle warning/failure state = %+v / %+v", warnings, o.preflightFailures)
+		}
+	}
+	if got := testing.AllocsPerRun(10, o.syncPreflightFailures); got > members {
+		t.Fatalf("cycle warning publication allocates %g times for %d members", got, members)
 	}
 }

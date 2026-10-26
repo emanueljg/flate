@@ -1,6 +1,5 @@
-// Package source is the SDK adapter for Flux's source-controller CRs.
-// It exposes per-kind Fetcher implementations (one per source type)
-// plus a content-addressed disk Cache that all fetchers write into.
+// Package source defines SDK contracts and shared helpers for Flux sources.
+// Per-kind fetchers acquire immutable artifacts through pkg/source/cache.
 //
 // Adding a new source kind:
 //
@@ -15,13 +14,23 @@ package source
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"io/fs"
+
+	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/gittree"
 	"github.com/home-operations/flate/pkg/store"
+)
+
+// Artifact filenames are shared by source fetchers and chart loaders.
+const (
+	// OCICopiedLayerFilename is the unextracted OCI layer in an artifact FS.
+	OCICopiedLayerFilename = "layer.tar.gz"
+	// HelmChartArchiveFilename is the HTTP chart archive in an artifact FS.
+	HelmChartArchiveFilename = "chart.tgz"
 )
 
 // Fetcher resolves a single source CR into an on-disk artifact. The
@@ -29,18 +38,12 @@ import (
 // dispatches via this untyped interface. Concrete implementations
 // satisfy it through Wrap[T] — see TypedFetcher.
 type Fetcher interface {
-	Fetch(ctx context.Context, obj manifest.BaseManifest) (*store.SourceArtifact, error)
+	Fetch(ctx context.Context, obj manifest.BaseManifest, reads *store.ReadSet, policy sourcecache.Policy) (*store.SourceArtifact, error)
 }
 
-// TypedFetcher is the kind-specific Fetcher each concrete source kind
-// implements (e.g. TypedFetcher[*manifest.GitRepository] for git).
-// The typed signature removes the per-implementation
-// `obj, ok := obj.(*manifest.X)` boilerplate every fetcher
-// previously opened with — a missing assertion would have panicked.
-// Wrap[T] turns a TypedFetcher into the untyped Fetcher the
-// source controller's map needs.
+// TypedFetcher acquires artifacts of one manifest type with explicit freshness and retries.
 type TypedFetcher[T manifest.BaseManifest] interface {
-	Fetch(ctx context.Context, obj T) (*store.SourceArtifact, error)
+	Fetch(ctx context.Context, obj T, reads *store.ReadSet, policy sourcecache.Policy) (*store.SourceArtifact, error)
 }
 
 // Wrap converts a TypedFetcher into the untyped Fetcher interface
@@ -57,35 +60,12 @@ type typedAdapter[T manifest.BaseManifest] struct {
 	inner TypedFetcher[T]
 }
 
-func (a typedAdapter[T]) Fetch(ctx context.Context, obj manifest.BaseManifest) (*store.SourceArtifact, error) {
+func (a typedAdapter[T]) Fetch(ctx context.Context, obj manifest.BaseManifest, reads *store.ReadSet, policy sourcecache.Policy) (*store.SourceArtifact, error) {
 	typed, ok := obj.(T)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s fetcher: unexpected payload %T", manifest.ErrInput, a.label, obj)
 	}
-	return a.inner.Fetch(ctx, typed)
-}
-
-// Suspendable is satisfied by source CR types that carry a
-// spec.suspend bool. The source controller short-circuits suspended
-// objects before invoking the Fetcher.
-type Suspendable interface {
-	Suspended() bool
-}
-
-// ExistenceFetcher is the no-op Fetcher registered for kinds whose
-// existence alone is enough to satisfy downstream waits — used today
-// for HelmRepository (a registry/index base whose per-chart pull is a
-// synthesized HelmChart). Returning nil artifact + nil error lands the
-// resource in Ready without recording a SourceArtifact, so a HelmRelease
-// that dependsOn a HelmRepository unblocks instantly without flate having
-// to mirror the controllers' "did fetch succeed?" logic from outside
-// the controller package. Embedders can also wire it for any kind they
-// want present-but-not-fetched (e.g. OCIRepository in an offline embed).
-type ExistenceFetcher struct{}
-
-// Fetch implements source.Fetcher as a no-op — see ExistenceFetcher.
-func (ExistenceFetcher) Fetch(_ context.Context, _ manifest.BaseManifest) (*store.SourceArtifact, error) {
-	return nil, nil
+	return a.inner.Fetch(ctx, typed, reads, policy)
 }
 
 // ErrUnsupportedProvider is the canonical "we only support X" error
@@ -96,33 +76,15 @@ func (ExistenceFetcher) Fetch(_ context.Context, _ manifest.BaseManifest) (*stor
 //
 // hint is a short parenthetical that names what the supported provider
 // expects (e.g. "SecretRef-based credentials" or "S3-compatible").
-func ErrUnsupportedProvider(kind, namespace, name, got, want, hint string) error {
+func ErrUnsupportedProvider(owner manifest.NamedResource, got, want, hint string) error {
 	return fmt.Errorf("%s provider %q is not implemented; flate currently supports only %q (%s)",
-		QualifiedName(kind, namespace, name), got, want, hint)
+		QualifiedName(owner.Kind, owner.Namespace, owner.Name), got, want, hint)
 }
 
-// QualifiedName is the canonical "<Kind> <namespace>/<name>" identifier the
-// per-kind fetchers prefix their error messages with — one helper so the
-// "Kind ns/name" shape can't drift across fetchers (git, oci, bucket, and
-// helmchart each wrap it as gitID/ociID/…). This is the slash form for
-// human-readable errors, distinct from RepoName()'s "ns-name" Flux resource
-// identifier used for cache slots and auth scopes.
+// QualifiedName returns the canonical "<Kind> <namespace>/<name>" error identity.
+// Cache slots and auth scopes use a distinct namespace-name representation.
 func QualifiedName(kind, namespace, name string) string {
 	return kind + " " + namespace + "/" + name
-}
-
-// CacheKeyHash marshals v to JSON, sha256-hashes the bytes, and returns
-// the hex of the first n bytes — the shared cache-key fingerprint used
-// by the per-kind fetchers. Exported so subpackages (git, oci) can reuse
-// one implementation; each caller picks its own width (n) and decides how
-// to treat a marshal error.
-func CacheKeyHash(v any, n int) (string, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:n]), nil
 }
 
 // SecretGetter resolves a Secret CR by namespace + name. Fetchers
@@ -130,5 +92,16 @@ func CacheKeyHash(v any, n int) (string, error) {
 // spec.*SecretRef accept one of these so they don't need a
 // back-reference to the Store. Today: GitRepository (auth + TLS),
 // OCIRepository (auth + TLS), Bucket (auth + TLS).
-// The orchestrator wires it to Store.GetByName at construction time.
+// The orchestrator wires it to the core Secret store lookup at construction time.
 type SecretGetter func(namespace, name string) *manifest.Secret
+
+// OperationView refreshes admitted mutable observations and retains cache acquisition identity.
+func OperationView(ctx context.Context, input fs.FS) (fs.FS, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if current, ok := input.(*gittree.FS); ok {
+		return gittree.New(ctx, nil, plumbing.ZeroHash, gittree.ViewOptions{Mode: gittree.Direct, Current: current})
+	}
+	return input, sourcecache.AcquisitionIdentity(input), nil
+}

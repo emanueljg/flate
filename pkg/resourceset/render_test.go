@@ -1,15 +1,20 @@
 package resourceset_test
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
 	apix "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/pkg/controllers/base"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/resourceset"
+	"github.com/home-operations/flate/pkg/store"
 )
 
 // TestRender_PermuteScopesByProviderName locks the core Permute
@@ -20,6 +25,7 @@ import (
 // Cartesian product is 1×1=1 — the cardinality match is the same as
 // Flatten, but the SCOPING differs, which is the observable change.
 func TestRender_PermuteScopesByProviderName(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "myrset", Namespace: "default",
 		InputStrategy: &fluxopv1.InputStrategySpec{Name: fluxopv1.InputStrategyPermute},
@@ -41,14 +47,14 @@ metadata:
 		Type:          fluxopv1.InputProviderStatic,
 		DefaultValues: fluxopv1.ResourceSetInput{"tenant": jsonTmpl(t, `"alpha"`)},
 	}
-	resolver := func(ref fluxopv1.InputProviderReference, _ string) ([]*manifest.ResourceSetInputProvider, error) {
+	resolver := func(ref fluxopv1.InputProviderReference, _ manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		if ref.Name == "myrsip" {
 			return []*manifest.ResourceSetInputProvider{rsip}, nil
 		}
 		return nil, nil
 	}
 
-	docs, err := resourceset.Render(rs, resolver)
+	docs, _, err := resourceset.Render(rs, resolver, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -66,6 +72,7 @@ metadata:
 // RSIP = 2 permutations, each combining the inline value with the
 // shared RSIP value.
 func TestRender_PermuteMultiInlineCartesian(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "rset", Namespace: "default",
 		InputStrategy: &fluxopv1.InputStrategySpec{Name: fluxopv1.InputStrategyPermute},
@@ -82,14 +89,14 @@ metadata:
   name: << index inputs "rset" "env" >>-<< index inputs "rsip" "tenant" >>
   namespace: default`,
 	}
-	resolver := func(_ fluxopv1.InputProviderReference, _ string) ([]*manifest.ResourceSetInputProvider, error) {
+	resolver := func(_ fluxopv1.InputProviderReference, _ manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		return []*manifest.ResourceSetInputProvider{{
 			Name: "rsip", Namespace: "default",
 			Type:          fluxopv1.InputProviderStatic,
 			DefaultValues: fluxopv1.ResourceSetInput{"tenant": jsonTmpl(t, `"alpha"`)},
 		}}, nil
 	}
-	docs, err := resourceset.Render(rs, resolver)
+	docs, _, err := resourceset.Render(rs, resolver, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -110,6 +117,7 @@ metadata:
 // false) silently drops it from the product. Only the non-empty
 // provider's inputs survive — and their scoping is preserved.
 func TestRender_PermuteSkipsEmptyProviderByDefault(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "rset", Namespace: "default",
 		InputStrategy: &fluxopv1.InputStrategySpec{Name: fluxopv1.InputStrategyPermute},
@@ -123,7 +131,7 @@ metadata:
   name: << index inputs "rset" "env" >>
   namespace: default`,
 	}
-	resolver := func(_ fluxopv1.InputProviderReference, _ string) ([]*manifest.ResourceSetInputProvider, error) {
+	resolver := func(_ fluxopv1.InputProviderReference, _ manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		// Dynamic provider (GitHubBranch etc.) — flate can't fetch
 		// remote APIs offline, so it exports zero input sets.
 		return []*manifest.ResourceSetInputProvider{{
@@ -131,7 +139,7 @@ metadata:
 			Type: fluxopv1.InputProviderGitHubBranch,
 		}}, nil
 	}
-	docs, err := resourceset.Render(rs, resolver)
+	docs, _, err := resourceset.Render(rs, resolver, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -146,6 +154,7 @@ metadata:
 // upstream's "permutes to empty when includeEmptyProviders is true"
 // test in combine_test.go.
 func TestRender_PermuteIncludeEmptyProvidersCollapses(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "rset", Namespace: "default",
 		InputStrategy: &fluxopv1.InputStrategySpec{
@@ -160,13 +169,13 @@ func TestRender_PermuteIncludeEmptyProvidersCollapses(t *testing.T) {
 kind: ConfigMap
 metadata: {name: x, namespace: default}`,
 	}
-	resolver := func(_ fluxopv1.InputProviderReference, _ string) ([]*manifest.ResourceSetInputProvider, error) {
+	resolver := func(_ fluxopv1.InputProviderReference, _ manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		return []*manifest.ResourceSetInputProvider{{
 			Name: "dyn", Namespace: "default",
 			Type: fluxopv1.InputProviderGitHubBranch,
 		}}, nil
 	}
-	docs, err := resourceset.Render(rs, resolver)
+	docs, _, err := resourceset.Render(rs, resolver, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -180,6 +189,7 @@ metadata: {name: x, namespace: default}`,
 // burn host RAM on a pathological combination set. With 10001 inline
 // inputs, even the single-RSET-provider case crosses the threshold.
 func TestRender_PermuteMaxPermutationsRejected(t *testing.T) {
+	t.Parallel()
 	inputs := make([]fluxopv1.ResourceSetInput, 10001)
 	for i := range inputs {
 		inputs[i] = fluxopv1.ResourceSetInput{"i": jsonTmpl(t, `"x"`)}
@@ -192,7 +202,7 @@ func TestRender_PermuteMaxPermutationsRejected(t *testing.T) {
 kind: ConfigMap
 metadata: {name: x, namespace: default}`,
 	}
-	_, err := resourceset.Render(rs, nil)
+	_, _, err := resourceset.Render(rs, nil, nil)
 	if err == nil {
 		t.Fatal("expected Render to reject the >10000-permutation case")
 	}
@@ -210,6 +220,7 @@ func jsonTmpl(t *testing.T, raw string) *apix.JSON {
 // one template + N inputs → N rendered objects, each substituting
 // inputs.X with the per-input value.
 func TestRender_InputsExpandTemplates(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "apps", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{
@@ -224,7 +235,7 @@ func TestRender_InputsExpandTemplates(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -243,6 +254,7 @@ func TestRender_InputsExpandTemplates(t *testing.T) {
 // OCIRepository referenced by all tenants) emit exactly once even when
 // templated inside a per-input matrix.
 func TestRender_Deduplication(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "apps", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{
@@ -262,7 +274,7 @@ func TestRender_Deduplication(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -275,6 +287,7 @@ func TestRender_Deduplication(t *testing.T) {
 // spec.inputs absent, just a fixed set of resources. The renderer must
 // still emit them (with a nil input set).
 func TestRender_NoInputsRendersOnce(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "policies", Namespace: "flux-system",
 		Resources: []*apix.JSON{
@@ -284,7 +297,7 @@ func TestRender_NoInputsRendersOnce(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -293,51 +306,38 @@ func TestRender_NoInputsRendersOnce(t *testing.T) {
 	}
 }
 
-// TestRender_DefaultsNamespace asserts that namespaced resources
-// without an explicit metadata.namespace inherit the ResourceSet's
-// own namespace, while cluster-scoped kinds (Namespace, ClusterRole,
-// CRD, etc.) stay namespace-less.
-func TestRender_DefaultsNamespace(t *testing.T) {
+func TestRender_PreservesNamespaces(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "tenant-x",
 		Inputs: []fluxopv1.ResourceSetInput{{"name": jsonTmpl(t, `"a"`)}},
 		Resources: []*apix.JSON{
-			// Namespaced — should default to tenant-x.
-			jsonTmpl(t, `{
-					"apiVersion": "v1", "kind": "ConfigMap",
-					"metadata": {"name": "<< inputs.name >>"}
-				}`),
-			// Cluster-scoped — must stay namespace-less.
-			jsonTmpl(t, `{
-					"apiVersion": "v1", "kind": "Namespace",
-					"metadata": {"name": "<< inputs.name >>"}
-				}`),
+			jsonTmpl(t, `{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "<< inputs.name >>"}}`),
+			jsonTmpl(t, `{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "<< inputs.name >>"}}`),
+			jsonTmpl(t, `{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "<< inputs.name >>"}}`),
+			jsonTmpl(t, `{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "<< inputs.name >>", "namespace": "authored"}}`),
+			jsonTmpl(t, `{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "explicit", "namespace": "authored"}}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
-		t.Fatalf("Render: %v", err)
+		t.Fatal(err)
 	}
-	for _, doc := range docs {
-		kind := doc["kind"].(string)
-		md := doc["metadata"].(map[string]any)
-		ns, _ := md["namespace"].(string)
-		switch kind {
-		case "ConfigMap":
-			if ns != "tenant-x" {
-				t.Errorf("ConfigMap namespace=%q want tenant-x", ns)
-			}
-		case "Namespace":
-			if ns != "" {
-				t.Errorf("Namespace got injected namespace=%q (cluster-scoped)", ns)
-			}
+	if len(docs) != 5 {
+		t.Fatalf("documents = %d", len(docs))
+	}
+	for i, want := range []string{"", "", "", "authored", "authored"} {
+		_, ns := manifest.DocMetadata(docs[i])
+		if ns != want {
+			t.Errorf("document %d namespace = %q, want %q", i, ns, want)
 		}
 	}
 }
 
 // TestRender_CommonMetadata stamps labels + annotations on every
 // emitted object.
-func TestRender_CommonMetadata(t *testing.T) {
+func TestRender_UnstampedCommonMetadata(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		CommonMetadata: &fluxopv1.CommonMetadata{
@@ -351,11 +351,15 @@ func TestRender_CommonMetadata(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	md := docs[0]["metadata"].(map[string]any)
+	if md["labels"] != nil || md["annotations"] != nil {
+		t.Fatal("raw ResourceSet render contains controller stamps")
+	}
+	base.Stamp(rs.EmissionPolicy(), docs)
 	labels, _ := md["labels"].(map[string]any)
 	if labels["team"] != "platform" {
 		t.Errorf("commonMetadata.labels not merged: %v", labels)
@@ -366,7 +370,8 @@ func TestRender_CommonMetadata(t *testing.T) {
 	}
 }
 
-func TestRender_OwnerLabels(t *testing.T) {
+func TestRender_UnstampedOwnerLabels(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "apps", Namespace: "tenant-a",
 		Resources: []*apix.JSON{
@@ -376,11 +381,15 @@ func TestRender_OwnerLabels(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	md := docs[0]["metadata"].(map[string]any)
+	if md["labels"] != nil || md["annotations"] != nil {
+		t.Fatal("raw ResourceSet render contains controller stamps")
+	}
+	base.Stamp(rs.EmissionPolicy(), docs)
 	labels, _ := md["labels"].(map[string]any)
 	if labels[fluxopv1.OwnerLabelResourceSetName] != "apps" {
 		t.Errorf("owner name label missing: %v", labels)
@@ -393,6 +402,7 @@ func TestRender_OwnerLabels(t *testing.T) {
 // TestRender_SprigFunctions exercises a few stdlib + slugify funcs to
 // confirm the template engine plumbs them through.
 func TestRender_SprigFunctions(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{
@@ -406,7 +416,7 @@ func TestRender_SprigFunctions(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -424,6 +434,7 @@ func TestRender_SprigFunctions(t *testing.T) {
 // exclusion pattern documented for ResourceSet: a resource with
 // `fluxcd.controlplane.io/reconcile: disabled` is dropped.
 func TestRender_DisabledReconcileAnnotationSkips(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{
@@ -442,7 +453,7 @@ func TestRender_DisabledReconcileAnnotationSkips(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -453,6 +464,23 @@ func TestRender_DisabledReconcileAnnotationSkips(t *testing.T) {
 	if md["name"] != "a" {
 		t.Errorf("wrong tenant kept: %v", md["name"])
 	}
+	rs.Resources = []*apix.JSON{
+		jsonTmpl(t, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"same","annotations":{"fluxcd.controlplane.io/reconcile":"disabled"}}}`),
+		jsonTmpl(t, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"same"},"data":{"value":"enabled"}}`),
+	}
+	docs, _, err = resourceset.Render(rs, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, len(docs), 1)
+	assert.Diff(t, docs[0]["data"], map[string]any{"value": "enabled"})
+	for _, value := range []string{"Disabled", "false", "enabled"} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			candidate := &manifest.ResourceSet{Name: "exact", ResourcesTemplate: fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n name: exact\n annotations: {fluxcd.controlplane.io/reconcile: %q}", value)}
+			docs, _, err := resourceset.Render(candidate, nil, nil)
+			assert.NoError(t, err)
+			assert.Equal(t, len(docs), 1)
+		})
+	}
 }
 
 // TestRender_InputsProviderBuiltinField asserts every rendered input
@@ -461,6 +489,7 @@ func TestRender_DisabledReconcileAnnotationSkips(t *testing.T) {
 // distinguish ResourceSet inline inputs from ResourceSetInputProvider
 // inputs once that's supported.
 func TestRender_InputsProviderBuiltinField(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "apps", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{{"tenant": jsonTmpl(t, `"a"`)}},
@@ -476,7 +505,7 @@ func TestRender_InputsProviderBuiltinField(t *testing.T) {
 				}`),
 		},
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -497,6 +526,7 @@ func TestRender_InputsProviderBuiltinField(t *testing.T) {
 // useful error rather than silently rendering "<no value>". Templates
 // that work in flate must also work in real flux-operator and vice versa.
 func TestRender_MissingKeyErrors(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{{"tenant": jsonTmpl(t, `"a"`)}},
@@ -507,13 +537,14 @@ func TestRender_MissingKeyErrors(t *testing.T) {
 				}`),
 		},
 	}
-	_, err := resourceset.Render(rs, nil)
+	_, _, err := resourceset.Render(rs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for undefined input key, got nil")
 	}
 }
 
 func TestRender_UsesResourceSetInputProviderStatusExportedInputs(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "apps", Namespace: "flux-system",
 		InputsFrom: []fluxopv1.InputProviderReference{{
@@ -538,9 +569,9 @@ func TestRender_UsesResourceSetInputProviderStatusExportedInputs(t *testing.T) {
 		},
 	}
 
-	docs, err := resourceset.Render(rs, func(fluxopv1.InputProviderReference, string) ([]*manifest.ResourceSetInputProvider, error) {
+	docs, _, err := resourceset.Render(rs, func(fluxopv1.InputProviderReference, manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		return []*manifest.ResourceSetInputProvider{rsip}, nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -556,6 +587,7 @@ func TestRender_UsesResourceSetInputProviderStatusExportedInputs(t *testing.T) {
 }
 
 func TestResourceSetInputProvider_StatusExportedInputsOverrideDerivedID(t *testing.T) {
+	t.Parallel()
 	rsip := &manifest.ResourceSetInputProvider{
 		Name: "static", Namespace: "flux-system",
 		Type:          fluxopv1.InputProviderStatic,
@@ -579,6 +611,7 @@ func TestResourceSetInputProvider_StatusExportedInputsOverrideDerivedID(t *testi
 // TestRender_MalformedTemplateErrors surfaces a parse error rather than
 // silently swallowing the broken template.
 func TestRender_MalformedTemplateErrors(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{{"name": jsonTmpl(t, `"a"`)}},
@@ -589,7 +622,7 @@ func TestRender_MalformedTemplateErrors(t *testing.T) {
 				}`), // unterminated template
 		},
 	}
-	_, err := resourceset.Render(rs, nil)
+	_, _, err := resourceset.Render(rs, nil, nil)
 	if err == nil {
 		t.Fatal("expected parse error for malformed template, got nil")
 	}
@@ -601,6 +634,7 @@ func TestRender_MalformedTemplateErrors(t *testing.T) {
 // (no error wrapping needed) and that the resulting indentation lines
 // up with the surrounding YAML.
 func TestRender_ToYamlNindent(t *testing.T) {
+	t.Parallel()
 	rs := &manifest.ResourceSet{
 		Name: "test", Namespace: "flux-system",
 		Inputs: []fluxopv1.ResourceSetInput{
@@ -615,7 +649,7 @@ spec:
   layerSelector: << inputs.layerSelector | toYaml | nindent 4 >>
 `,
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -626,13 +660,10 @@ spec:
 	}
 }
 
-// TestRender_InputsFrom_StaticProvider locks the billimek volsync
-// pattern: a ResourceSet with no inline inputs that references a Static
-// ResourceSetInputProvider, whose defaultValues become a single input
-// set the template iterates over with `<<- range $app := inputs.apps >>`.
 func TestRender_InputsFrom_StaticProvider(t *testing.T) {
+	t.Parallel()
 	rsip := &manifest.ResourceSetInputProvider{
-		Name: "apps", Namespace: "kube-system",
+		Name: "apps", Namespace: "kube-system", Labels: map[string]string{"set": "apps"},
 		Type: fluxopv1.InputProviderStatic,
 		DefaultValues: fluxopv1.ResourceSetInput{
 			"defaults": jsonTmpl(t, `{"capacity": "1Gi"}`),
@@ -656,13 +687,13 @@ data:
 <<- end >>
 `,
 	}
-	resolver := func(ref fluxopv1.InputProviderReference, ns string) ([]*manifest.ResourceSetInputProvider, error) {
-		if ref.Name == "apps" && ns == "kube-system" {
-			return []*manifest.ResourceSetInputProvider{rsip}, nil
-		}
-		return nil, nil
-	}
-	docs, err := resourceset.Render(rs, resolver)
+	st := store.New()
+	st.AddObject(rsip)
+	other := *rsip
+	other.Namespace = "other"
+	st.AddObject(&other)
+	st.AddObject(&manifest.RawObject{APIVersion: "example.test/v1", Kind: manifest.KindResourceSetInputProvider, Name: rsip.Name, Namespace: rsip.Namespace})
+	docs, _, err := resourceset.Render(rs, resourceset.StoreResolver(st), nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -675,9 +706,216 @@ data:
 		data := doc["data"].(map[string]any)
 		caps[md["name"].(string)] = data["capacity"].(string)
 	}
-	// alpha falls back to inputs.defaults.capacity (1Gi); bravo
-	// overrides via its own per-app capacity (5Gi).
 	assert.Diff(t, caps, map[string]string{"alpha": "1Gi", "bravo": "5Gi"})
+	for _, selector := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, apiVersion, kind string
+			want                   int
+		}{
+			{"omitted", "", "", 2},
+			{"explicit", "fluxcd.controlplane.io/v1", manifest.KindResourceSetInputProvider, 2},
+			{"kind only", "", manifest.KindResourceSetInputProvider, 2},
+			{"version only", "fluxcd.controlplane.io/v1", "", 2},
+			{"foreign", "example.test/v1", "", 0},
+			{"core", "v1", "", 0},
+			{"other kind", "", manifest.KindResourceSet, 0},
+		} {
+			t.Run(fmt.Sprintf("%s/selector=%t", tc.name, selector), func(t *testing.T) {
+				t.Parallel()
+				candidate := *rs
+				ref := fluxopv1.InputProviderReference{APIVersion: tc.apiVersion, Kind: tc.kind, Name: rsip.Name}
+				if selector {
+					ref.Name = ""
+					ref.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"set": "apps"}}
+				}
+				candidate.InputsFrom = []fluxopv1.InputProviderReference{ref}
+				docs, _, err := resourceset.Render(&candidate, resourceset.StoreResolver(st), nil)
+				if err != nil || len(docs) != tc.want {
+					t.Fatalf("docs=%d, error=%v, want %d", len(docs), err, tc.want)
+				}
+			})
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		refs []fluxopv1.InputProviderReference
+		want int
+	}{
+		{"expressions", []fluxopv1.InputProviderReference{{Selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "set", Operator: metav1.LabelSelectorOpIn, Values: []string{"apps"}}}}}}, 2},
+		{"empty selector", []fluxopv1.InputProviderReference{{Selector: &metav1.LabelSelector{}}}, 2},
+		{"named invalid selector", []fluxopv1.InputProviderReference{{Name: rsip.Name, Selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "set", Operator: "invalid"}}}}}, 2},
+		{"nil selector", []fluxopv1.InputProviderReference{{}}, 0},
+		{"overlapping references", []fluxopv1.InputProviderReference{{Name: rsip.Name}, {Selector: &metav1.LabelSelector{}}, {Selector: &metav1.LabelSelector{MatchLabels: rsip.Labels}}}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			candidate := *rs
+			candidate.InputsFrom = tc.refs
+			got, _, err := resourceset.Render(&candidate, resourceset.StoreResolver(st), nil)
+			assert.NoError(t, err)
+			if len(got) != tc.want {
+				t.Fatalf("docs=%d, want %d", len(got), tc.want)
+			}
+			if tc.want != 0 {
+				assert.Diff(t, got, docs)
+			}
+		})
+	}
+
+}
+
+func TestStoreResolver_CollectionAssessmentTotal(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		provider  bool
+		selector  *metav1.LabelSelector
+		wantError bool
+		wantDocs  int
+	}{
+		{name: "empty", selector: &metav1.LabelSelector{}},
+		{name: "null values", provider: true, selector: &metav1.LabelSelector{}, wantDocs: 1},
+		{name: "selector error", selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "role", Operator: "invalid"}}}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.New()
+			if tc.provider {
+				st.AddObject(&manifest.ResourceSetInputProvider{Name: "provider", Namespace: "apps", DefaultValues: fluxopv1.ResourceSetInput{"value": nil}})
+			}
+			rs := &manifest.ResourceSet{Name: "reader", Namespace: "apps", InputsFrom: []fluxopv1.InputProviderReference{{Selector: tc.selector}}, ResourcesTemplate: "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: output}\n"}
+			var reads store.ReadSet
+			reads.Init(st, rs.Named(), nil)
+			defer reads.Retire()
+			docs, _, err := resourceset.Render(rs, resourceset.StoreResolver(&reads), nil)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("prepare error=%v, want error=%t", err, tc.wantError)
+			}
+			if tc.wantError {
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, len(docs), tc.wantDocs)
+			assert.Equal(t, reads.Valid(), true)
+		})
+	}
+}
+
+func TestStoreResolver_SelectorInputs(t *testing.T) {
+	t.Parallel()
+	db := &manifest.ResourceSetInputProvider{Name: "db", Namespace: "apps", Labels: map[string]string{"role": "db"}, DefaultValues: fluxopv1.ResourceSetInput{"value": jsonTmpl(t, `"first"`)}}
+	web := *db
+	web.Name, web.Labels = "web", map[string]string{"role": "web"}
+	other := *db
+	other.Namespace = "other"
+	invalid := &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "role", Operator: "invalid"}}}
+	selected := &metav1.LabelSelector{MatchLabels: map[string]string{"role": "db"}}
+	scope := manifest.NamedResource{Group: manifest.FluxOperatorDomain, Kind: manifest.KindResourceSetInputProvider, Namespace: "apps"}
+	for _, tc := range []struct {
+		name      string
+		providers []manifest.BaseManifest
+		ref       fluxopv1.InputProviderReference
+		id        manifest.NamedResource
+		want      []string
+		wantError bool
+	}{
+		{"success", []manifest.BaseManifest{db, &web}, fluxopv1.InputProviderReference{Selector: selected}, scope, []string{"db"}, false},
+		{"empty selector", []manifest.BaseManifest{db, &web}, fluxopv1.InputProviderReference{Selector: &metav1.LabelSelector{}}, scope, []string{"db", "web"}, false},
+		{"invalid eligible", []manifest.BaseManifest{db}, fluxopv1.InputProviderReference{Selector: invalid}, scope, nil, true},
+		{"invalid empty", nil, fluxopv1.InputProviderReference{Selector: invalid}, scope, nil, true},
+		{"invalid other namespace", []manifest.BaseManifest{&other}, fluxopv1.InputProviderReference{Selector: invalid}, scope, nil, true},
+		{"invalid foreign group", []manifest.BaseManifest{db, &manifest.RawObject{APIVersion: "other.example/v1", Kind: scope.Kind, Namespace: scope.Namespace, Name: db.Name}}, fluxopv1.InputProviderReference{Selector: invalid}, manifest.NamedResource{Group: "other.example", Kind: scope.Kind, Namespace: scope.Namespace}, nil, true},
+		{"invalid foreign kind", []manifest.BaseManifest{db, &manifest.ResourceSet{Name: db.Name, Namespace: scope.Namespace}}, fluxopv1.InputProviderReference{Selector: invalid}, manifest.NamedResource{Group: scope.Group, Kind: manifest.KindResourceSet, Namespace: scope.Namespace}, nil, true},
+		{"named invalid selector", []manifest.BaseManifest{db}, fluxopv1.InputProviderReference{Selector: invalid}, db.Named(), []string{"db"}, false},
+		{"unnamed nil selector", []manifest.BaseManifest{db}, fluxopv1.InputProviderReference{}, scope, nil, false},
+		{"omitted group and kind", []manifest.BaseManifest{db, &web}, fluxopv1.InputProviderReference{Selector: selected}, manifest.NamedResource{Namespace: scope.Namespace}, []string{"db"}, false},
+		{"omitted group", []manifest.BaseManifest{db}, fluxopv1.InputProviderReference{Selector: invalid}, manifest.NamedResource{Kind: scope.Kind, Namespace: scope.Namespace}, nil, true},
+		{"omitted kind", []manifest.BaseManifest{db}, fluxopv1.InputProviderReference{Selector: invalid}, manifest.NamedResource{Group: scope.Group, Namespace: scope.Namespace}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.New()
+			for _, p := range tc.providers {
+				st.AddObject(p)
+			}
+			resolve := resourceset.StoreResolver(st)
+			for range 2 {
+				got, err := resolve(tc.ref, tc.id)
+				if (err != nil) != tc.wantError {
+					t.Fatalf("resolve error=%v, want error=%t", err, tc.wantError)
+				}
+				var names []string
+				for _, p := range got {
+					names = append(names, p.Name)
+				}
+				assert.Diff(t, names, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		prior *metav1.LabelSelector
+	}{
+		{"first cached error in empty scope", nil},
+		{"additional cached error in empty scope", selected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.New()
+			st.AddObject(db)
+			resolve := resourceset.StoreResolver(st)
+			if tc.prior != nil {
+				got, err := resolve(fluxopv1.InputProviderReference{Selector: tc.prior}, scope)
+				assert.NoError(t, err)
+				assert.Equal(t, len(got), 1)
+			}
+			ref := fluxopv1.InputProviderReference{Selector: invalid}
+			empty := scope
+			empty.Namespace = "empty"
+			for range 2 {
+				if _, err := resolve(ref, scope); err == nil {
+					t.Fatal("invalid selector accepted with an eligible provider")
+				}
+				got, err := resolve(ref, empty)
+				if err == nil || len(got) != 0 {
+					t.Fatalf("empty scope query = %v, %v; want selector error", got, err)
+				}
+			}
+		})
+	}
+	t.Run("distinct selectors and live providers", func(t *testing.T) {
+		t.Parallel()
+		st := store.New()
+		st.AddObject(db)
+		st.AddObject(&web)
+		resolve := resourceset.StoreResolver(st)
+		webSelector := &metav1.LabelSelector{MatchLabels: web.Labels}
+		for _, tc := range []struct {
+			selector *metav1.LabelSelector
+			want     manifest.NamedResource
+		}{{selected, db.Named()}, {webSelector, web.Named()}, {selected, db.Named()}, {webSelector, web.Named()}} {
+			got, err := resolve(fluxopv1.InputProviderReference{Selector: tc.selector}, scope)
+			assert.NoError(t, err)
+			if len(got) != 1 || got[0].Named() != tc.want {
+				t.Fatalf("providers=%v, want %s", got, tc.want)
+			}
+		}
+		fresh := *db
+		fresh.Labels = map[string]string{"role": "web"}
+		fresh.DefaultValues = fluxopv1.ResourceSetInput{"value": jsonTmpl(t, `"updated"`)}
+		st.AddObject(&fresh)
+		got, err := resolve(fluxopv1.InputProviderReference{Selector: selected}, scope)
+		assert.NoError(t, err)
+		assert.Equal(t, len(got), 0)
+		got, err = resolve(fluxopv1.InputProviderReference{Selector: webSelector}, scope)
+		assert.NoError(t, err)
+		if len(got) != 2 || got[0].Named() != db.Named() || got[1].Named() != web.Named() {
+			t.Fatalf("updated providers=%v, want db and web", got)
+		}
+		inputs, err := got[0].ExportedInputs()
+		assert.NoError(t, err)
+		assert.Equal(t, inputs[0]["value"], "updated")
+	})
 }
 
 // TestRender_InputsFrom_DynamicProviderEmptySkip verifies that a
@@ -685,6 +923,7 @@ data:
 // zero input sets rather than erroring — the ResourceSet still renders
 // with whatever inline inputs it has.
 func TestRender_InputsFrom_DynamicProviderEmptySkip(t *testing.T) {
+	t.Parallel()
 	rsip := &manifest.ResourceSetInputProvider{
 		Name: "branches", Namespace: "flux-system",
 		Type: fluxopv1.InputProviderGitHubBranch,
@@ -705,15 +944,18 @@ metadata:
   namespace: flux-system
 `,
 	}
-	resolver := func(_ fluxopv1.InputProviderReference, _ string) ([]*manifest.ResourceSetInputProvider, error) {
+	resolver := func(_ fluxopv1.InputProviderReference, _ manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
 		return []*manifest.ResourceSetInputProvider{rsip}, nil
 	}
-	docs, err := resourceset.Render(rs, resolver)
+	docs, warnings, err := resourceset.Render(rs, resolver, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if len(docs) != 1 {
 		t.Fatalf("expected 1 doc from inline input (dynamic provider contributes nothing), got %d", len(docs))
+	}
+	if len(warnings) != 1 || warnings[0].Category != manifest.WarnOfflineInputProvider || warnings[0].Resource != rs.Named() || warnings[0].Detail[0] != rsip.Named().String() {
+		t.Fatalf("offline provider warning = %+v", warnings)
 	}
 	md := docs[0]["metadata"].(map[string]any)
 	if md["name"] != "inline-only" {
@@ -721,9 +963,8 @@ metadata:
 	}
 }
 
-// TestRender_ResourcesTemplate covers spec.resourcesTemplate (multi-doc
-// YAML string variant).
 func TestRender_ResourcesTemplate(t *testing.T) {
+	t.Parallel()
 	tmpl := `---
 apiVersion: v1
 kind: ConfigMap
@@ -744,11 +985,399 @@ metadata:
 		},
 		ResourcesTemplate: tmpl,
 	}
-	docs, err := resourceset.Render(rs, nil)
+	docs, _, err := resourceset.Render(rs, nil, nil)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if len(docs) != 4 {
 		t.Errorf("expected 4 docs (2 inputs × 2 docs each), got %d", len(docs))
+	}
+	t.Run("invalid stream separator", func(t *testing.T) {
+		t.Parallel()
+		candidate := &manifest.ResourceSet{Name: "stream", ResourcesTemplate: "\n---oops: kept\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: rejected}"}
+		_, _, err := resourceset.Render(candidate, nil, nil)
+		if !errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) {
+			t.Fatalf("error = %v, want classified invalid stream separator", err)
+		}
+	})
+	t.Run("duplicate mapping keys", func(t *testing.T) {
+		t.Parallel()
+		candidate := &manifest.ResourceSet{Name: "duplicate-keys", ResourcesTemplate: `--- # comment
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: {name: db}
+spec:
+  postgresql: {value: first}
+  postgresql: {value: last}
+`}
+		docs, _, err := resourceset.Render(candidate, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(docs) != 1 {
+			t.Fatalf("documents = %d, want 1", len(docs))
+		}
+		assert.Diff(t, docs[0]["spec"], map[string]any{"postgresql": map[string]any{"value": "last"}})
+	})
+}
+
+func TestRender_NullInput(t *testing.T) {
+	t.Parallel()
+	rs := &manifest.ResourceSet{
+		Name: "null", Namespace: "apps",
+		Inputs: []fluxopv1.ResourceSetInput{{"value": nil, "malformed": {Raw: []byte("invalid")}}},
+		ResourcesTemplate: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: null-input}
+data:
+  value: << if eq inputs.value nil >>"null"<< end >>
+  malformed: << if hasKey inputs "malformed" >>present<< else >>omitted<< end >>`,
+	}
+	docs, _, err := resourceset.Render(rs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("documents = %d, want 1", len(docs))
+	}
+	assert.Diff(t, docs[0]["data"], map[string]any{"value": "null", "malformed": "omitted"})
+}
+
+func TestRender_SlugifyLength(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, input, want string }{
+		{"truncate", strings.Repeat("a", 64), strings.Repeat("a", 63)},
+		{"smart truncate", strings.Repeat("a", 32) + " " + strings.Repeat("b", 32), strings.Repeat("a", 32)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := &manifest.ResourceSet{
+				Name: "slug", Namespace: "apps",
+				Inputs: []fluxopv1.ResourceSetInput{{"name": jsonTmpl(t, `"`+tc.input+`"`)}},
+				ResourcesTemplate: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: << inputs.name | slugify >>}`,
+			}
+			docs, _, err := resourceset.Render(rs, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(docs) != 1 {
+				t.Fatalf("documents = %d, want 1", len(docs))
+			}
+			assert.Equal(t, docs[0]["metadata"].(map[string]any)["name"].(string), tc.want)
+		})
+	}
+}
+
+func TestRender_Steps(t *testing.T) {
+	t.Parallel()
+	resource := jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"first"}}`)
+	template := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: second}"
+	for _, tt := range []struct {
+		name    string
+		spec    fluxopv1.ResourceSetSpec
+		names   []string
+		wantErr string
+	}{
+		{name: "ordered steps", spec: fluxopv1.ResourceSetSpec{Steps: []fluxopv1.ResourceSetStep{
+			{Name: "deploy", Resources: []*apix.JSON{resource}},
+			{Name: "config", ResourcesTemplate: template},
+		}}, names: []string{"first", "second"}},
+		{name: "dedup within step", spec: fluxopv1.ResourceSetSpec{Inputs: []fluxopv1.ResourceSetInput{{}}, Steps: []fluxopv1.ResourceSetStep{
+			{Name: "deploy", Resources: []*apix.JSON{resource, resource}},
+		}}, names: []string{"first"}},
+		{name: "no-input duplicate inside a step keeps both", spec: fluxopv1.ResourceSetSpec{Steps: []fluxopv1.ResourceSetStep{
+			{Name: "deploy", Resources: []*apix.JSON{resource, resource}},
+		}}, names: []string{"first", "first"}},
+		{name: "duplicate across steps", spec: fluxopv1.ResourceSetSpec{Steps: []fluxopv1.ResourceSetStep{
+			{Name: "first", Resources: []*apix.JSON{resource}},
+			{Name: "second", Resources: []*apix.JSON{jsonTmpl(t, `{"apiVersion":"apps/v1beta2","kind":"Deployment","metadata":{"name":"first"}}`)}},
+		}}, wantErr: "duplicate resource"},
+		{name: "empty identity across steps", spec: fluxopv1.ResourceSetSpec{Steps: []fluxopv1.ResourceSetStep{
+			{Name: "first", Resources: []*apix.JSON{jsonTmpl(t, `{}`)}},
+			{Name: "second", Resources: []*apix.JSON{jsonTmpl(t, `{}`)}},
+		}}, wantErr: "duplicate resource"},
+		{name: "steps and resources", spec: fluxopv1.ResourceSetSpec{Resources: []*apix.JSON{resource}, Steps: []fluxopv1.ResourceSetStep{{Name: "deploy", Resources: []*apix.JSON{resource}}}}, wantErr: "mutually exclusive"},
+		{name: "steps and template", spec: fluxopv1.ResourceSetSpec{ResourcesTemplate: template, Steps: []fluxopv1.ResourceSetStep{{Name: "deploy", Resources: []*apix.JSON{resource}}}}, wantErr: "mutually exclusive"},
+		{name: "empty step with empty providers", spec: fluxopv1.ResourceSetSpec{InputsFrom: []fluxopv1.InputProviderReference{{Name: "empty"}}, Steps: []fluxopv1.ResourceSetStep{{Name: "empty"}}}, wantErr: "at least one"},
+		{name: "step template error", spec: fluxopv1.ResourceSetSpec{Steps: []fluxopv1.ResourceSetStep{{Name: "bad", ResourcesTemplate: "<< inputs.missing >>"}}}, wantErr: `step "bad"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rs := &manifest.ResourceSet{Name: "steps", Namespace: "default", ResourceSetSpec: tt.spec}
+			docs, _, err := resourceset.Render(rs, nil, nil)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			names := make([]string, 0, len(docs))
+			base.Stamp(rs.EmissionPolicy(), docs)
+			for _, doc := range docs {
+				name, ns := manifest.DocMetadata(doc)
+				if ns != "" {
+					t.Errorf("namespace = %q", ns)
+				}
+				labels := doc["metadata"].(map[string]any)["labels"].(map[string]any)
+				if labels[fluxopv1.OwnerLabelResourceSetName] != "steps" {
+					t.Errorf("labels = %v", labels)
+				}
+				names = append(names, name)
+			}
+			assert.Diff(t, names, tt.names)
+		})
+	}
+}
+
+func TestRender_EmptyInputRule(t *testing.T) {
+	t.Parallel()
+	for _, strategy := range []string{fluxopv1.InputStrategyFlatten, fluxopv1.InputStrategyPermute} {
+		for _, referenced := range []bool{false, true} {
+			name := strategy + "/inline-only"
+			if referenced {
+				name = strategy + "/empty-provider"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				rs := &manifest.ResourceSet{Name: "empty", Namespace: "default", InputStrategy: &fluxopv1.InputStrategySpec{Name: strategy}, ResourcesTemplate: "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: static}"}
+				want := 1
+				if referenced {
+					rs.InputsFrom = []fluxopv1.InputProviderReference{{Name: "empty"}}
+					want = 0
+				}
+				resolve := func(fluxopv1.InputProviderReference, manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
+					return []*manifest.ResourceSetInputProvider{{Name: "empty", Type: fluxopv1.InputProviderGitHubBranch}}, nil
+				}
+				docs, _, err := resourceset.Render(rs, resolve, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(docs) != want {
+					t.Fatalf("docs = %d, want %d", len(docs), want)
+				}
+			})
+		}
+	}
+}
+
+func TestRender_GroupDedup(t *testing.T) {
+	t.Parallel()
+	rs := &manifest.ResourceSet{Name: "group", Namespace: "default", Inputs: []fluxopv1.ResourceSetInput{{}}, Resources: []*apix.JSON{
+		jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"shared"}}`),
+		jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"StatefulSet","metadata":{"name":"shared"}}`),
+		jsonTmpl(t, `{"apiVersion":"example.test/v1","kind":"Widget"}`),
+		jsonTmpl(t, `{"apiVersion":"other.test/v1","kind":"Widget"}`),
+		jsonTmpl(t, `{"apiVersion":"v1","metadata":{"name":"kindless"}}`),
+		jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"shared","namespace":"a"}}`),
+		jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"shared","namespace":"b"}}`),
+		jsonTmpl(t, `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"other"}}`),
+		jsonTmpl(t, `{"data":{"value":"zero"}}`),
+		jsonTmpl(t, `{}`),
+	}, ResourcesTemplate: `apiVersion: apps/v1beta2
+kind: Deployment
+metadata: {name: shared}
+---
+apiVersion: other.example/v1
+kind: Deployment
+metadata: {name: shared}
+---
+apiVersion: example.test/v1
+kind: Deployment
+metadata: {}
+---
+apiVersion: example.test/v1
+metadata: {name: incomplete}`}
+	docs, _, err := resourceset.Render(rs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 10 {
+		t.Fatalf("docs = %d, want 10", len(docs))
+	}
+	assert.Diff(t, []string{manifest.DocAPIVersion(docs[0]), manifest.DocAPIVersion(docs[len(docs)-1])}, []string{"apps/v1", "other.example/v1"})
+	malformed := map[string]any{"apiVersion": "example.io/v1/extra", "kind": "Deployment", "metadata": map[string]any{"name": "shared", "namespace": "default"}}
+	assert.Equal(t, manifest.DocIdentity(malformed).Group, "example.io")
+	assert.Equal(t, resourceset.DedupKey(malformed), manifest.NamedResource{Kind: "Deployment", Namespace: "default", Name: "shared"})
+}
+
+func TestRender_NoInputJSONBypassesExclusionAndDedup(t *testing.T) {
+	t.Parallel()
+	raw := jsonTmpl(t, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"static","annotations":{"fluxcd.controlplane.io/reconcile":"disabled"}}}`)
+	rs := &manifest.ResourceSet{Name: "static", Namespace: "default", Resources: []*apix.JSON{raw, raw}, ResourcesTemplate: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: static}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+ name: excluded
+ annotations: {fluxcd.controlplane.io/reconcile: disabled}`}
+	docs, _, err := resourceset.Render(rs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("docs = %d, want 2 JSON duplicates", len(docs))
+	}
+	for _, doc := range docs {
+		if doc["metadata"].(map[string]any)["annotations"].(map[string]any)[fluxopv1.ReconcileAnnotation] != fluxopv1.DisabledValue {
+			t.Fatalf("wrong resource: %v", doc)
+		}
+	}
+}
+
+func TestRender_ListItems(t *testing.T) {
+	t.Parallel()
+	rs := &manifest.ResourceSet{Name: "list", Namespace: "default", ResourcesTemplate: `apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: ConfigMap
+  metadata: {name: first}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata: {name: second}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata: {name: first}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: excluded
+    annotations: {fluxcd.controlplane.io/reconcile: disabled}`}
+	docs, _, err := resourceset.Render(rs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		name, ns := manifest.DocMetadata(doc)
+		names = append(names, name)
+		if ns != "" {
+			t.Errorf("namespace = %q", ns)
+		}
+	}
+	assert.Diff(t, names, []string{"first", "second"})
+	for _, tc := range []struct {
+		name, template string
+		count          int
+		wantErr        bool
+	}{
+		{"ordinary missing name", "apiVersion: v1\nkind: ConfigMap", 0, false},
+		{"ordinary missing kind", "apiVersion: v1\nmetadata: {name: excluded}", 0, false},
+		{"ordinary missing apiVersion", "kind: ConfigMap\nmetadata: {name: excluded}", 0, false},
+		{"mixed case directive", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: kUsToMiZaTiOn\nmetadata: {name: excluded}", 0, false},
+		{"non directive group", "apiVersion: another.example/v1\nkind: Kustomization\nmetadata: {name: kept}", 1, false},
+		{"items without suffix", "items: [{apiVersion: v1, kind: ConfigMap, metadata: {name: item}}]", 1, false},
+		{"suffix without items", "apiVersion: example.test/v1\nkind: WidgetList\nmetadata: {name: ordinary}", 1, false},
+		{"typed incomplete items", "apiVersion: v1\nkind: ConfigMapList\nitems: [{metadata: {name: kindless}}, {apiVersion: v1, kind: ConfigMap}]", 2, false},
+		{"nested list stays wrapped", "items: [{kind: List, items: [{apiVersion: v1, kind: ConfigMap, metadata: {name: nested}}]}]", 1, false},
+		{"directive item survives", "items: [{apiVersion: kustomize.config.k8s.io/v1beta1, kind: Kustomization, metadata: {name: directive}}]", 1, false},
+		{"invalid YAML", "metadata: [unterminated", 0, true},
+		{"null member", "items: [null]", 0, true},
+		{"scalar member", "items: [plain]", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			candidate := &manifest.ResourceSet{Name: "boundary", Namespace: "apps", ResourcesTemplate: tc.template}
+			got, _, err := resourceset.Render(candidate, nil, nil)
+			if tc.wantErr {
+				if !errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) {
+					t.Fatalf("error = %v, want classified malformed list error", err)
+				}
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, len(got), tc.count)
+			if tc.name == "typed incomplete items" && len(got) == 2 {
+				assert.Equal(t, manifest.DocKind(got[0]), "")
+				assert.Equal(t, manifest.DocAPIVersion(got[0]), "")
+				name, _ := manifest.DocMetadata(got[1])
+				assert.Equal(t, name, "")
+			}
+			if tc.name == "nested list stays wrapped" && len(got) == 1 {
+				assert.Equal(t, manifest.DocKind(got[0]), "List")
+				assert.Equal(t, len(got[0]["items"].([]any)), 1)
+			}
+		})
+	}
+
+}
+
+func TestRender_Admission(t *testing.T) {
+	t.Parallel()
+	failure := errors.New("admission failed")
+	for _, tc := range []struct {
+		name string
+		hit  bool
+		err  error
+	}{
+		{"replay", true, nil},
+		{"error", false, failure},
+		{"template", false, manifest.ErrInput},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := &manifest.ResourceSet{Name: "reader", Namespace: "apps", ResourcesTemplate: "<< invalid template",
+				Inputs: []fluxopv1.ResourceSetInput{{"name": jsonTmpl(t, `"inline"`)}}, InputsFrom: []fluxopv1.InputProviderReference{{Name: "dynamic"}}}
+			provider := &manifest.ResourceSetInputProvider{Name: "dynamic", Namespace: "apps", Type: fluxopv1.InputProviderGitHubBranch}
+			resolved := 0
+			resolve := func(fluxopv1.InputProviderReference, manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
+				resolved++
+				return []*manifest.ResourceSetInputProvider{provider}, nil
+			}
+			calls := 0
+			docs, warnings, err := resourceset.Render(rs, resolve, func(any) (bool, error) {
+				calls++
+				if tc.name == "template" {
+					return false, nil
+				}
+				return tc.hit, tc.err
+			})
+			assert.Equal(t, calls, 1)
+			assert.Equal(t, resolved, 1)
+			if len(warnings) != 1 || warnings[0].Category != manifest.WarnOfflineInputProvider || warnings[0].Resource != rs.Named() {
+				t.Fatalf("admission lost provider warning: %+v", warnings)
+			}
+			if docs != nil || (tc.name == "template" && err == nil) || (tc.name != "template" && !errors.Is(err, tc.err)) {
+				t.Fatalf("admission: documents=%v error=%v, want %v", docs, err, tc.err)
+			}
+		})
+	}
+	invalid := &manifest.ResourceSet{Name: "invalid", Steps: []fluxopv1.ResourceSetStep{{Name: "empty"}}}
+	called := false
+	_, _, err := resourceset.Render(invalid, nil, func(any) (bool, error) { called = true; return true, nil })
+	if !errors.Is(err, manifest.ErrInput) || called {
+		t.Fatalf("invalid steps reached admission: called=%v error=%v", called, err)
+	}
+}
+
+func TestRender_UsesOneProviderQuery(t *testing.T) {
+	t.Parallel()
+	rs := &manifest.ResourceSet{
+		Name: "apps", Namespace: "apps",
+		InputsFrom:        []fluxopv1.InputProviderReference{{Name: "provider"}},
+		ResourcesTemplate: "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: '<< inputs.value >>'}\n",
+	}
+	provider := &manifest.ResourceSetInputProvider{
+		Name: "provider", Namespace: "apps",
+		DefaultValues: fluxopv1.ResourceSetInput{"value": jsonTmpl(t, `"captured"`)},
+	}
+	calls := 0
+	docs, _, err := resourceset.Render(rs, func(fluxopv1.InputProviderReference, manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
+		calls++
+		if calls != 1 {
+			t.Fatal("provider query repeated")
+		}
+		return []*manifest.ResourceSetInputProvider{provider}, nil
+	}, nil)
+	assert.NoError(t, err)
+	if calls != 1 || len(docs) != 1 || docs[0]["metadata"].(map[string]any)["name"] != "captured" {
+		t.Fatalf("query calls=%d output=%v", calls, docs)
 	}
 }

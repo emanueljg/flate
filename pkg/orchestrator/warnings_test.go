@@ -2,14 +2,63 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/store"
 )
+
+func TestRender_ScanAndPathWarnings(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		sameRoot bool
+		category string
+	}{
+		{name: "empty scan", category: "EmptyScan"},
+		{name: "same root", sameRoot: true, category: "PathConfig"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			cfg := Config{Path: root, CacheDir: t.TempDir(), Concurrency: 2}
+			if tt.sameRoot {
+				cfg.PathOrig = root
+			}
+			o, err := New(t.Context(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := o.Stop(); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			}()
+			res, err := o.Render(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var warnings []manifest.Warning
+			for _, w := range res.Warnings {
+				if w.Category == tt.category {
+					warnings = append(warnings, w)
+				}
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("warnings = %+v, want one %s", res.Warnings, tt.category)
+			}
+			assert.Equal(t, warnings[0].Count, 1)
+			if tt.sameRoot {
+				assert.Diff(t, warnings[0].Detail, []string{root})
+			}
+		})
+	}
+}
 
 // TestRender_StaleValuesWarning is the konflate-facing contract: a HelmRelease
 // pinning a value no chart template references surfaces as a structured
@@ -73,7 +122,7 @@ spec:
 	testutil.WriteFile(t, dir, "charts/opaque/templates/cm.yaml",
 		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-cm\ndata:\n  v: |\n    {{- toYaml .Values | nindent 4 }}\n")
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
+	o, err := New(t.Context(), Config{Path: dir, WipeSecrets: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -85,8 +134,8 @@ spec:
 		t.Fatalf("advisory must not fail the render; Failed=%v", res.Failed)
 	}
 
-	app := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "app"}
-	opaque := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "opaque"}
+	app := testutil.HelmReleaseID("apps", "app")
+	opaque := testutil.HelmReleaseID("apps", "opaque")
 
 	var got *manifest.Warning
 	for i := range res.Warnings {
@@ -106,48 +155,52 @@ spec:
 	}
 }
 
-// TestRender_UnresolvedSubstitutionWarning is the konflate-facing contract: a
-// Kustomization whose postBuild.substituteFrom Secret can't be read offline
-// (absent here, as an ExternalSecret-backed one is) surfaces a structured
-// Result.Warnings entry (Category WarnUnresolvedSubstitution, attributed to the
-// Secret) — explaining why the ${VAR}s it would supply render empty. The render
-// itself still succeeds: Secret refs are not hard dependency edges.
 func TestRender_UnresolvedSubstitutionWarning(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "kubernetes/flux/cluster-apps.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata: {name: cluster-apps, namespace: flux-system}
-spec:
-  path: ./kubernetes/apps
+	testutil.WriteFile(t, dir, "kubernetes/flux/cluster-apps.yaml", testutil.KustomizationYAML("cluster-apps", "flux-system", `  path: ./kubernetes/apps
   sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
   postBuild:
     substituteFrom:
       - kind: Secret
         name: cluster-secrets
-`)
+`))
+	testutil.WriteFile(t, dir, "kubernetes/flux/other-apps.yaml", testutil.KustomizationYAML("other-apps", "other", `  path: ./kubernetes/apps
+  sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
+  postBuild:
+    substituteFrom:
+      - kind: Secret
+        name: cluster-secrets
+`))
 	testutil.WriteFile(t, dir, "kubernetes/apps/kustomization.yaml",
 		"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: flux-system\nresources:\n  - ./cm.yaml\n")
 	testutil.WriteFile(t, dir, "kubernetes/apps/cm.yaml",
 		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\ndata:\n  k: v\n")
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
+	o, err := New(t.Context(), Config{Path: dir, WipeSecrets: true, Concurrency: 2})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	res, err := o.Render(context.Background())
+	t.Cleanup(func() { assert.NoError(t, o.Stop()) })
+	res, err := o.Render(t.Context())
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 
-	found := false
+	var warnings []manifest.Warning
 	for _, w := range res.Warnings {
-		if w.Category == manifest.WarnUnresolvedSubstitution && strings.Contains(w.Message, `"cluster-secrets"`) {
-			found = true
+		if w.Category == manifest.WarnUnresolvedSubstitution {
+			warnings = append(warnings, w)
 		}
 	}
-	if !found {
-		t.Fatalf("missing UnresolvedSubstitution warning naming cluster-secrets; Warnings=%+v", res.Warnings)
+	want := manifest.Warning{
+		Category: manifest.WarnUnresolvedSubstitution,
+		Message: `substituteFrom Secret "cluster-secrets" could not be read offline; ` +
+			"its variables are unavailable, so their ${VAR} references may remain unsubstituted " +
+			"or resolve to defaults or empty values",
+		Count: 2,
 	}
+	assert.Diff(t, warnings, []manifest.Warning{want})
 }
 
 // TestRender_BestEffortRescue: a HelmRelease whose required value rendered empty
@@ -164,19 +217,15 @@ kind: GitRepository
 metadata: {name: flux-system, namespace: flux-system}
 spec:
   url: https://example.test/cluster.git
----
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata: {name: apps, namespace: flux-system}
-spec:
-  path: ./apps
+`+"---\n"+
+		testutil.KustomizationYAML("apps", "flux-system", `  path: ./apps
   sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
   postBuild:
     substitute: {KEEP: "ok"}
     substituteFrom:
       - kind: Secret
         name: missing
-`)
+`))
 	testutil.WriteFile(t, dir, "apps/kustomization.yaml",
 		"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ./hr.yaml\n")
 	testutil.WriteFile(t, dir, "apps/hr.yaml", `apiVersion: helm.toolkit.fluxcd.io/v2
@@ -197,7 +246,7 @@ spec:
 	testutil.WriteFile(t, dir, "charts/req/templates/cm.yaml",
 		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-cm\ndata:\n  g: {{ required \"greeting is required\" .Values.greeting | quote }}\n")
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
+	o, err := New(t.Context(), Config{Path: dir, WipeSecrets: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -206,18 +255,18 @@ spec:
 		t.Fatalf("Render: %v", err)
 	}
 
-	demo := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "demo"}
+	demo := testutil.HelmReleaseID("apps", "demo")
 	if info, failed := res.Failed[demo]; failed {
 		t.Fatalf("demo should be rescued, not failed; got %+v", info)
 	}
 	sawPlaceholder := false
-	for _, doc := range res.Manifests[demo] {
+	for _, doc := range outputByParent(res.Manifests)[demo] {
 		if manifest.ContainsValuePlaceholder(doc) {
 			sawPlaceholder = true
 		}
 	}
 	if !sawPlaceholder {
-		t.Errorf("rescued render should carry a placeholder; manifests=%v", res.Manifests[demo])
+		t.Errorf("rescued render should carry a placeholder; manifests=%v", outputByParent(res.Manifests)[demo])
 	}
 	warned := false
 	for _, w := range res.Warnings {
@@ -244,18 +293,14 @@ kind: GitRepository
 metadata: {name: flux-system, namespace: flux-system}
 spec:
   url: https://example.test/cluster.git
----
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata: {name: apps, namespace: flux-system}
-spec:
-  path: ./apps
+`+"---\n"+
+		testutil.KustomizationYAML("apps", "flux-system", `  path: ./apps
   sourceRef: {kind: GitRepository, name: flux-system, namespace: flux-system}
   postBuild:
     substituteFrom:
       - kind: Secret
         name: cloudflared-secret
-`)
+`))
 	testutil.WriteFile(t, dir, "apps/kustomization.yaml",
 		"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: flux-system\nresources:\n  - ./externalsecret.yaml\n  - ./cm.yaml\n")
 	// The ExternalSecret materializing cloudflared-secret enumerates its output
@@ -270,6 +315,7 @@ spec:
     template:
       data:
         CLOUDFLARE_TUNNEL_ID: "{{ .id }}"
+        identity: "{{ .identity }}"
   dataFrom:
     - extract: {key: cloudflare}
 `)
@@ -277,7 +323,7 @@ spec:
 	testutil.WriteFile(t, dir, "apps/cm.yaml",
 		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: tunnel\ndata:\n  target: \"${CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com\"\n")
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
+	o, err := New(t.Context(), Config{Path: dir, WipeSecrets: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -286,10 +332,20 @@ spec:
 		t.Fatalf("Render: %v", err)
 	}
 
+	repo := &manifest.GitRepository{Name: "ssh", Namespace: "flux-system"}
+	repo.URL = "ssh://git@example.test/cluster"
+	repo.SecretRef = &manifest.LocalObjectReference{Name: "cloudflared-secret"}
+	var reads store.ReadSet
+	reads.Init(o.Store(), repo.Named(), nil)
+	_, err = o.src.Fetchers[manifest.KindGitRepository].Fetch(t.Context(), repo, &reads, sourcecache.Policy{})
+	if missing, ok := errors.AsType[*source.MissingSecretError](err); !ok || missing.Detail != "missing 'identity' for SSH auth" || missing.Secret.Name != "cloudflared-secret" || !reads.Valid() {
+		t.Fatalf("producer-declared credential did not retain placeholder classification: %v", err)
+	}
+
 	// The ${CLOUDFLARE_TUNNEL_ID} resolved to its placeholder, not empty/literal.
-	want := fmt.Sprintf(manifest.ValuePlaceholderTemplate, "CLOUDFLARE_TUNNEL_ID") + ".cfargotunnel.com"
+	want := manifest.ValuePlaceholder("CLOUDFLARE_TUNNEL_ID") + ".cfargotunnel.com"
 	var got string
-	for _, docs := range res.Manifests {
+	for _, docs := range outputByParent(res.Manifests) {
 		for _, d := range docs {
 			md, _ := d["metadata"].(map[string]any)
 			data, _ := d["data"].(map[string]any)

@@ -2,19 +2,12 @@ package manifest
 
 import (
 	"encoding/json"
-	"strings"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// decodeInto re-marshals a parsed YAML document into a typed Flux CR
-// via a JSON round-trip. The Flux API types use the same JSON tags
-// k8s uses to serialize their CRDs, so this matches `kubectl apply`'s
-// decoding fidelity without keeping the raw YAML bytes around.
-//
-// Per-document cost is ~one marshal + one unmarshal; documents are
-// small (a single CR) and this only runs during the load phase, not on
-// the render hot path.
+// Flux API JSON tags govern typed admission of loaded and rendered documents.
 func decodeInto(doc map[string]any, out any) error {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -23,19 +16,15 @@ func decodeInto(doc map[string]any, out any) error {
 	return json.Unmarshal(raw, out)
 }
 
-// decodeCR runs the shared typed-CR decode preamble: API-version
-// check, JSON round-trip into cr, and a non-empty metadata.name
-// check. cr must be a pointer to a Flux CR type (all embed
-// metav1.ObjectMeta, so GetName() is available). Centralizes the
-// identical opening previously hand-copied across the typed parsers.
-func decodeCR(doc map[string]any, cr metav1.Object, kind, domain string) error {
+func decodeCR(doc map[string]any, cr any, kind, domain string) error {
 	if err := checkAPIVersion(doc, domain); err != nil {
 		return err
 	}
+	// Typed JSON errors MUST precede permissive required-metadata checks.
 	if err := decodeInto(doc, cr); err != nil {
 		return inputf("%s decode: %w", kind, err)
 	}
-	if cr.GetName() == "" {
+	if _, _, missing := requireMetadata(doc); missing != "" {
 		return inputf("%s missing metadata.name", kind)
 	}
 	return nil
@@ -54,38 +43,10 @@ func DocAPIVersion(doc map[string]any) string {
 	return v
 }
 
-// DropKinds returns docs with every entry whose `kind` appears in drop
-// removed. drop=nil is a no-op (returns docs unchanged). Used by the
-// orchestrator's Render and the CLI's build/diff paths to honor
-// --skip-secrets / --skip-crds / --skip-kinds against both
-// HelmRelease and Kustomization sources uniformly. helm.TemplateDocs
-// already filters HR output upstream; this is the canonical helper
-// for downstream code that needs the same operation.
-func DropKinds(docs []map[string]any, drop []string) []map[string]any {
-	if len(drop) == 0 || len(docs) == 0 {
-		return docs
-	}
-	dropSet := make(map[string]struct{}, len(drop))
-	for _, kind := range drop {
-		dropSet[kind] = struct{}{}
-	}
-	var out []map[string]any
-	for i, doc := range docs {
-		if _, skip := dropSet[DocKind(doc)]; skip {
-			if out == nil {
-				out = make([]map[string]any, 0, len(docs)-1)
-				out = append(out, docs[:i]...)
-			}
-			continue
-		}
-		if out != nil {
-			out = append(out, doc)
-		}
-	}
-	if out == nil {
-		return docs
-	}
-	return out
+// DocIdentity extracts a document's resource identity without validation or namespace defaulting.
+func DocIdentity(doc map[string]any) NamedResource {
+	name, namespace := DocMetadata(doc)
+	return NamedResource{Group: apiGroup(DocAPIVersion(doc)), Kind: DocKind(doc), Namespace: namespace, Name: name}
 }
 
 // DocMetadata returns (name, namespace) from a manifest document's
@@ -97,115 +58,71 @@ func DocMetadata(doc map[string]any) (name, namespace string) {
 	}
 	name, _ = md["name"].(string)
 	namespace, _ = md["namespace"].(string)
-	return
+	return name, namespace
 }
 
 // ParseDocOptions tunes ParseDoc behavior.
 type ParseDocOptions struct {
-	// WipeSecrets controls Secret cleartext replacement. Default true.
+	// WipeSecrets replaces SOPS ciphertext with offline placeholders.
 	WipeSecrets bool
+	// DefaultNamespace fills omitted namespaced identity and authoritative document metadata.
+	DefaultNamespace string
 }
 
-// ParseDoc dispatches on kind + apiVersion to the appropriate concrete
-// parser. Unknown kinds become a RawObject; kustomize.config.k8s.io
-// build directives and bare data files are silently dropped.
-//
-// Every case matches BOTH kind and API group: a kind name is not unique
-// across groups, and a foreign CRD that happens to reuse one of Flux's
-// (seaweed.seaweedfs.com Bucket, s3.services.k8s.aws Bucket) is an
-// ordinary cluster resource, so it falls through to RawObject rather
-// than being decoded as — and reconciled as — the Flux CR it isn't.
-func ParseDoc(doc map[string]any, opts ParseDocOptions) (BaseManifest, error) {
-	kind := DocKind(doc)
-	apiVersion := DocAPIVersion(doc)
-	// kustomize.config.k8s.io build directives (Kustomization,
-	// Component) aren't k8s resources — they're build inputs we
-	// already follow via spec.path discovery. Drop them silently.
-	if strings.HasPrefix(apiVersion, KustomizeDomain) {
-		return &RawObject{Kind: kind, APIVersion: apiVersion}, nil
-	}
-	// Documents without a kind are bare data files (helm values,
-	// arbitrary YAML configs). Treat them as RawObjects so the
-	// loader drops them without surfacing as parse errors.
-	if kind == "" {
-		return &RawObject{APIVersion: apiVersion}, nil
+// ParseDoc decodes recognized group/kind pairs and returns the authoritative
+// document and whether sanitation or namespace defaulting changed it, including
+// on errors. Foreign kinds become RawObjects; bare data and Kustomize build
+// directives return nil.
+func ParseDoc(doc map[string]any, opts ParseDocOptions) (BaseManifest, map[string]any, bool, error) {
+	kind, apiVersion := DocKind(doc), DocAPIVersion(doc)
+	if kind == "" || apiGroup(apiVersion) == KustomizeDomain {
+		return nil, doc, false, nil
 	}
 	if apiVersion == "" {
-		return nil, inputf("missing apiVersion for %s", kind)
+		return nil, doc, false, inputf("missing apiVersion for %s", kind)
 	}
 
-	switch {
-	case kind == KindKustomization && inGroup(apiVersion, FluxKustomizeDomain):
-		return parseKustomization(doc)
-	case kind == KindHelmRelease && inGroup(apiVersion, HelmReleaseDomain):
-		return parseHelmRelease(doc)
-	case kind == KindHelmRepository && inGroup(apiVersion, SourceDomain):
-		return parseHelmRepository(doc)
-	case kind == KindHelmChart && inGroup(apiVersion, SourceDomain):
-		return parseHelmChartSource(doc)
-	case kind == KindGitRepository && inGroup(apiVersion, SourceDomain):
-		return parseGitRepository(doc)
-	case kind == KindOCIRepository && inGroup(apiVersion, SourceDomain):
-		return ParseOCIRepository(doc)
-	case kind == KindExternalArtifact && inGroup(apiVersion, SourceDomain):
-		return parseExternalArtifact(doc)
-	case kind == KindBucket && inGroup(apiVersion, SourceDomain):
-		return parseBucket(doc)
-	case kind == KindResourceSet && inGroup(apiVersion, FluxOperatorDomain):
-		return parseResourceSet(doc)
-	case kind == KindResourceSetInputProvider && inGroup(apiVersion, FluxOperatorDomain):
-		return parseResourceSetInputProvider(doc)
-	case kind == KindConfigMap && apiVersion == CoreAPIVersion:
-		return parseConfigMap(doc, opts.WipeSecrets)
-	case kind == KindSecret && apiVersion == CoreAPIVersion:
-		return parseSecret(doc, opts.WipeSecrets)
+	changed := false
+	if opts.WipeSecrets && apiVersion == CoreAPIVersion && (kind == KindConfigMap || kind == KindSecret) {
+		doc, changed = sanitizeData(doc, kind)
 	}
-	return parseRawObject(doc)
+	var obj BaseManifest
+	var err error
+	group := apiGroup(apiVersion)
+	if i, ok := kindIndex[kind]; ok && kindTable[i].Group == group && (group != "" || apiVersion == CoreAPIVersion) {
+		obj, err = kindTable[i].decode(doc)
+	} else {
+		obj, err = parseRawObject(doc)
+	}
+	if err == nil {
+		obj, doc, changed = defaultNamespace(obj, doc, opts.DefaultNamespace, changed)
+	}
+	return obj, doc, changed, err
 }
 
-// IsKustomizeBuildDirective reports whether obj is a kustomize.config.k8s.io
-// build directive (a Kustomization or Component). ParseDoc preserves these as
-// metadata-less RawObjects — they're build inputs, not cluster resources, and
-// the loader drops them during discovery. Render paths must drop them too: a
-// kustomization.yaml self-referenced in its own resources: makes `kustomize
-// build` emit one, which would otherwise land in the Store as a phantom,
-// nameless object (id "<kind>//") that no controller ever reconciles.
-func IsKustomizeBuildDirective(obj BaseManifest) bool {
-	raw, ok := obj.(*RawObject)
-	return ok && strings.HasPrefix(raw.APIVersion, KustomizeDomain)
-}
-
-// inGroup reports whether apiVersion belongs to the API group group.
-// The group is compared exactly while the version is ignored, so any
-// version of a group flate models is accepted (see constants.go) and a
-// group that merely starts with one of ours is not.
-func inGroup(apiVersion, group string) bool {
-	g, _, _ := strings.Cut(apiVersion, "/")
-	return g == group
-}
-
-// checkAPIVersion enforces an api group prefix on a raw document.
+// checkAPIVersion requires an exact API group match on a raw document.
 func checkAPIVersion(doc map[string]any, want string) error {
 	v := DocAPIVersion(doc)
 	if v == "" {
 		return inputf("missing apiVersion")
 	}
-	if !strings.HasPrefix(v, want) {
+	gv, err := schema.ParseGroupVersion(v)
+	if err != nil || gv.Version == "" {
+		return inputf("invalid %w", field.Invalid(field.NewPath("apiVersion"), v, "must have a valid version"))
+	}
+	if gv.Group != want {
 		return inputf("expected apiVersion %q, got %q", want, v)
 	}
 	return nil
 }
 
-// requireMetadata pulls name + namespace from a non-nil metadata block.
-func requireMetadata(kind string, doc map[string]any) (name, ns string, err error) {
-	md, _ := doc["metadata"].(map[string]any)
-	if md == nil {
-		return "", "", inputf("%s missing metadata", kind)
+func requireMetadata(doc map[string]any) (name, namespace, missing string) {
+	name, namespace = DocMetadata(doc)
+	if name != "" {
+		return name, namespace, ""
 	}
-	name, _ = md["name"].(string)
-	if name == "" {
-		return "", "", inputf("%s missing metadata.name", kind)
+	if md, _ := doc["metadata"].(map[string]any); md == nil {
+		return "", "", "metadata"
 	}
-	ns, _ = md["namespace"].(string)
-	return name, ns, nil
+	return "", "", "metadata.name"
 }

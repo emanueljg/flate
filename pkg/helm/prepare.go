@@ -5,34 +5,19 @@ import (
 	"github.com/home-operations/flate/pkg/values"
 )
 
-// Prepare runs the standard pre-render dance for a HelmRelease so it
-// is ready to feed into Client.Template / TemplateDocs:
-//
-//  1. Clone hr so subsequent mutations don't touch the store-canonical
-//     copy (the immutability contract every flate controller honors).
-//  2. Resolve hr.spec.chartRef via the supplied lookup. A chartRef
-//     points at a Flux HelmChart CR — typically emitted by a parent
-//     Kustomization render — and is rewritten into the concrete
-//     hr.Chart projection. Pass SourceResolver.HelmChart when an
-//     orchestrator is available, or a custom lookup otherwise.
-//  3. Expand values / valuesFrom against the supplied provider so
-//     hr.Values reflects the merged result a render would consume.
-//
-// Embedders rendering a single HelmRelease without standing up the
-// orchestrator's HR controller call Prepare then TemplateDocs. The
-// returned *HelmRelease is the cloned, resolved one — pass it to
-// Template / TemplateDocs and discard once rendered.
-//
-// The Client's per-orchestrator values.Cache is threaded through so
-// platform-wide valuesFrom CMs (a common pattern: one app-config CM
-// referenced by N HRs) parse exactly once across the entire run.
-func Prepare(hr *manifest.HelmRelease, lookup manifest.HelmChartLookup, provider values.Provider, cache *values.Cache) (*manifest.HelmRelease, error) {
+// Prepare clones a HelmRelease, resolves its chartRef, expands its values and
+// returns required wiped values files omitted from expansion.
+func Prepare(hr *manifest.HelmRelease, lookup manifest.HelmChartLookup, provider values.Provider, cache *values.Cache) (*manifest.HelmRelease, []manifest.NamedResource, error) {
 	hr = hr.Clone()
+	if source := hr.ChartSource(); source.Name != "" {
+		hr.Chart.Source = source
+	}
 	if err := hr.ResolveChartRef(lookup); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := values.ExpandValueReferences(hr, provider, cache); err != nil {
-		return nil, err
+	omitted, err := values.ExpandValueReferences(hr, provider, cache)
+	if err != nil {
+		return nil, omitted, err
 	}
-	return hr, nil
+	return hr, omitted, nil
 }

@@ -1,39 +1,38 @@
 package cli
 
 import (
-	"cmp"
 	"io"
 	"maps"
 	"slices"
 
 	"github.com/spf13/cobra"
 
-	"github.com/home-operations/flate/internal/format"
+	"github.com/home-operations/flate/internal/imageutil"
+	"github.com/home-operations/flate/internal/output"
+	"github.com/home-operations/flate/internal/selection"
 	"github.com/home-operations/flate/pkg/manifest"
-	"github.com/home-operations/flate/pkg/orchestrator"
-	"github.com/home-operations/flate/pkg/selector"
 )
 
 func newGetCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "get",
-		Short: "List Kustomizations, HelmReleases, container images, or a cluster summary",
-	}
-	cmd.AddCommand(newGetKSCmd(), newGetHRCmd(), newGetImagesCmd(), newGetAllCmd())
+	cmd := getAllCmd("get", "List Kustomizations, HelmReleases, container images, or a cluster summary (defaults to all)")
+	cmd.AddCommand(newGetKSCmd(), newGetHRCmd(), newGetImagesCmd(),
+		getAllCmd("all", "Summarize every Kustomization and HelmRelease"))
 	return cmd
 }
 
 func newGetKSCmd() *cobra.Command {
-	return resourceListCmd("ks", []string{"kustomization", "kustomizations"},
-		"List Kustomizations", manifest.KindKustomization, ksColumns,
-		func(_ *orchestrator.Orchestrator, o *manifest.Kustomization) (row map[string]string, doc map[string]any) {
+	return resourceListCmd(listView[*manifest.Kustomization]{
+		use: "ks", aliases: []string{"kustomization", "kustomizations"},
+		short: "List Kustomizations", kind: manifest.KindKustomization, cols: ksColumns,
+		mapper: func(_ *selection.Selection, o *manifest.Kustomization) (row map[string]string, doc map[string]any) {
+			source := o.SourceID()
 			doc = map[string]any{
 				"kind": manifest.KindKustomization, "namespace": o.Namespace,
 				"name": o.Name, "path": o.Path,
 				"sourceRef": map[string]string{
-					"kind":      o.SourceKind,
-					"name":      o.SourceName,
-					"namespace": o.SourceNamespace,
+					"kind":      source.Kind,
+					"name":      source.Name,
+					"namespace": source.Namespace,
 				},
 				"prune": o.Prune,
 				"wait":  o.Wait,
@@ -48,30 +47,32 @@ func newGetKSCmd() *cobra.Command {
 				"namespace": o.Namespace, "name": o.Name, "path": o.Path,
 			}, doc
 		},
-	)
+	})
 }
 
 func newGetHRCmd() *cobra.Command {
-	return resourceListCmd("hr", []string{"helmrelease", "helmreleases"},
-		"List HelmReleases", manifest.KindHelmRelease, hrColumns,
-		func(orch *orchestrator.Orchestrator, o *manifest.HelmRelease) (row map[string]string, doc map[string]any) {
+	return resourceListCmd(listView[*manifest.HelmRelease]{
+		use: "hr", aliases: []string{"helmrelease", "helmreleases"},
+		short: "List HelmReleases", kind: manifest.KindHelmRelease, cols: hrColumns,
+		mapper: func(res *selection.Selection, o *manifest.HelmRelease) (row map[string]string, doc map[string]any) {
+			source := o.ChartSource()
+			chart := o.Chart
+			if source.Name != "" {
+				chart.Source = source
+			}
+			chartName := chart.ChartName()
 			version := o.Chart.Version
-			// chartRef HRs leave hr.Chart.Version empty — the version is
-			// pinned on the referenced OCIRepository (ref.digest,
-			// ref.semver, or ref.tag) or
-			// HelmChart CRD (spec.version). Surface that for display
-			// instead of an empty column.
 			if version == "" {
-				version = resolveChartRefVersion(orch, o)
+				version = res.ChartVersions[o.Named()]
 			}
 			doc = map[string]any{
 				"kind": manifest.KindHelmRelease, "namespace": o.Namespace,
-				"name": o.Name, "chart": o.Chart.ChartName(),
-				"version": version, "source": o.Chart.RepoName,
+				"name": o.Name, "chart": chartName,
+				"version": version, "source": source.Name,
 				"sourceRef": map[string]string{
-					"kind":      o.Chart.RepoKind,
-					"name":      o.Chart.RepoName,
-					"namespace": o.Chart.RepoNamespace,
+					"kind":      source.Kind,
+					"name":      source.Name,
+					"namespace": source.Namespace,
 				},
 				"releaseName": o.ReleaseName(),
 			}
@@ -83,187 +84,104 @@ func newGetHRCmd() *cobra.Command {
 			}
 			return map[string]string{
 				"namespace": o.Namespace, "name": o.Name,
-				"chart": o.Chart.ChartName(), "version": version,
-				"source": o.Chart.RepoName,
+				"chart": chartName, "version": version,
+				"source": source.Name,
 			}, doc
-		})
+		},
+	})
 }
 
-// resolveChartRefVersion looks up the version pinned on the source CR
-// that hr.Chart references. For OCIRepository the source's
-// spec.ref digest, semver, or tag is the version; for the HelmChart
-// CRD the version field is part of the CRD spec.
-func resolveChartRefVersion(orch *orchestrator.Orchestrator, hr *manifest.HelmRelease) string {
-	srcID := manifest.NamedResource{
-		Kind: hr.Chart.RepoKind, Namespace: hr.Chart.RepoNamespace, Name: hr.Chart.RepoName,
-	}
-	obj := orch.Store().GetObject(srcID)
-	switch s := obj.(type) {
-	case *manifest.OCIRepository:
-		if s.Reference != nil {
-			return cmp.Or(s.Reference.Digest, s.Reference.SemVer, s.Reference.Tag)
-		}
-	case *manifest.HelmChartSource:
-		return s.Version
-	}
-	return ""
-}
-
-func newGetAllCmd() *cobra.Command {
+func getAllCmd(use, short string) *cobra.Command {
 	c := &commonFlags{}
-	h := &helmFlags{}
 	cmd := &cobra.Command{
-		Use:   "all",
-		Short: "Summarize every Kustomization and HelmRelease",
+		Use:   use,
+		Short: short,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// printCluster emits a key/value summary; only yaml/json shape
-			// it. `-o name`/`table` have no cluster-summary form, so the -o
-			// flag accepts only yaml/json (rejected at parse time).
-			o, res, runErr := runOrchestrator(cmdContext(cmd), *c, *h)
-			if o == nil {
-				return runErr
-			}
-			return emitResult(printCluster(cmd.OutOrStdout(), o, c, c.output), o, res, c, runErr)
+			return runSelected(cmd.Context(), selectedRequest{
+				flags: *c, roots: c.roots("", renderKinds...),
+				stdout: cmd.OutOrStdout(), stderr: cmd.ErrOrStderr(), presentation: presentData,
+			}, func(inv *selectedInvocation) selectedPayload {
+				return selectedPayload{err: printCluster(cmd.OutOrStdout(), inv.sides[0], c.output)}
+			})
 		},
 	}
-	bindCommon(cmd.Flags(), c, format.OutputYAML, format.OutputJSON)
-	bindHelmFlags(cmd.Flags(), h)
+	bindCommon(cmd.Flags(), c)
+	bindOutput(cmd.Flags(), &c.output, output.FormatYAML, output.FormatJSON)
 	return cmd
 }
 
-// newGetImagesCmd emits a deduplicated list of container images
-// extracted from every rendered Kustomization and HelmRelease — the
-// symmetric counterpart of `flate diff images`, which emits the same
-// shape filtered to images that actually changed between paths.
 func newGetImagesCmd() *cobra.Command {
 	c := &commonFlags{}
-	h := &helmFlags{}
 	cmd := &cobra.Command{
 		Use:   "images",
 		Short: "List container images across the cluster",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Mirrors `diff images`: name is the natural default (one image
-			// per line); yaml/json are the structured alternatives. The -o
-			// flag rejects anything else at parse time.
-			o, res, runErr := runOrchestrator(cmdContext(cmd), *c, *h)
-			if o == nil {
-				return runErr
-			}
-			imgs := slices.Sorted(maps.Keys(collectImages(o, res, c)))
-			return emitResult(emitImageList(cmd.OutOrStdout(), imgs, c.output), o, res, c, runErr)
+			return runSelected(cmd.Context(), selectedRequest{
+				flags: *c, roots: c.roots("", renderKinds...),
+				stdout: cmd.OutOrStdout(), stderr: cmd.ErrOrStderr(), presentation: presentData,
+			}, func(inv *selectedInvocation) selectedPayload {
+				res := inv.sides[0]
+				imgs := slices.Sorted(maps.Keys(imageutil.Collect(res.Manifests)))
+				return selectedPayload{err: (output.Encoder{Writer: cmd.OutOrStdout(), Format: output.Format(c.output)}).Images(imgs)}
+			})
 		},
 	}
-	bindCommon(cmd.Flags(), c, format.OutputName, format.OutputYAML, format.OutputJSON)
-	bindHelmFlags(cmd.Flags(), h)
+	bindCommon(cmd.Flags(), c)
+	bindOutput(cmd.Flags(), &c.output, output.FormatName, output.FormatYAML, output.FormatJSON)
 	return cmd
 }
 
-// resourceListCmd builds a `get <kind>` subcommand. mapper converts each
-// stored object to (table row, structured doc); cols is the table
-// schema. The orchestrator is threaded into mapper so display logic
-// can resolve cross-references (e.g. HR chartRef → OCIRepository tag).
-func resourceListCmd[T manifest.BaseManifest](
-	use string, aliases []string, short, kind string,
-	cols []format.Column, mapper func(*orchestrator.Orchestrator, T) (map[string]string, map[string]any),
-) *cobra.Command {
+type listView[T manifest.BaseManifest] struct {
+	use, short, kind string
+	aliases          []string
+	cols             []output.Column
+	mapper           func(*selection.Selection, T) (map[string]string, map[string]any)
+}
+
+func resourceListCmd[T manifest.BaseManifest](view listView[T]) *cobra.Command {
 	c := &commonFlags{}
 	l := &listFlags{}
-	h := &helmFlags{}
 	cmd := &cobra.Command{
-		Use:     use + " [name]",
-		Aliases: aliases,
-		Short:   short,
-		Args:    cobra.MaximumNArgs(1),
+		Use: view.use + " [name]", Aliases: view.aliases, Short: view.short,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o, res, runErr := runOrchestrator(cmdContext(cmd), *c, *h)
-			if o == nil {
-				return runErr
-			}
-			sel := selector.Metadata{
-				Name:   firstArg(args),
-				Labels: l.labels,
-			}
-			return emitResult(printResources(cmd.OutOrStdout(), o, sel, c, c.output, kind, cols, mapper), o, res, c, runErr)
+			return runSelected(cmd.Context(), selectedRequest{
+				flags: *c, roots: c.roots(firstArg(args), view.kind), labels: l.labels,
+				stdout: cmd.OutOrStdout(), stderr: cmd.ErrOrStderr(), presentation: presentData,
+			}, func(inv *selectedInvocation) selectedPayload {
+				return selectedPayload{err: printResources(cmd.OutOrStdout(), inv.sides[0], c.output, view)}
+			})
 		},
 	}
-	bindCommon(cmd.Flags(), c, format.OutputTable, format.OutputYAML, format.OutputJSON, format.OutputName)
+	bindCommon(cmd.Flags(), c)
+	bindOutput(cmd.Flags(), &c.output, output.FormatTable, output.FormatYAML, output.FormatJSON, output.FormatName)
 	bindSelector(cmd.Flags(), l)
-	bindHelmFlags(cmd.Flags(), h)
 	return cmd
 }
 
-func printResources[T manifest.BaseManifest](
-	w io.Writer, o *orchestrator.Orchestrator, sel selector.Metadata, c *commonFlags,
-	out, kind string,
-	cols []format.Column, mapper func(*orchestrator.Orchestrator, T) (map[string]string, map[string]any),
-) error {
-	objs := o.Store().ListObjects(kind)
-	type pair struct {
-		row map[string]string
-		doc map[string]any
-	}
-	pairs := make([]pair, 0, len(objs))
-	nameExists := sel.Name == ""
-	// Match on labels only; the name was already filtered above, so a
-	// label-only selector keeps the two passes from double-counting.
-	labelSel := selector.Metadata{Labels: sel.Labels}
-	for _, obj := range objs {
-		id := obj.Named()
-		if sel.Name != "" && id.Name != sel.Name {
-			continue
-		}
-		if !c.includeNamespace(o.Filter(), id.Namespace) {
-			continue
-		}
-		nameExists = true
-		if !labelSel.Matches(obj) {
-			continue
-		}
+func printResources[T manifest.BaseManifest](w io.Writer, res *selection.Selection, out string, view listView[T]) error {
+	rows := make([]map[string]string, 0, len(res.Objects))
+	docs := make([]map[string]any, 0, len(res.Objects))
+	for _, obj := range res.Objects {
 		t, ok := obj.(T)
 		if !ok {
 			continue
 		}
-		row, doc := mapper(o, t)
-		pairs = append(pairs, pair{row, doc})
+		row, doc := view.mapper(res, t)
+		rows = append(rows, row)
+		docs = append(docs, doc)
 	}
-	if !nameExists {
-		return noNamedError(kind, sel.Name)
-	}
-	// Sort the (row, doc) tuples by (namespace, name) so every output
-	// flavor — table/yaml/json — is deterministic across runs. (The rows
-	// are derived per-object, so sort them rather than rely on the store's
-	// listing order.)
-	slices.SortFunc(pairs, func(a, b pair) int {
-		return cmp.Or(
-			cmp.Compare(a.row["namespace"], b.row["namespace"]),
-			cmp.Compare(a.row["name"], b.row["name"]),
-		)
-	})
-	rows := make([]map[string]string, len(pairs))
-	docs := make([]map[string]any, len(pairs))
-	for i, p := range pairs {
-		rows[i] = p.row
-		docs[i] = p.doc
-	}
-
-	switch format.Output(out) {
-	case format.OutputYAML:
-		return format.YAMLMulti(w, docs)
-	case format.OutputJSON:
-		return format.JSON(w, docs)
-	case format.OutputName:
-		return format.Name(w, rows, "name")
-	}
-	return format.Table(w, cols, rows)
+	return (output.Encoder{Writer: w, Format: output.Format(out)}).Resources(view.cols, rows, docs)
 }
 
 var (
-	ksColumns = []format.Column{
+	ksColumns = []output.Column{
 		{Header: "NAMESPACE", Key: "namespace"},
 		{Header: "NAME", Key: "name"},
 		{Header: "PATH", Key: "path"},
 	}
-	hrColumns = []format.Column{
+	hrColumns = []output.Column{
 		{Header: "NAMESPACE", Key: "namespace"},
 		{Header: "NAME", Key: "name"},
 		{Header: "CHART", Key: "chart"},
@@ -272,25 +190,10 @@ var (
 	}
 )
 
-func printCluster(w io.Writer, o *orchestrator.Orchestrator, c *commonFlags, out string) error {
-	ksCount := countObjects(o, c, manifest.KindKustomization)
-	hrCount := countObjects(o, c, manifest.KindHelmRelease)
+func printCluster(w io.Writer, res *selection.Selection, out string) error {
 	summary := map[string]any{
-		"kustomizations": ksCount,
-		"helmReleases":   hrCount,
+		"kustomizations": res.Counts[manifest.KindKustomization],
+		"helmReleases":   res.Counts[manifest.KindHelmRelease],
 	}
-	if format.Output(out) == format.OutputJSON {
-		return format.JSON(w, summary)
-	}
-	return format.YAML(w, summary)
-}
-
-func countObjects(o *orchestrator.Orchestrator, c *commonFlags, kind string) int {
-	count := 0
-	for _, obj := range o.Store().ListObjects(kind) {
-		if c == nil || c.includeNamespace(o.Filter(), obj.Named().Namespace) {
-			count++
-		}
-	}
-	return count
+	return (output.Encoder{Writer: w, Format: output.Format(out)}).Cluster(summary)
 }

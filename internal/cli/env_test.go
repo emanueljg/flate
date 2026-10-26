@@ -3,6 +3,10 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/home-operations/flate/internal/assert"
 )
 
 // TestEnv_FlagFromEnv covers the happy path: a flag the user did not
@@ -38,38 +42,54 @@ func TestEnv_CLIFlagOverridesEnv(t *testing.T) {
 	}
 }
 
-// TestEnv_BoolFlagParsed verifies pflag's bool Set is wired through:
-// FLATE_SKIP_CRDS=false flips a flag that defaults to true. We
-// exercise `--only-crds`'s applyBuildFlags pathway by checking that
-// the resulting render still includes the ConfigMap (i.e. nothing
-// regressed) — the boolean parse is on the silent path here, so the
-// stronger assertion comes from TestEnv_InvalidValueReportsKey,
-// which proves Value.Set is reached.
-func TestEnv_BoolFlagParsed(t *testing.T) {
-	path := writeFixture(t)
-	t.Setenv("FLATE_SKIP_CRDS", "false")
-	stdout, stderr, code := runCLI(t, "build", "all", "--path", path)
-	if code != 0 {
-		t.Fatalf("build all FLATE_SKIP_CRDS=false exited %d: %s", code, stderr)
-	}
-	if !strings.Contains(stdout, "kind: ConfigMap") {
-		t.Errorf("expected ConfigMap in render:\n%s", stdout)
-	}
-}
-
 // TestEnv_SliceFlagParsesCSV covers comma-separated parsing for
 // pflag.StringSliceVar (`--skip-kinds`). Setting FLATE_SKIP_KINDS to
 // "ConfigMap,Secret" should drop the fixture's only ConfigMap from
 // the render, leaving an empty stream.
 func TestEnv_SliceFlagParsesCSV(t *testing.T) {
-	path := writeFixture(t)
-	t.Setenv("FLATE_SKIP_KINDS", "ConfigMap,Secret")
-	stdout, stderr, code := runCLI(t, "build", "all", "--path", path)
-	if code != 0 {
-		t.Fatalf("build all FLATE_SKIP_KINDS=... exited %d: %s", code, stderr)
-	}
-	if strings.Contains(stdout, "kind: ConfigMap") {
-		t.Errorf("FLATE_SKIP_KINDS=ConfigMap,Secret should have filtered ConfigMap:\n%s", stdout)
+	t.Run("render", func(t *testing.T) {
+		path := writeFixture(t)
+		t.Setenv("FLATE_SKIP_KINDS", "ConfigMap,Secret")
+		stdout, stderr, code := runCLI(t, "build", "all", "--path", path)
+		if code != 0 {
+			t.Fatalf("build all FLATE_SKIP_KINDS=... exited %d: %s", code, stderr)
+		}
+		if strings.Contains(stdout, "kind: ConfigMap") {
+			t.Errorf("FLATE_SKIP_KINDS=ConfigMap,Secret should have filtered ConfigMap:\n%s", stdout)
+		}
+	})
+	for _, tc := range []struct {
+		name, env string
+		args      []string
+		want      []string
+		setEnv    bool
+		changed   bool
+	}{
+		{name: "defaults", want: []string{"Secret", "CustomResourceDefinition"}},
+		{name: "replacement flag", args: []string{"--skip-kinds", "Job"}, want: []string{"Job"}, changed: true},
+		{name: "empty flag", args: []string{"--skip-kinds", ""}, want: []string{}, changed: true},
+		{name: "environment", env: "ConfigMap,Secret", setEnv: true, want: []string{"ConfigMap", "Secret"}, changed: true},
+		{name: "empty environment", setEnv: true, want: []string{}, changed: true},
+		{name: "flag overrides environment", env: "ConfigMap", setEnv: true, args: []string{"--skip-kinds", "Secret"}, want: []string{"Secret"}, changed: true},
+		{name: "empty flag overrides environment", env: "ConfigMap", setEnv: true, args: []string{"--skip-kinds", ""}, want: []string{}, changed: true},
+		{name: "flag overrides empty environment", setEnv: true, args: []string{"--skip-kinds", "Job"}, want: []string{"Job"}, changed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setEnv {
+				t.Setenv("FLATE_SKIP_KINDS", tc.env)
+			}
+			cmd := &cobra.Command{}
+			var flags commonFlags
+			bindCommon(cmd.Flags(), &flags)
+			if err := cmd.Flags().Parse(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyEnvVars(cmd); err != nil {
+				t.Fatal(err)
+			}
+			assert.Diff(t, flags.skipKinds, tc.want)
+			assert.Equal(t, cmd.Flags().Changed("skip-kinds"), tc.changed)
+		})
 	}
 }
 
@@ -139,7 +159,7 @@ func TestEnv_HelpAdvertisesEnvVars(t *testing.T) {
 	for _, want := range []string{
 		"[env: FLATE_PATH]",
 		"[env: FLATE_LOG_LEVEL]",
-		"[env: FLATE_SKIP_CRDS]",
+		"[env: FLATE_ONLY_KINDS]",
 		"[env: FLATE_SKIP_KINDS]",
 		"[env: FLATE_CONCURRENCY]",
 		"[env: FLATE_CACHE_DIR]",
@@ -161,10 +181,10 @@ func TestEnv_HelpAdvertisesEnvVars(t *testing.T) {
 // TestEnvKey pins the kebab→snake transform so future refactors don't
 // silently change which env vars users export.
 func TestEnvKey(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]string{
 		"path":         "FLATE_PATH",
 		"path-orig":    "FLATE_PATH_ORIG",
-		"krmignore":    "FLATE_KRMIGNORE",
 		"log-level":    "FLATE_LOG_LEVEL",
 		"skip-kinds":   "FLATE_SKIP_KINDS",
 		"api-versions": "FLATE_API_VERSIONS",
@@ -172,5 +192,37 @@ func TestEnvKey(t *testing.T) {
 		if got := envKey(in); got != want {
 			t.Errorf("envKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestRun_RemovedFlagsRejected(t *testing.T) {
+	for _, verb := range []string{"build", "test", "diff", "get"} {
+		flags := []string{"stream", "skip-crds", "skip-secrets", "only-crds", "krmignore", "profile", "profile-out", "skip-schema-validation", "source-retry-attempts", "source-retry-min-wait", "source-retry-max-wait", "source-retry-jitter", "helm-template-cache-mb", "helm-render-cache-mb", "kustomize-render-cache-mb"}
+		if verb != "build" {
+			flags = append(flags, "only-kinds")
+		}
+		for _, flag := range flags {
+			t.Run(verb+"/"+flag, func(t *testing.T) {
+				_, stderr, code := runCLI(t, verb, "all", "--"+flag)
+				if code != 1 || !strings.Contains(stderr, "unknown flag: --"+flag) {
+					t.Fatalf("removed flag: exit=%d stderr=%s", code, stderr)
+				}
+				help, _, code := runCLI(t, verb, "all", "--help")
+				if code != 0 || strings.Contains(help, "--"+flag) || strings.Contains(help, envKey(flag)) {
+					t.Fatalf("obsolete option advertised: exit=%d help=%s", code, help)
+				}
+			})
+		}
+	}
+}
+
+func TestEnv_RemovedOptionsIgnored(t *testing.T) {
+	path := writeFixture(t)
+	for _, key := range []string{"STREAM", "SKIP_CRDS", "SKIP_SECRETS", "ONLY_CRDS", "KRMIGNORE", "SKIP_SCHEMA_VALIDATION", "SOURCE_RETRY_ATTEMPTS", "SOURCE_RETRY_MIN_WAIT", "SOURCE_RETRY_MAX_WAIT", "SOURCE_RETRY_JITTER", "HELM_TEMPLATE_CACHE_MB", "HELM_RENDER_CACHE_MB", "KUSTOMIZE_RENDER_CACHE_MB"} {
+		t.Setenv("FLATE_"+key, "invalid-value")
+	}
+	stdout, stderr, code := runCLI(t, "build", "all", "--path", path)
+	if code != 0 || !strings.Contains(stdout, "kind: ConfigMap") {
+		t.Fatalf("obsolete environment keys affected render: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 }

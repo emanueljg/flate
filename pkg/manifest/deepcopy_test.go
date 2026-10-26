@@ -2,12 +2,13 @@ package manifest
 
 import (
 	"slices"
-	"strings"
 	"testing"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	"github.com/fluxcd/pkg/apis/kustomize"
+
+	"github.com/home-operations/flate/internal/assert"
 )
 
 // TestFillEmptyValueLeaves: empty-string and null leaves (nested, in slices)
@@ -15,6 +16,7 @@ import (
 // non-empty leaves (strings, numbers, bools, partial concatenations) are
 // untouched; the source map is not mutated.
 func TestFillEmptyValueLeaves(t *testing.T) {
+	t.Parallel()
 	in := map[string]any{
 		"timeZone": "",
 		"server":   nil,
@@ -62,6 +64,7 @@ func TestFillEmptyValueLeaves(t *testing.T) {
 // can't bleed into the original or vice versa. Used by Kustomization.
 // Clone and HelmRelease.Clone to isolate reconcile-time mutations.
 func TestDeepCopyMap_Isolation(t *testing.T) {
+	t.Parallel()
 	src := map[string]any{
 		"top": "scalar",
 		"nested": map[string]any{
@@ -95,78 +98,40 @@ func TestDeepCopyMap_Isolation(t *testing.T) {
 }
 
 func TestDeepCopyMap_Nil(t *testing.T) {
+	t.Parallel()
 	if DeepCopyMap(nil) != nil {
 		t.Errorf("nil source should produce nil")
 	}
 }
 
-// AnyStringNode gates the postBuild substitution round-trip. Unlike
-// AnyStringLeaf it must also see `${VAR}` in MAP KEY position — Flux
-// runs envsubst over the serialized YAML text, where a key is just
-// another token, so a key-only reference (e.g. `${OP_VAULT}: 1`) has to
-// trigger the round-trip or the var is left literal. The value-only and
-// no-match cases must stay identical to AnyStringLeaf (the parity sweep
-// below) so the change is inert for docs that were already handled.
-func TestAnyStringNode(t *testing.T) {
-	hasDollar := func(s string) bool { return strings.Contains(s, "${") }
-	cases := []struct {
+func TestContainsValuePlaceholder_ValuesOnly(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
 		name string
 		in   any
 		want bool
 	}{
-		// Cases shared with AnyStringLeaf — must match it exactly.
 		{"nil", nil, false},
-		{"empty map", map[string]any{}, false},
-		{"plain scalars only", map[string]any{"a": "literal", "b": 3, "c": true}, false},
-		{"top-level value with ${", map[string]any{"a": "${VAR}"}, true},
-		{"value nested in list", map[string]any{"data": []any{"first", "${VAR}", "third"}}, true},
-		{"value deeply nested", map[string]any{
-			"spec": map[string]any{"containers": []any{map[string]any{"image": "ghcr.io/x:${TAG}"}}},
-		}, true},
-		{"dollar but no brace", map[string]any{"a": "price$5"}, false},
-		// Key-position cases — these are where AnyStringNode diverges
-		// from (improves on) AnyStringLeaf.
-		{"key with ${, non-string value", map[string]any{"${OP_VAULT}": 1}, true},
-		{"key with ${ nested under a list", map[string]any{
-			"vaults": []any{map[string]any{"${OP_VAULT}": 1}},
-		}, true},
-		{"escaped $${ key still triggers", map[string]any{"$${OP_VAULT}": 1}, true},
-		{"plain key, no ${ anywhere", map[string]any{"vaults": map[string]any{"homelab": 1}}, false},
-	}
-	for _, tc := range cases {
+		{"literal", "value", false},
+		{"placeholder", "..PLACEHOLDER_key..", true},
+		{"concatenation", "registry...PLACEHOLDER_DOMAIN..", true},
+		{"key only", map[string]any{"..PLACEHOLDER_key..": 1}, false},
+		{"nested key", []any{map[string]any{"..PLACEHOLDER_key..": "value"}}, false},
+		{"nested value", map[string]any{"data": []any{3, map[string]any{"value": "..PLACEHOLDER_key.."}}}, true},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := AnyStringNode(tc.in, hasDollar); got != tc.want {
-				t.Errorf("AnyStringNode(${) = %v, want %v", got, tc.want)
+			t.Parallel()
+			if got := ContainsValuePlaceholder(tc.in); got != tc.want {
+				t.Errorf("ContainsValuePlaceholder = %v, want %v", got, tc.want)
 			}
 		})
-	}
-}
-
-// TestAnyStringNode_ParityWithLeafOnValues pins that AnyStringNode and
-// AnyStringLeaf agree whenever no `${` sits in a key — i.e. the new
-// behavior is strictly additive (it only ever flips false→true for a
-// key-position match, never changes a value-driven result).
-func TestAnyStringNode_ParityWithLeafOnValues(t *testing.T) {
-	hasDollar := func(s string) bool { return strings.Contains(s, "${") }
-	valueOnly := []any{
-		nil,
-		map[string]any{},
-		map[string]any{"a": "literal", "b": 3},
-		map[string]any{"a": "${VAR}"},
-		map[string]any{"data": []any{"x", "${VAR}", "y"}},
-		map[string]any{"spec": map[string]any{"replicas": "${N}"}},
-		map[string]any{"a": "price$5"},
-	}
-	for i, v := range valueOnly {
-		if AnyStringNode(v, hasDollar) != AnyStringLeaf(v, hasDollar) {
-			t.Errorf("case %d: AnyStringNode and AnyStringLeaf disagree on a key-free tree", i)
-		}
 	}
 }
 
 // HelmRelease.Clone must produce a HR whose mutable fields don't alias
 // the source — critical for the store-immutability contract.
 func TestHelmRelease_Clone_Isolation(t *testing.T) {
+	t.Parallel()
 	src := &HelmRelease{
 		Name: "plex", Namespace: "media",
 		Values:           map[string]any{"replicas": 1, "nested": map[string]any{"k": "v"}},
@@ -188,30 +153,38 @@ func TestHelmRelease_Clone_Isolation(t *testing.T) {
 	}
 }
 
-// Kustomization.Clone must deep-copy Contents — the nested map that
-// UpdatePostBuildSubstitutions walks and writes into.
 func TestKustomization_Clone_Isolation(t *testing.T) {
-	src := &Kustomization{
-		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstitute: map[string]any{"K": "v"},
-		Contents: map[string]any{
-			"spec": map[string]any{
-				"postBuild": map[string]any{
-					"substitute": map[string]any{"X": "y"},
-				},
-			},
-		},
-	}
+	t.Parallel()
+	doc := mustYAML(t, `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: apps, namespace: flux-system, labels: {owner: original}, annotations: {note: original}}
+spec:
+  patches: [{patch: original, target: {kind: ConfigMap, name: original}}, null]
+  components: [original]
+  commonMetadata:
+    labels: {app: null, team: original}
+    annotations: {note: null}
+`)
+	src, err := parseKustomization(doc)
+	assert.NoError(t, err)
+	snapshot := Fingerprint(src.Content(nil))
+	rawSpec := doc["spec"].(map[string]any)
+	rawSpec["patches"].([]any)[0].(map[string]any)["target"].(map[string]any)["name"] = "raw-edit"
+	rawSpec["commonMetadata"].(map[string]any)["labels"].(map[string]any)["team"] = "raw-edit"
+	assert.Equal(t, Fingerprint(src.Content(nil)), snapshot)
 	dst := src.Clone()
-	dst.PostBuildSubstitute["K"] = "MUTATED"
-	dst.Contents["spec"].(map[string]any)["postBuild"].(map[string]any)["substitute"].(map[string]any)["X"] = "MUTATED"
-
-	if src.PostBuildSubstitute["K"] != "v" {
-		t.Errorf("source PostBuildSubstitute aliased")
-	}
-	srcSub := src.Contents["spec"].(map[string]any)["postBuild"].(map[string]any)["substitute"].(map[string]any)
-	if srcSub["X"] != "y" {
-		t.Errorf("source Contents aliased: %v", srcSub)
+	dst.Patches[0].Patch = "changed"
+	dst.Patches[0].Target.Name = "changed"
+	dst.Components[0] = "changed"
+	dst.CommonMetadata.Labels["app"] = "changed"
+	dst.CommonMetadata.Annotations["note"] = "changed"
+	dst.Labels["owner"] = "changed"
+	dst.Annotations["note"] = "changed"
+	assert.Equal(t, src.Labels["owner"], "original")
+	assert.Equal(t, src.Annotations["note"], "original")
+	assert.Equal(t, Fingerprint(src.Content(nil)), snapshot)
+	if Fingerprint(dst.Content(nil)) == snapshot {
+		t.Fatal("typed input edits did not invalidate content")
 	}
 }
 
@@ -222,23 +195,22 @@ func TestKustomization_Clone_Isolation(t *testing.T) {
 // would corrupt the store. Iterate every pointer-shaped field the
 // spec exposes — any one regressing breaks the immutability contract.
 func TestHelmRelease_Clone_DeepCopiesEmbeddedSpec(t *testing.T) {
+	t.Parallel()
 	src := &HelmRelease{
 		Name: "plex", Namespace: "media",
-		HelmReleaseSpec: helmv2.HelmReleaseSpec{
-			Install:   &helmv2.Install{DisableHooks: false},
-			Upgrade:   &helmv2.Upgrade{DisableHooks: false},
-			Rollback:  &helmv2.Rollback{DisableHooks: false},
-			Uninstall: &helmv2.Uninstall{DisableHooks: false},
-			Test:      &helmv2.Test{Enable: false},
-			DriftDetection: &helmv2.DriftDetection{
-				Mode: helmv2.DriftDetectionWarn,
-			},
-			ValuesFrom: []helmv2.ValuesReference{
-				{Kind: "ConfigMap", Name: "src-cm"},
-			},
-			DependsOn: []helmv2.DependencyReference{
-				{Name: "src-dep"},
-			},
+		Install:   &helmv2.Install{DisableHooks: false},
+		Upgrade:   &helmv2.Upgrade{DisableHooks: false},
+		Rollback:  &helmv2.Rollback{DisableHooks: false},
+		Uninstall: &helmv2.Uninstall{DisableHooks: false},
+		Test:      &helmv2.Test{Enable: false},
+		DriftDetection: &helmv2.DriftDetection{
+			Mode: helmv2.DriftDetectionWarn,
+		},
+		ValuesFrom: []helmv2.ValuesReference{
+			{Kind: "ConfigMap", Name: "src-cm"},
+		},
+		DependsOn: []helmv2.DependencyReference{
+			{Name: "src-dep"},
 		},
 	}
 	dst := src.Clone()
@@ -282,28 +254,24 @@ func TestHelmRelease_Clone_DeepCopiesEmbeddedSpec(t *testing.T) {
 // Pre-fix the spec's PostBuild.Substitute map, Patches slice, Images
 // slice etc. aliased the canonical store-owned Kustomization.
 func TestKustomization_Clone_DeepCopiesEmbeddedSpec(t *testing.T) {
+	t.Parallel()
 	src := &Kustomization{
 		Name: "apps", Namespace: "flux-system",
-		KustomizationSpec: kustomizev1.KustomizationSpec{
-			PostBuild: &kustomizev1.PostBuild{
-				Substitute: map[string]string{"K": "v"},
-			},
-			Patches: []kustomize.Patch{
-				{Patch: "src-patch"},
-			},
-			Components: []string{"src-comp"},
-			DependsOn: []kustomizev1.DependencyReference{
-				{Name: "src-dep"},
-			},
+		PostBuild: &kustomizev1.PostBuild{
+			Substitute: map[string]string{"K": "v"},
+		},
+		Patches: []kustomize.Patch{
+			{Patch: "src-patch"},
+		},
+		Components: []string{"src-comp"},
+		DependsOn: []kustomizev1.DependencyReference{
+			{Name: "src-dep"},
 		},
 	}
 	dst := src.Clone()
 	dst.PostBuild.Substitute["K"] = "MUTATED"
 	dst.Patches[0].Patch = "MUTATED"
 	dst.Components[0] = "MUTATED"
-	// KustomizationSpec.DependsOn is shadowed by the flate-side
-	// Kustomization.DependsOn ([]DependencyRef); access through the
-	// embedded field name to disambiguate.
 	dst.KustomizationSpec.DependsOn[0].Name = "MUTATED"
 
 	if src.PostBuild.Substitute["K"] != "v" {
@@ -317,5 +285,23 @@ func TestKustomization_Clone_DeepCopiesEmbeddedSpec(t *testing.T) {
 	}
 	if src.KustomizationSpec.DependsOn[0].Name != "src-dep" {
 		t.Errorf("source spec DependsOn aliased: %v", src.KustomizationSpec.DependsOn[0].Name)
+	}
+}
+
+func TestWithNamespace_Copy(t *testing.T) {
+	t.Parallel()
+	ks := &Kustomization{Name: "app", Namespace: "authored"}
+	ks.PostBuild = &kustomizev1.PostBuild{SubstituteFrom: []SubstituteReference{{Kind: KindConfigMap, Name: "values"}}}
+	for _, tc := range []struct{ name, namespace string }{
+		{"projected", "effective"}, {"cleared", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			projected := ks.WithNamespace(tc.namespace).(*Kustomization)
+			assert.Equal(t, projected.Named(), NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: tc.namespace, Name: "app"})
+			assert.Equal(t, ks.Named(), NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: "authored", Name: "app"})
+			assert.Diff(t, ks.PostBuild, &kustomizev1.PostBuild{SubstituteFrom: []SubstituteReference{{Kind: KindConfigMap, Name: "values"}}})
+			assert.Diff(t, projected.PostBuild, ks.PostBuild)
+		})
 	}
 }

@@ -31,7 +31,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           cache: false
           experimental: true
@@ -48,7 +48,7 @@ jobs:
       contents: read
       id-token: write
       packages: write
-    uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    uses: docker/github-builder/.github/workflows/build.yml@cbc9d42f8c89a55623392aadd03600965b80e963 # v1.18.1
     with:
       build-args: |
         VERSION=${{ github.ref_name }}
@@ -77,6 +77,7 @@ jobs:
     if: ${{ github.event_name == 'release' }}
     uses: $/.github/workflows/goreleaser.yaml
     permissions:
+      attestations: write
       contents: write
       id-token: write
     with:

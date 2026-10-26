@@ -1,60 +1,40 @@
 package external_test
 
 import (
-	"context"
-	"strings"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/source/external"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-func TestFetcher_FileURL(t *testing.T) {
-	f := &external.Fetcher{}
-	ea := &manifest.ExternalArtifact{
-		Name: "ea", Namespace: "apps",
-		ArtifactURL: "file:///cache/x.tar.gz",
-		Revision:    "v1@sha256:abc",
-		Digest:      "sha256:abc",
-	}
-	art, err := f.Fetch(context.Background(), ea)
-	if err != nil {
-		t.Fatalf("Fetch: %v", err)
-	}
-	if art.Kind != manifest.KindExternalArtifact {
-		t.Errorf("Kind = %q, want %q", art.Kind, manifest.KindExternalArtifact)
-	}
-	if art.LocalPath != "/cache/x.tar.gz" {
-		t.Errorf("LocalPath = %q, want /cache/x.tar.gz", art.LocalPath)
-	}
-	if art.Revision != "v1@sha256:abc" {
-		t.Errorf("Revision = %q", art.Revision)
-	}
-}
-
 func TestFetcher_NoArtifact(t *testing.T) {
-	f := &external.Fetcher{}
-	ea := &manifest.ExternalArtifact{Name: "ea", Namespace: "apps"}
-	_, err := f.Fetch(context.Background(), ea)
-	if err == nil {
-		t.Fatalf("expected error when ArtifactURL is empty")
-	}
-	if !strings.Contains(err.Error(), "offline use") {
-		t.Errorf("error should explain the offline limitation; got %v", err)
-	}
-}
-
-func TestFetcher_NonFileURL(t *testing.T) {
-	f := &external.Fetcher{}
-	ea := &manifest.ExternalArtifact{
-		Name: "ea", Namespace: "apps",
-		ArtifactURL: "http://source-controller.flux-system.svc/x.tar.gz",
-	}
-	_, err := f.Fetch(context.Background(), ea)
-	if err == nil {
-		t.Fatalf("expected error for non-file:// URL")
-	}
-	if !strings.Contains(err.Error(), "not a file://") {
-		t.Errorf("error should call out the URL scheme; got %v", err)
+	t.Parallel()
+	for _, predicted := range []bool{false, true} {
+		t.Run(fmt.Sprint(predicted), func(t *testing.T) {
+			t.Parallel()
+			f := &external.Fetcher{}
+			ea := &manifest.ExternalArtifact{Name: "ea", Namespace: "apps"}
+			s := store.New()
+			if predicted {
+				owner := &manifest.Kustomization{Name: "owner", Namespace: "apps"}
+				s.AddObject(owner)
+				generator := &manifest.RawObject{APIVersion: "source.extensions.fluxcd.io/v1beta1", Kind: "ArtifactGenerator", Name: "generator", Namespace: "apps", Spec: map[string]any{"artifacts": []any{map[string]any{"name": ea.Name}}}}
+				s.RecordEmitted(owner.Named(), &store.Emission{Children: []store.Child{{Obj: generator}}, Complete: true}, nil)
+				if len(s.Productions(ea.Named(), nil)) != 1 {
+					t.Fatal("missing producer evidence")
+				}
+			}
+			if s.GetObject(ea.Named()) != nil || s.GetArtifact(ea.Named()) != nil {
+				t.Fatal("prediction supplied source content")
+			}
+			_, err := f.Fetch(t.Context(), ea, testReadSet(ea), sourcecache.Policy{})
+			if !errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) {
+				t.Fatalf("missing-content error = %v", err)
+			}
+		})
 	}
 }

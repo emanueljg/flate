@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
+	"helm.sh/helm/v4/pkg/registry"
 	"oras.land/oras-go/v2/registry/remote"
 
 	"github.com/home-operations/flate/pkg/manifest"
@@ -28,14 +29,12 @@ func parseOCIRef(versioned string) (string, error) {
 	versioned = strings.TrimPrefix(versioned, "oci://")
 	// Strip ":<tag>" or "@<digest>" portion for the reference; oras
 	// takes them separately.
-	if i := strings.LastIndex(versioned, "@"); i > 0 {
-		versioned = versioned[:i]
+	if before, _, found := strings.CutLast(versioned, "@"); found && before != "" {
+		versioned = before
 	}
-	if i := strings.LastIndex(versioned, ":"); i > 0 {
-		// Don't confuse port numbers with tags ("registry:5000/x").
-		if !strings.Contains(versioned[i+1:], "/") {
-			versioned = versioned[:i]
-		}
+	// Don't confuse port numbers with tags ("registry:5000/x").
+	if before, after, found := strings.CutLast(versioned, ":"); found && before != "" && !strings.Contains(after, "/") {
+		versioned = before
 	}
 	if _, err := url.Parse("oci://" + versioned); err != nil {
 		return "", fmt.Errorf("parse OCI ref %q: %w", versioned, err)
@@ -58,22 +57,6 @@ func versionTag(ref manifest.OCIRepositoryRef) string {
 	return ""
 }
 
-// versionedURL composes a Flux-style versioned URL from a base + ref.
-// Used here for cache-slot keying after semver resolution.
-func versionedURL(base string, ref manifest.OCIRepositoryRef) string {
-	switch {
-	case ref.Digest != "":
-		return base + "@" + ref.Digest
-	case ref.Tag != "":
-		return base + ":" + ref.Tag
-	}
-	return base
-}
-
-func shouldResolveOCISemver(ref manifest.OCIRepositoryRef) bool {
-	return ref.Digest == "" && ref.SemVer != ""
-}
-
 // ociRevision composes a Flux-style "<tag>@<digest>" revision string.
 // When tag is empty, falls back to bare digest; when digest is empty,
 // returns just the tag. Matches source-controller's ocirepository
@@ -92,36 +75,19 @@ func ociRevision(ref manifest.OCIRepositoryRef, digest string) string {
 	return tag
 }
 
-// resolveOCISemver lists the remote tags, applies an optional regex
-// filter, then returns the highest tag matching the semver constraint.
-// Mirrors source-controller's `getTagBySemver` (ocirepository_controller.go).
-func resolveOCISemver(ctx context.Context, repoClient *remote.Repository, expr, filterPattern, mediaType string) (string, error) {
+// Mirrors source-controller's getTagBySemver (ocirepository_controller.go).
+func resolveOCISemver(ctx context.Context, repoClient *remote.Repository, ref manifest.OCIRepositoryRef, mediaType string) (string, error) {
 	var collected []string
 	if err := repoClient.Tags(ctx, "", func(batch []string) error {
 		collected = append(collected, batch...)
 		return nil
 	}); err != nil {
-		return "", fmt.Errorf("list tags: %w", err)
+		return "", fmt.Errorf("list tags: %w", orasError(err))
 	}
-	return pickSemverTag(collected, expr, filterPattern, mediaType)
+	return pickSemverTag(collected, ref.SemVer, ref.SemverFilter, mediaType)
 }
 
-// resolveOCIRefDigest returns the concrete digest for a ref: the explicit
-// digest when set, otherwise the registry's resolution of tag.
-func resolveOCIRefDigest(ctx context.Context, repoClient *remote.Repository, ref manifest.OCIRepositoryRef, tag string) (string, error) {
-	if ref.Digest != "" {
-		return ref.Digest, nil
-	}
-	desc, err := repoClient.Resolve(ctx, tag)
-	if err != nil {
-		return "", err
-	}
-	return desc.Digest.String(), nil
-}
-
-// pickSemverTag picks the highest semver-matching tag from a list,
-// applying an optional regex filter. Pure function so it's testable
-// without a real registry.
+// pickSemverTag preserves the first registry tag among equal semver versions.
 func pickSemverTag(tags []string, expr, filterPattern, mediaType string) (string, error) {
 	constraint, err := semver.NewConstraint(expr)
 	if err != nil {
@@ -140,7 +106,10 @@ func pickSemverTag(tags []string, expr, filterPattern, mediaType string) (string
 		if pattern != nil && !pattern.MatchString(tag) {
 			continue
 		}
-		v, perr := semver.NewVersion(convertOCIToSemVerTag(tag, mediaType))
+		if mediaType == registry.ChartLayerMediaType {
+			tag = strings.ReplaceAll(tag, "_", "+")
+		}
+		v, perr := semver.NewVersion(tag)
 		if perr != nil {
 			continue
 		}
@@ -152,19 +121,9 @@ func pickSemverTag(tags []string, expr, filterPattern, mediaType string) (string
 		return "", fmt.Errorf("no tag matched semver %q (filter %q)", expr, filterPattern)
 	}
 	best := slices.MaxFunc(matching, (*semver.Version).Compare)
-	return convertSemVerToOCITag(best.Original(), mediaType), nil
-}
-
-func convertSemVerToOCITag(semVer, mediaType string) string {
-	if mediaType == helmChartLayerMediaType {
-		return strings.ReplaceAll(semVer, "+", "_")
+	tag := best.Original()
+	if mediaType == registry.ChartLayerMediaType {
+		tag = strings.ReplaceAll(tag, "+", "_")
 	}
-	return semVer
-}
-
-func convertOCIToSemVerTag(ociTag, mediaType string) string {
-	if mediaType == helmChartLayerMediaType {
-		return strings.ReplaceAll(ociTag, "_", "+")
-	}
-	return ociTag
+	return tag, nil
 }

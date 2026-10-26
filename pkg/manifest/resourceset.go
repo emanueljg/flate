@@ -1,18 +1,22 @@
 package manifest
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 
 	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/kustomize/kyaml/yaml"
 )
 
 // ResourceSet is the flux-operator ResourceSet CRD
 // (fluxcd.controlplane.io/v1). A ResourceSet templates a fixed set of
 // resources across a matrix of input values — the controller renders
-// spec.resources / spec.resourcesTemplate once per input set and emits
-// the resulting objects with metadata.namespace defaulted to the
-// ResourceSet's own namespace when absent.
+// spec.resources / spec.resourcesTemplate once per input set. Standalone rendering
+// preserves document namespaces; controller emission defaults omitted namespaces
+// on namespaced children to the ResourceSet namespace.
 //
 // The embedded fluxopv1.ResourceSetSpec promotes CommonMetadata,
 // Inputs, InputsFrom, Resources, ResourcesTemplate, InputStrategy,
@@ -28,12 +32,28 @@ type ResourceSet struct {
 	// downstream consumers can read them without re-parsing the raw
 	// document.
 	Labels map[string]string `json:"-" yaml:"-"`
+
+	// Suspend reports whether the reconciliation-disabled annotation pauses the set.
+	Suspend bool `json:"-" yaml:"-"`
 }
+
+// Suspended reports whether reconciliation is disabled.
+func (r *ResourceSet) Suspended() bool { return r.Suspend }
 
 // Named identifies the ResourceSet.
 func (r *ResourceSet) Named() NamedResource {
-	return NamedResource{Kind: KindResourceSet, Namespace: r.Namespace, Name: r.Name}
+	return NamedResource{Group: kindTable[kindResourceSet].Group, Kind: KindResourceSet, Namespace: r.Namespace, Name: r.Name}
 }
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (r *ResourceSet) WithNamespace(namespace string) BaseManifest {
+	out := *r
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (r *ResourceSet) ProjectionCompatible(BaseManifest) bool { return true }
 
 // GetLabels returns the ResourceSet's metadata.labels.
 func (r *ResourceSet) GetLabels() map[string]string { return r.Labels }
@@ -45,11 +65,35 @@ func parseResourceSet(doc map[string]any) (*ResourceSet, error) {
 	if err := decodeCR(doc, &cr, "ResourceSet", FluxOperatorDomain); err != nil {
 		return nil, err
 	}
+	for i, dep := range cr.Spec.DependsOn {
+		gv, err := schema.ParseGroupVersion(dep.APIVersion)
+		if err != nil || gv.Version == "" {
+			return nil, inputf("ResourceSet %w", field.Invalid(field.NewPath("spec", "dependsOn").Index(i).Child("apiVersion"), dep.APIVersion, "must have a valid version"))
+		}
+		scopes.ResolveScope(yaml.TypeMeta{APIVersion: dep.APIVersion, Kind: dep.Kind})
+	}
+	spec, _ := doc["spec"].(map[string]any)
+	inputsFrom, _ := spec["inputsFrom"].([]any)
+	for i, ref := range cr.Spec.InputsFrom {
+		explicit := ref.APIVersion != ""
+		if i < len(inputsFrom) {
+			raw, _ := inputsFrom[i].(map[string]any)
+			_, explicit = raw["apiVersion"]
+		}
+		if !explicit {
+			continue
+		}
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err != nil || gv.Version == "" {
+			return nil, inputf("ResourceSet %w", field.Invalid(field.NewPath("spec", "inputsFrom").Index(i).Child("apiVersion"), ref.APIVersion, "must have a valid version"))
+		}
+	}
 	return &ResourceSet{
 		Name:            cr.Name,
 		Namespace:       cr.Namespace,
 		ResourceSetSpec: cr.Spec,
 		Labels:          cr.Labels,
+		Suspend:         cr.IsDisabled(),
 	}, nil
 }
 
@@ -75,8 +119,21 @@ type ResourceSetInputProvider struct {
 
 // Named identifies the ResourceSetInputProvider.
 func (p *ResourceSetInputProvider) Named() NamedResource {
-	return NamedResource{Kind: KindResourceSetInputProvider, Namespace: p.Namespace, Name: p.Name}
+	return NamedResource{Group: kindTable[kindResourceSetInputProvider].Group, Kind: KindResourceSetInputProvider, Namespace: p.Namespace, Name: p.Name}
 }
+
+// Suspended reports whether reconciliation is paused on this resource.
+func (p *ResourceSetInputProvider) Suspended() bool { return false }
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (p *ResourceSetInputProvider) WithNamespace(namespace string) BaseManifest {
+	out := *p
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (p *ResourceSetInputProvider) ProjectionCompatible(BaseManifest) bool { return true }
 
 // GetLabels returns the ResourceSetInputProvider's metadata.labels.
 func (p *ResourceSetInputProvider) GetLabels() map[string]string { return p.Labels }
@@ -151,4 +208,46 @@ func (p *ResourceSetInputProvider) derivedID() string {
 	// First 8 bytes (16 hex chars) of the full digest — enough to
 	// uniquely identify the input set within a render.
 	return SHA256Hex([]byte(p.Namespace + "/" + p.Name))[:16]
+}
+
+func (r *ResourceSet) references(yield func(Reference) bool) {
+	for i := range r.DependsOn {
+		dep := &r.DependsOn[i]
+		id := NamedResource{Group: apiGroup(dep.APIVersion), Kind: dep.Kind, Name: dep.Name}
+		namespaced, prepared := scopes.LookupScope(yaml.TypeMeta{APIVersion: dep.APIVersion, Kind: dep.Kind})
+		if !prepared {
+			panic("manifest: ResourceSet dependency scope was not prepared")
+		}
+		if namespaced {
+			id.Namespace = r.Namespace
+			if dep.Namespace != "" {
+				id.Namespace = dep.Namespace
+			}
+		}
+		if !yield(Reference{
+			NamedResource: id,
+			Use:           "dependsOn", Position: i, ReadyExpr: referenceExpression(&dep.ReadyExpr), Gate: GateInputs,
+		}) {
+			return
+		}
+	}
+	for i, ref := range r.InputsFrom {
+		kind := cmp.Or(ref.Kind, KindResourceSetInputProvider)
+		var gate GateStage
+		if ref.Name != "" {
+			gate = GateInputs
+		}
+		if !yield(Reference{
+			NamedResource: Resolve(NamedResource{Group: referenceGroup(kind, ref.APIVersion), Kind: kind, Name: ref.Name}, "", r.Namespace),
+			Use:           "inputsFrom", Position: i, Content: true, Gate: gate,
+		}) {
+			return
+		}
+	}
+}
+
+func (r *ResourceSet) kind() KindInfo { return kindTable[kindResourceSet].KindInfo }
+
+func (p *ResourceSetInputProvider) kind() KindInfo {
+	return kindTable[kindResourceSetInputProvider].KindInfo
 }

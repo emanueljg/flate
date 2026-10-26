@@ -1,6 +1,13 @@
 package manifest
 
-import "strings"
+import (
+	"bytes"
+	"encoding/base64"
+	"maps"
+	"strings"
+
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+)
 
 // sopsCiphertextPrefix opens every SOPS-encrypted scalar. SOPS rewrites
 // an encrypted value as `ENC[AES256_GCM,data:…,iv:…,tag:…,type:…]`; the
@@ -8,29 +15,72 @@ import "strings"
 // real cleartext value never matches it by accident.
 const sopsCiphertextPrefix = "ENC[AES256_GCM,"
 
-// IsSopsCiphertext reports whether s is a SOPS-encrypted scalar that
-// flate (running offline, with no decryption key) cannot decrypt. Used
-// to wipe leftover ciphertext to a placeholder so it doesn't poison
-// downstream rendering — e.g. an encrypted ConfigMap value flowing into
-// postBuild substitution, where the `:` inside the ciphertext breaks
-// chart validation (Ingress hosts, cert-manager dnsNames, ...).
-func IsSopsCiphertext(s string) bool {
-	return strings.HasPrefix(s, sopsCiphertextPrefix) && strings.HasSuffix(s, "]")
+// ValuePlaceholder returns the offline placeholder token for key.
+func ValuePlaceholder(key string) string {
+	return ValuePlaceholderPrefix + key + ".."
 }
 
-// IsEncryptedSecret reports whether doc looks like a SOPS-encrypted
-// Kubernetes resource. SOPS appends a top-level `sops` map containing
-// its metadata (mac, kms/age/pgp blocks, version) after encrypting the
-// document's body; presence of that map with a `mac` or `version`
-// field is the unambiguous signal.
-//
-// flate runs offline and cannot decrypt; the kustomization and
-// helmrelease controllers call this to log the encrypted resource
-// then wipe its data fields to ValuePlaceholderTemplate via
-// parseSecret, mirroring the --wipe-secrets cleartext behavior.
-// flate ignores spec.decryption entirely — there is no path that
-// reads the decryption Secret.
-func IsEncryptedSecret(doc map[string]any) bool {
+func sanitizeData(doc map[string]any, kind string) (map[string]any, bool) {
+	encrypted := isEncryptedSecret(doc)
+	var sanitized map[string]any
+	for _, field := range []string{"data", "stringData", "binaryData"} {
+		var encoding *base64.Encoding
+		if field == "binaryData" || (kind == KindSecret && field == "data") {
+			encoding = base64.StdEncoding
+		}
+		data, _ := doc[field].(map[string]any)
+		var replaced map[string]any
+		for key, raw := range data {
+			// Base64 decoding cannot lengthen a scalar to contain a longer marker.
+			if value, ok := raw.(string); !encrypted && ok && len(value) < len(sopsCiphertextPrefix) {
+				continue
+			}
+			value, err := scalarString(raw)
+			if err != nil && !encrypted {
+				continue
+			}
+			wiped := WipeValue(key, value, encoding, encrypted)
+			if wiped == value {
+				continue
+			}
+			if replaced == nil {
+				replaced = maps.Clone(data)
+			}
+			replaced[key] = wiped
+		}
+		if replaced != nil {
+			if sanitized == nil {
+				sanitized = maps.Clone(doc)
+			}
+			sanitized[field] = replaced
+		}
+	}
+	if sanitized != nil {
+		return sanitized, true
+	}
+	return doc, false
+}
+
+// WipeValue replaces raw or once-decoded SOPS ciphertext with a per-key token.
+// Nil encoding denotes a plaintext field; malformed encoding alone is preserved.
+func WipeValue(key, value string, encoding *base64.Encoding, encrypted bool) string {
+	wiped := encrypted || strings.Contains(value, sopsCiphertextPrefix)
+	if !wiped && encoding != nil {
+		var scratch [128]byte
+		decoded, err := encoding.AppendDecode(scratch[:0], []byte(value))
+		wiped = err == nil && bytes.Contains(decoded, []byte(sopsCiphertextPrefix))
+	}
+	if !wiped {
+		return value
+	}
+	token := ValuePlaceholder(key)
+	if encoding != nil {
+		return encoding.EncodeToString([]byte(token))
+	}
+	return token
+}
+
+func isEncryptedSecret(doc map[string]any) bool {
 	sops, ok := doc["sops"].(map[string]any)
 	if !ok {
 		return false
@@ -47,10 +97,6 @@ func IsEncryptedSecret(doc map[string]any) bool {
 // $${VAR[@]} bash array expansions would otherwise crash the parser.
 const SubstituteAnnotationKey = "kustomize.toolkit.fluxcd.io/substitute"
 
-// SubstituteDisabledValue is the literal value that opts a resource
-// out of postBuild substitution. Matches Flux's `DisabledValue`.
-const SubstituteDisabledValue = "disabled"
-
 // HasSubstituteDisabled reports whether a manifest doc carries the
 // substitute-disabled label or annotation. flate skips envsubst on
 // such resources, mirroring Flux's per-resource opt-out.
@@ -61,7 +107,7 @@ func HasSubstituteDisabled(doc map[string]any) bool {
 	}
 	for _, field := range []string{"labels", "annotations"} {
 		m, _ := md[field].(map[string]any)
-		if v, _ := m[SubstituteAnnotationKey].(string); v == SubstituteDisabledValue {
+		if v, _ := m[SubstituteAnnotationKey].(string); v == kustomizev1.DisabledValue {
 			return true
 		}
 	}

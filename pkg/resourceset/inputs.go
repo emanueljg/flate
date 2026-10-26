@@ -3,7 +3,6 @@ package resourceset
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"slices"
 
 	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
@@ -11,53 +10,45 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/home-operations/flate/pkg/manifest"
-	"github.com/home-operations/flate/pkg/store"
 )
 
-// providerInputs is one per-provider list of input sets carrying its
-// raw (un-normalized) name. Used to dispatch on spec.inputStrategy:
-// Flatten concatenates; Permute scopes by name and Cartesian-products.
-type providerInputs struct {
-	name   string           // raw provider name (rs.Name for inline; RSIP.Name otherwise)
-	inputs []map[string]any // each set already carries its `provider` block
+type providerContent struct {
+	ID     manifest.NamedResource
+	Type   string
+	Inputs []map[string]any
 }
 
-// isPermute reports whether rs selects the Permute input strategy.
+type providerInputs struct {
+	name   string
+	inputs []map[string]any
+}
+
 func isPermute(rs *manifest.ResourceSet) bool {
 	return rs.InputStrategy != nil && rs.InputStrategy.Name == fluxopv1.InputStrategyPermute
 }
 
-// buildInputSets gathers per-provider input lists then dispatches on
-// spec.inputStrategy. The ResourceSet's own inline spec.inputs are
-// treated as "provider 0", followed by each referenced
-// ResourceSetInputProvider in upstream's sorted order (matching
-// flux-operator/internal/inputs/combine.go).
-//
-// Flatten (default) concatenates: each input set is rendered once
-// against the templates, top-level access (`inputs.foo`).
-//
-// Permute Cartesian-products across providers: each result map has
-// the providers' input sets nested under their normalized names
-// (`inputs.<provider>.foo`) plus an `id` field — an adler32 hash of
-// the provider=index path matching upstream's flux-operator/internal/
-// inputs/permuter.go. Per-provider input lists are scoped before the
-// product so authors can disambiguate "rset.x" from "rsip.x". A 10000
-// permutation cap (also matching upstream) prevents pathological
-// Cartesian blowups.
-//
-// inputs.id is left to the provider when it's a Static RSIP; inline-
-// only inputs see no synthetic id under Flatten.
-func buildInputSets(rs *manifest.ResourceSet, resolve ProviderResolver) ([]map[string]any, error) {
-	groups, err := collectProviderInputs(rs, resolve)
-	if err != nil {
-		return nil, err
+func buildInputSets(rs *manifest.ResourceSet, providers []providerContent) ([]map[string]any, error) {
+	groups := make([]providerInputs, 0, 1+len(providers))
+	inlineProv := providerBlock(manifest.KindResourceSet, rs.Name, rs.Namespace)
+	inline := make([]map[string]any, 0, len(rs.Inputs))
+	for _, in := range rs.Inputs {
+		decoded := decodeInputSet(in)
+		decoded["provider"] = inlineProv
+		inline = append(inline, decoded)
+	}
+	groups = append(groups, providerInputs{name: rs.Name, inputs: inline})
+	for _, p := range providers {
+		exported := p.Inputs
+		provBlock := providerBlock(p.ID.Kind, p.ID.Name, p.ID.Namespace)
+		for _, set := range exported {
+			set["provider"] = provBlock
+		}
+		groups = append(groups, providerInputs{name: p.ID.Name, inputs: exported})
 	}
 
 	if isPermute(rs) {
 		return permute(groups, rs.InputStrategy.IncludeEmptyProviders)
 	}
-	// Default: Flatten — pre-size out to total input count across all
-	// providers to avoid incremental reallocations.
 	total := 0
 	for _, g := range groups {
 		total += len(g.inputs)
@@ -69,81 +60,48 @@ func buildInputSets(rs *manifest.ResourceSet, resolve ProviderResolver) ([]map[s
 	return out, nil
 }
 
-// collectProviderInputs assembles the per-provider input lists: rs's
-// inline inputs as provider 0 (named after the ResourceSet itself),
-// then every resolved ResourceSetInputProvider in (namespace, name)
-// order. Each input set is stamped with a `provider` block so
-// templates can recover which CR sourced the values.
-func collectProviderInputs(rs *manifest.ResourceSet, resolve ProviderResolver) ([]providerInputs, error) {
-	// Pre-size: 1 for inline + one slot per inputsFrom reference (upper
-	// bound; deduplicated entries may yield fewer).
-	groups := make([]providerInputs, 0, 1+len(rs.InputsFrom))
-
-	// Provider 0: the ResourceSet itself with its inline spec.inputs.
-	inlineProv := providerBlock(manifest.KindResourceSet, rs.Name, rs.Namespace)
-	inline := make([]map[string]any, 0, len(rs.Inputs))
-	for _, in := range rs.Inputs {
-		decoded := decodeInputSet(in)
-		decoded["provider"] = inlineProv
-		inline = append(inline, decoded)
-	}
-	groups = append(groups, providerInputs{name: rs.Name, inputs: inline})
-
+func collectProviderInputs(rs *manifest.ResourceSet, resolve ProviderResolver) ([]providerContent, error) {
 	if resolve == nil || len(rs.InputsFrom) == 0 {
-		return groups, nil
+		return nil, nil
 	}
-
-	seen := make(map[string]struct{})
-	var providers []*manifest.ResourceSetInputProvider
-	for _, ref := range rs.InputsFrom {
-		matches, err := resolve(ref, rs.Namespace)
+	providers := make(map[manifest.NamedResource]*manifest.ResourceSetInputProvider)
+	for edge := range manifest.References(rs, manifest.ReferenceRelations) {
+		if edge.Use != "inputsFrom" {
+			continue
+		}
+		ref := rs.InputsFrom[edge.Position]
+		matches, err := resolve(ref, edge.NamedResource)
 		if err != nil {
-			return nil, fmt.Errorf("inputsFrom %q: %w", ref.Name, err)
+			return nil, fmt.Errorf("%w: inputsFrom %q: %w", manifest.ErrInput, ref.Name, err)
 		}
 		for _, p := range matches {
 			if p == nil {
 				continue
 			}
-			k := p.Namespace + "/" + p.Name
-			if _, dup := seen[k]; dup {
-				continue
+			k := p.Named()
+			if _, dup := providers[k]; !dup {
+				providers[k] = p
 			}
-			seen[k] = struct{}{}
-			providers = append(providers, p)
 		}
 	}
-	// Sort providers by (namespace, name) for deterministic output,
-	// matching upstream's Combine routine ordering. NamedResource.Compare
-	// orders by (kind, namespace, name); every provider here shares the
-	// same kind so the Kind comparison is always 0 and the order reduces
-	// to the desired (namespace, name).
-	slices.SortFunc(providers, func(a, b *manifest.ResourceSetInputProvider) int {
-		return a.Named().Compare(b.Named())
+	var content []providerContent
+	for id := range providers {
+		content = append(content, providerContent{ID: id})
+	}
+	slices.SortFunc(content, func(a, b providerContent) int {
+		return a.ID.Compare(b.ID)
 	})
-	for _, p := range providers {
-		exported, err := p.ExportedInputs()
+	for i := range content {
+		p := providers[content[i].ID]
+		inputs, err := p.ExportedInputs()
 		if err != nil {
-			return nil, fmt.Errorf("ResourceSetInputProvider %s: %w", p.Named().NamespacedName(), err)
+			return nil, fmt.Errorf("%w: ResourceSetInputProvider %s: %w", manifest.ErrInput, p.Named().NamespacedName(), err)
 		}
-		if exported == nil && p.Type != "" && p.Type != fluxopv1.InputProviderStatic {
-			slog.Warn("resourceset: dynamic input provider contributes no inputs offline",
-				"resource_set", rs.Named().NamespacedName(),
-				"provider", p.Named().NamespacedName(),
-				"type", p.Type)
-		}
-		provBlock := providerBlock(manifest.KindResourceSetInputProvider, p.Name, p.Namespace)
-		pInputs := make([]map[string]any, 0, len(exported))
-		for _, set := range exported {
-			set["provider"] = provBlock
-			pInputs = append(pInputs, set)
-		}
-		groups = append(groups, providerInputs{name: p.Name, inputs: pInputs})
+		content[i].Type, content[i].Inputs = p.Type, inputs
 	}
-	return groups, nil
+	return content, nil
 }
 
-// providerBlock builds the `provider` block stamped onto each input set
-// so templates can recover which CR sourced the values.
 func providerBlock(kind, name, namespace string) map[string]any {
 	return map[string]any{
 		"apiVersion": fluxopv1.GroupVersion.String(),
@@ -172,34 +130,24 @@ func decodeInputSet(in fluxopv1.ResourceSetInput) map[string]any {
 	return decoded
 }
 
-// MatchSelector returns true when sel matches lbls. Helper for
-// ProviderResolver implementations that filter by InputProviderReference.Selector.
-func MatchSelector(sel *metav1.LabelSelector, lbls map[string]string) (bool, error) {
-	if sel == nil {
-		return true, nil
-	}
-	s, err := metav1.LabelSelectorAsSelector(sel)
-	if err != nil {
-		return false, err
-	}
-	return s.Matches(labels.Set(lbls)), nil
+type providerReader interface {
+	GetObject(manifest.NamedResource) manifest.BaseManifest
+	ListObjects(string, string) []manifest.BaseManifest
 }
 
-// StoreResolver returns a ProviderResolver backed by s. Name-only refs
-// perform a direct id lookup; selector refs walk the store's
-// ResourceSetInputProviders in the requested namespace and filter by
-// metadata.labels. This is the canonical implementation shared by
-// discovery and the orchestrator — both call sites previously carried
-// identical local copies.
-func StoreResolver(s *store.Store) ProviderResolver {
-	return func(ref fluxopv1.InputProviderReference, namespace string) ([]*manifest.ResourceSetInputProvider, error) {
-		if ref.Name != "" {
-			id := manifest.NamedResource{
-				Kind:      manifest.KindResourceSetInputProvider,
-				Namespace: namespace,
-				Name:      ref.Name,
-			}
-			obj, ok := s.Get[*manifest.ResourceSetInputProvider](id)
+// StoreResolver resolves named or selected providers from immutable query inputs.
+// References MUST remain immutable, and the resolver MUST be used sequentially.
+func StoreResolver(s providerReader) ProviderResolver {
+	type compilation struct {
+		selector labels.Selector
+		err      error
+	}
+	var firstSelector *metav1.LabelSelector
+	var firstCompilation compilation
+	var selectors map[*metav1.LabelSelector]compilation
+	return func(ref fluxopv1.InputProviderReference, id manifest.NamedResource) ([]*manifest.ResourceSetInputProvider, error) {
+		if id.Name != "" {
+			obj, ok := s.GetObject(id).(*manifest.ResourceSetInputProvider)
 			if !ok {
 				return nil, nil
 			}
@@ -208,16 +156,29 @@ func StoreResolver(s *store.Store) ProviderResolver {
 		if ref.Selector == nil {
 			return nil, nil
 		}
+		compiled := firstCompilation
+		if ref.Selector != firstSelector {
+			var ok bool
+			compiled, ok = selectors[ref.Selector]
+			if !ok {
+				compiled.selector, compiled.err = metav1.LabelSelectorAsSelector(ref.Selector)
+				if firstSelector == nil {
+					firstSelector, firstCompilation = ref.Selector, compiled
+				} else {
+					if selectors == nil {
+						selectors = make(map[*metav1.LabelSelector]compilation)
+					}
+					selectors[ref.Selector] = compiled
+				}
+			}
+		}
+		if compiled.err != nil {
+			return nil, compiled.err
+		}
 		var out []*manifest.ResourceSetInputProvider
-		for _, p := range s.ListAs[*manifest.ResourceSetInputProvider](manifest.KindResourceSetInputProvider) {
-			if p.Namespace != namespace {
-				continue
-			}
-			match, err := MatchSelector(ref.Selector, p.Labels)
-			if err != nil {
-				return nil, err
-			}
-			if match {
+		for _, object := range s.ListObjects(id.Group, id.Kind) {
+			p, ok := object.(*manifest.ResourceSetInputProvider)
+			if ok && p.Namespace == id.Namespace && compiled.selector.Matches(labels.Set(p.Labels)) {
 				out = append(out, p)
 			}
 		}

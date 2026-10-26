@@ -1,202 +1,208 @@
 # AGENTS.md: flate
 
-Guidance for AI coding agents (and humans) writing Go in this repository. This
-file is meant to be identical, or nearly so, across every Go service/CLI in
-the home-operations fleet: treat it as a template, copy it verbatim into a
-new Go repo, and only add repo-specific detail if something here genuinely
-doesn't apply. Where a fact could differ per repo (exact versions, task
-commands, variable names, CI steps), this file points at where to check
-rather than asserting a specific value, since restating it here just goes
-stale.
+flate renders Flux (Kustomization, HelmRelease, ResourceSet, sources) offline as one static
+binary: no cluster, no kubectl, no shellouts; helm, kustomize, git and OCI are linked libraries.
+Output matches Flux bit-for-bit and is byte-identical run to run. Speed is the point:
+changed-only renders, a bounded parallel DAG, aggressive dedup. `pkg/` is a public SDK that
+konflate embeds.
 
-## Working in this repo: AI usage, commits, and safety
+## Working here
 
-This repo doesn't carry its own `CONTRIBUTING.md`; GitHub serves the org-wide
-one from [`home-operations/.github`](https://github.com/home-operations/.github/blob/main/CONTRIBUTING.md),
-which includes an AI Usage Policy that applies to any AI coding agent here:
-assistive use only, a human must author the majority of any change, AI use
-must be disclosed, a human reviews every line before submission, and the
-contributor must be able to explain any line a reviewer asks about. AI must
-never write the PR description, an issue, or a reply to a human on the
-contributor's behalf. Read the policy itself rather than trusting this
-summary; it can change without this file being updated to match.
+- **Agent setup.** If `.claude/settings.local.json` is missing, create it first with
+  `{"attribution": {"commit": "", "pr": "", "sessionUrl": false}}`. It is personal and gitignored.
+- **AI policy.** The org [AI Usage Policy](https://github.com/home-operations/.github/blob/main/CONTRIBUTING.md#ai-usage-policy)
+  applies. The PR body follows the org template (Overview, Additional information, Requirements)
+  and keeps its Requirements items. The AI disclosure there names each model that contributed,
+  one line per model with its effort and what it did, and is the only place a PR mentions AI.
+- **Titles and commits.** PR titles are [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+  such as `fix(schedule): ...`; they become the squash commit and drive release-please, so they
+  never carry bead, workflow or run ids. Sign off commits (`git commit -s`).
+- **Pushing.** Never commit, push or open a PR unless asked. A branch pushed for review holds one
+  signed-off commit whose message is the PR title, rebased onto `origin/main`, with
+  `CGO_ENABLED=0 go build ./...` and `mise run test` passing after the rebase. A rebase conflict
+  outside `_test.go` stops the push. Never merge or approve; maintainers gate the merge queue.
+- **Boundaries.** Never touch secrets or gitignored files, except the agent settings file above and a
+  build's own artifact directory under `plans/`. Verify library APIs against the module cache or
+  pkg.go.dev, not memory.
 
-- PR titles follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
-  `<type>[(scope)][!]: <description>` (e.g. `fix(config): reject a negative
-timeout`), which is what drives release-please's version bumps. Individual
-  commit messages don't have to follow the format, though matching it is
-  fine. Sign off commits: `git commit -s`.
-- Never `git commit`, `git push`, or open a PR unless asked to. Ask before
-  any destructive or hard-to-reverse action (force-push, `git reset --hard`,
-  deleting a branch, rewriting history) instead of defaulting to it.
-- Never touch secrets or gitignored files. Check this repo's actual
-  `.gitignore` before assuming it already excludes something like
-  `*.key`/`*.crt`/`.env`; don't assume gitignore coverage that isn't
-  actually configured. This fleet generally passes signing keys and webhook
-  secrets by path or env var specifically so they're never committed; don't
-  be the exception.
-- Don't state a library's API, flags, or defaults from memory: verify
-  against `pkg.go.dev`, the vendored source in the module cache, or this
-  project's own code. Dependency behavior changes between versions in ways
-  that are easy to get subtly wrong from recollection alone.
-- After a change, run this repo's actual test and lint tasks (see "Build,
-  lint, test" below) before calling it done. Don't claim untested code
-  works.
+## Design rules
 
-## Baseline
+- **Smallest diff.** Solve the stated problem: no speculative abstractions, no interface or options
+  struct with one caller, no new flags, no new dependencies, no drive-by refactors. Remove what
+  your change orphans. Clean up touched code within the same concern (simplify, delete dead code,
+  fix stale comments); leave other dead code alone and mention it. Approved dependency
+  exceptions: `automemlimit`, `doublestar/v4`.
+- **Replace, don't add.** A change that introduces a new way migrates every consumer and deletes
+  the old path in the same PR; never land a new path beside the old one. In a planned series one
+  PR may grow when a later PR deletes; the series as a whole shrinks. PRs state production lines
+  as +added/-removed.
+- **Redesign on entry, never bolt on.** A change that adds a new case to a concern that already has
+  a mechanism (a new source kind, producer, input or key) owns the unification: it redesigns the
+  concern so every case goes through one seam (one classification, one derivation, one
+  publication, one warning) and deletes the mechanisms it folds in. A sibling path, or a per-kind
+  branch in a consumer, is a blocking finding in the plan and in review. A fix inside an existing
+  mechanism does not trigger this; it names the remaining multiplicity in its PR.
+- **No legacy paths, ever.** No code whose purpose is an earlier flate layout, format, key or
+  flag: no cleanup commands, migrations, fallbacks, tolerances or aliases. The word "legacy" in
+  code, help text or docs is itself a finding. Replacing a layout deletes the old one; users
+  discard old cache directories; upgrade notes go in the PR body.
+- **Call upstream.** Use helm, Flux, kustomize, go-git, oras and the stdlib instead of
+  re-implementing them; if upstream lacks a hook, post-process its output. No compatibility shims
+  or aliases past their last caller. `internal/kustomize.Build` is the one approved replacement
+  (it keeps the builtin schema loaded across builds).
+- **The SDK.** List every exported `pkg/` API or `Warning.Category` change in the PR; remove unused
+  or test-only exports when the result is leaner. konflate is not a constraint: never keep an
+  export, option or cache for it; it migrates.
 
-- **Idiomatic.** Follow [Effective Go](https://go.dev/doc/effective_go) and
-  the [Code Review Comments](https://go.dev/wiki/CodeReviewComments) wiki.
-  `gofmt -s` runs on every staged `.go` file via lefthook and again in CI:
-  never hand-format, and don't fight it with inline exceptions. Comments
-  explain non-obvious constraints only (a hidden invariant, why a workaround
-  exists, what would surprise a reader); don't narrate what good naming
-  already says, and don't reference the current change or past behavior in
-  a comment: that belongs in the PR description and rots as the code moves
-  on.
-- **Go version.** The language version is whatever `go.mod`'s `go`
-  directive says; read it from there rather than assuming or hard-coding
-  one. The directive is pinned to the lowest patch release of its minor
-  that the dependencies allow (`1.N.0` unless one forces higher) and
-  Renovate no longer bumps it; `.mise/config.toml`'s `tools.go` is the
-  toolchain that actually builds and tests, so the two are expected to
-  differ. Raise the directive only when the code or a dependency needs a
-  newer Go version. Write idiomatic Go for the directive's version: when
-  a newer construct is genuinely more idiomatic, use it (Go 1.26, for
-  example, added `errors.AsType[T](err)`, a generic type-safe replacement
-  for the `var t *T; errors.As(err, &t)` two-step; prefer it in new
-  code). `go fix` (rebuilt in 1.26 as a modernizer runner on `go vet`'s
-  analysis) surfaces these mechanical migrations; run it after a
-  toolchain bump.
-- **Idempotent.** Reconcilers, code generators (`mise run generate`), and
-  CLI subcommands must be safe to re-run: identical input yields identical
-  output/state, with no accumulating side effects on a second invocation.
-  The strongest version of this is a stateless service: if every response
-  is re-derivable from its inputs or upstream, a restart or an extra
-  replica can't affect correctness, only latency.
-- **DRY and minimal, without premature abstraction.** Three similar call
-  sites are fine as-is; don't introduce an interface, options struct, or
-  generic helper until a real third caller needs the variance it buys.
-  Touch only what the task requires: don't refactor or "improve" adjacent
-  code, and match the existing style even where you'd do it differently.
-  Remove imports, variables, and functions your own change orphaned; leave
-  pre-existing dead code alone and mention it instead of deleting it
-  unprompted.
-- **Unit tested**, table-driven via `t.Run` subtests. Match whatever
-  framework the package you're touching already uses instead of assuming:
-  plain stdlib `testing` is the fleet default and is sufficient for most
-  tests (config parsing, HTTP handlers, pure functions); `testify`
-  (`assert`/`require`) is common where a table's per-case assertions get
-  repetitive; `controller-runtime` operators scaffolded by kubebuilder often
-  keep Ginkgo/Gomega for `test/e2e`/`test/integration`, but that doesn't
-  necessarily extend to unit tests under `internal/`, check the actual test
-  files before assuming. Don't introduce a second framework into a package
-  that already has one. `go test -race` is the floor for anything touching
-  goroutines; check `.mise/config.toml`'s `test` task for whether `-race`
-  and coverage flags are already wired in.
-- **`log/slog`**, JSON handler to stdout by default (a text-format escape
-  hatch via config is fine for local runs), never a third-party logging
-  library. Call `slog.SetDefault` once in `main`, then use package-level
-  `slog.Info`/`slog.Error`/etc., or thread a `*slog.Logger` through
-  constructors that are genuinely reused outside `main`; don't pass a
-  logger through call chains that don't need one.
-- **`github.com/caarlos0/env/v11`** for env-var-driven configuration: one
-  `Config` struct (commonly in `internal/config`), populated by
-  `env.Parse`/`env.ParseAs`, behind a `Load()` that also derives any
-  computed fields and validates: fail fast on invalid config at startup
-  instead of letting a bad value surface later as a runtime error.
-  Doc-comment every field with what it does and why its `envDefault` is
-  what it is; the struct doubles as the config reference. If this repo is
-  primarily a CLI tool already using `pflag`/`cobra` with its own
-  env-var-binding convention, match that existing pattern instead of
-  introducing a second, competing config path.
-- **`github.com/spf13/pflag`, only when the app has a real CLI surface**:
-  subcommands, flags a human types, anything beyond "read env vars and
-  serve." Wire it through `github.com/spf13/cobra` rather than a bare
-  `pflag.FlagSet` once there's more than a couple of flags. A service
-  that's entirely env-configured shouldn't take a flags dependency just to
-  have one. Exception: `controller-runtime` operators keep the kubebuilder
-  scaffold's stdlib `flag` + `opts.BindFlags(flag.CommandLine)` wiring;
-  don't convert generated operator boilerplate to pflag.
+## Layout
 
-## Project layout
+`cmd/flate` is the entrypoint. `internal/cli` owns flags, exit codes (0 or 1), signal handling
+and `slog.SetDefault`. Everything else is `pkg/`. Dependencies flow one way and never upward;
+`depguard` in `.golangci.yml` enforces this graph:
 
-`cmd/<app>/main.go` is the entrypoint; everything else lives under
-`internal/` unless another repo needs to import this one as a library, in
-which case the exported package lives outside `internal/` at the module
-root. Keep `main.go` to wiring: parse config, build the logger, construct
-dependencies, run, translate the top-level error into an exit code.
-Business logic belongs in `internal/<package>`, not in `main`.
+```
+manifest <- store <- {loader, values, depwait, change, source}
+         <- {kustomize, helm, discovery} <- controllers/base <- controllers/* <- orchestrator <- internal/cli
+```
 
-## Errors
+Leaf packages (`tree`, `manifest`, `task`, `schedule` behind its `Dispatcher` seam, `source/{safepath,sourceignore,ssrfguard}`,
+`internal/assert`) are the graph's bottom; `depguard` holds the exact rules.
 
-Wrap with `fmt.Errorf("<component>: %w", err)` so a caller gets context
-without losing the original error for `errors.Is`/`errors.As`/`errors.AsType`.
-A `"<package>: %w"`-style prefix is the fleet convention: grep an error
-message and you know which package raised it. Define sentinel errors
-(`errors.New`, package-level `Err*`) for conditions a caller branches on,
-and classify with a single `errors.Is` switch at the boundary that turns an
-internal error into an HTTP status / exit code / CR condition, rather than
-scattering classification through business logic. Never discard an error
-silently: `_ = someCall()` is only for genuinely fire-and-forget calls (e.g.
-best-effort metrics), and say why in a comment when that's not obvious.
+**Concern owners.** Each concern is decided in exactly one place:
 
-## Context & shutdown
+| Concern                                                                                                                 | Owner                          |
+| ----------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Identity and per-kind behaviour                                                                                         | `manifest`                     |
+| Objects, relations, emitted children                                                                                    | `store`                        |
+| Entry bootstrap (seeded source, missing source refs of any kind, self-referential sources, artifact roots) and aliasing | `discovery`                    |
+| Cache paths and fetched content                                                                                         | the cache owner under `source` |
+| Substitution                                                                                                            | `values`                       |
+| Change detection                                                                                                        | `change`                       |
+| Readiness                                                                                                               | `depwait`                      |
+| Scheduling                                                                                                              | `schedule`                     |
+| Render selection and lifecycle                                                                                          | `orchestrator`                 |
+| Flags and exit codes                                                                                                    | `internal/cli`                 |
 
-Every function that does I/O takes a `context.Context` as its first
-parameter, and propagates one it's already given rather than building a
-fresh `context.Background()` partway down the call stack, unless there's a
-documented reason cancellation shouldn't propagate there. Long-running
-processes derive their root context from
-`signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)`
-and re-arm the default handler on a second signal so a stuck drain can
-still be force-killed. Prefer `golang.org/x/sync/errgroup` over raw
-`sync.WaitGroup` + channels when fanning out goroutines that can fail: it
-propagates the first error and cancels the group's context for you.
+**Vocabulary.**
 
-## Build, lint, test (via mise)
+- _bootstrap source_: the working tree admitted as the cluster's own source.
+- _alias_: a synthetic source that resolves to that tree.
+- _seed_: a file-indexed object discovered before any render.
+- _orphan_: a seed no Kustomization owns, promoted as a static root.
+- _emitted child_: an object a producer publishes through `Emit`.
+- _fingerprint_: the content key the cache owner derives.
+- _changed-only_: rendering only what the diff base reaches.
 
-Mise is mandatory: it pins the exact Go and golangci-lint versions
-(`.mise/config.toml`), so running `go build`/`go test` outside `mise run`
-risks a toolchain mismatch with CI. Run `mise tasks` to see what's actually
-defined in this repo; don't copy another repo's task names, flags, or
-output paths (`-race`, `$(go list ./...)` vs `./...`, build output
-location, `-ldflags` version stamping all vary) without checking
-`.mise/config.toml` first. Fleet-wide, the common tasks are some subset of
-`build`, `fmt`, `vet`, `test`, `lint`, `lint-fix`, plus repo-specific ones
-like `generate`/`generate-check`, `test-integration`, `test-e2e`, `bench`,
-or `helm-*` for repos that ship a chart; not every repo has every task.
+## Invariants
 
-`lefthook` (`.lefthook.toml`, extending the shared `home-operations/.github`
-config) runs `gofmt -s -w` on staged `.go` files pre-commit; that part is
-shared fleet-wide. What CI actually enforces beyond that (`go vet`, a `go
-mod tidy` diff check, a generated-file diff check) varies per repo: check
-`.golangci.yml` and `.github/workflows/` here rather than assuming every
-repo enforces the same set. Lint rules themselves live in `.golangci.yml`;
-read it instead of trusting a restated list, since the two can drift.
+- **One mechanism per concern.** Store events (`Store.AddListener`) are the only observer
+  mechanism; no `On*` hooks. Use an event only where a direct call would invert the dependency
+  flow; otherwise call directly. Children are published through `base.Controller.Emit`. Per-kind
+  behaviour is a method on the manifest type, never a kind switch in a consumer.
+- **One fingerprint.** Cache and change keys are `manifest.Fingerprint` over content, derived
+  where the cache lives; consumers never hash. No hand-rolled hashers, tags, framing or mtimes.
+- **Immutable manifests.** Clone, mutate the copy, `AddObject` again. Never write to an embedded
+  `Spec` after parse.
+- **Listeners never block the store.** They run inline; writers snapshot them with
+  `fireUnderLock` and dispatch after unlocking. Locking more than one shard uses
+  `lockAll`/`rLockAll`.
+- **The scheduler holds no store, pool or dispatcher under its mutex.** Drop `mu` before
+  `tasks.Go`. Termination is a structural fixpoint plus drain, never a timeout.
+- **One global serialization point.** Every krusty build holds `internal/kustomize.BuildMutex`;
+  add no other on the render path.
+- **Changed-only mode.** `KeepEmitted`/`AddEmitted` before `AddObject`.
+- **Secrets.** Only SOPS ciphertext is wiped (`..PLACEHOLDER_<key>..`). Missing secrets fail loud
+  unless a producer exists or `--allow-missing-secrets` is set; absent or wiped auth, cert and
+  proxy material follows the same whole-source skip; malformed real material fails loud.
+- **The cache owner alone chooses storage paths.** Flate-owned fetched-content writes go through
+  `safepath` and the owner's `os.Root` boundary with atomic publication; ORAS and go-billy
+  writers stay library-owned. The SSRF guard is process-global and opt-in via `RestrictEgress`.
+- **Deterministic output.** Order never depends on goroutine scheduling; sort anything derived
+  from a map.
+- **Flux parity beats strictness.** Where Flux renders, flate never fails: conflicting producers
+  yield one object, a deterministic winner and one `ConflictingProducers` warning.
 
-## Containers
+## Performance and concurrency
 
-Static binaries are the fleet default: `CGO_ENABLED=0`, `-trimpath`, and
-`-ldflags` stamping build metadata into exported `main` package variables,
-though the exact variable names differ per repo (`main.version`/
-`main.commit`, `main.Version`/`main.Gitsha`, etc.): check `main.go` before
-copying an `-ldflags -X` example verbatim. The base image pattern is
-building `FROM golang:<pinned>-alpine` and running `FROM
-gcr.io/distroless/static:nonroot`. Only drop `CGO_ENABLED=0` if a
-dependency genuinely requires cgo, and justify it in a comment. Long-running
-services in containers commonly set `GOMEMLIMIT` via
-`github.com/KimMachineGun/automemlimit` so the GC reclaims before the
-cgroup OOM-kills the process; check whether this repo already does before
-adding it. Expose Prometheus metrics via `github.com/prometheus/client_golang`;
-whether health/readiness probes share that port or use a separate one is a
-per-repo decision, check the manager/server setup in `main.go` before
-assuming.
+- Reconcile bodies run only through `task.Service.Go`, bounded by `--concurrency` (default
+  `NumCPU*4`); wrap waits on other slot-gated work in `task.YieldSlot`. errgroup only for fixed
+  fan-out.
+- No new locks, widened critical sections, channel round-trips or serialization on the render,
+  store, discovery, change-detection or scheduler paths. Prefer immutable snapshots, existing
+  shards, atomics, and work computed once before the parallel phase.
+- Deduplicate expensive work by key (`keylock`, per-URL `sync.Once`, fingerprint dedup, template
+  and disk caches) instead of re-rendering, re-fetching or re-parsing.
+- Allocation-free hot paths stay allocation-free; allocs/op never rises on an existing benchmark.
+- A PR touching a package with benchmarks pastes `benchstat`: `COUNT=10 mise run bench` on base
+  and branch, then `benchstat <base>.txt <branch>.txt` (results in `bench/results/`).
+  `bench/baseline.txt` is a placeholder until `mise run bench-baseline` regenerates it. A
+  regression over 5% on a hot path, or any allocs/op increase, blocks review unless argued with
+  numbers and accepted explicitly.
+- Concurrent code gets a `-race` test at concurrency >= 2, not a serialized stand-in.
 
-## Security
+## Code style
 
-`govulncheck ./...` runs in CI as the `Go Vulncheck` job, via `mise run
-vulncheck` with the tool version pinned in `.mise/config.toml`. Run the
-same task locally before cutting a release; a new advisory that fails the
-job is an action item (upgrade the module or the Go toolchain), not noise
-to suppress.
+- **Go.** The version is `go.mod`'s directive, pinned to the lowest patch; `.mise/config.toml`
+  pins the toolchain. Write idiomatic Go for it: `slices`, `maps`, `cmp.Or`, `strings.Cut`,
+  `for range N`, `min`/`max`, generics constrained on `manifest.BaseManifest`, `errors.AsType`.
+  Run `go fix` after touching a package. No `interface{}`, naked returns, or reflection on hot
+  paths. No cgo, ever: builds use `CGO_ENABLED=0`; the race detector needs cgo,
+  so run `mise run test` as configured.
+- **Context.** `ctx context.Context` is the first parameter of anything doing I/O and is never
+  stored in a struct. `context.Background()` belongs to `internal/cli`; `forbidigo` enforces it and
+  its exclusion list is the record of shared work that outlives one caller.
+- **Errors.** `fmt.Errorf("<lowercase op>: %w", err)`; tag with a `manifest.Err*` sentinel as
+  `fmt.Errorf("%w: detail", manifest.ErrInput)`. Every domain error wraps `manifest.ErrFlux`.
+  Classify with `errors.Is`/`errors.AsType`, never by string. Panic only on impossible state.
+- **Logging.** Package-level `log/slog` (`slog.Debug/Warn`) with a `"pkg: "` message prefix; the
+  message is a constant and values are attrs. No logger threading.
+- **Signatures.** At most four parameters (median is one); beyond that an `Options`/`Config`
+  struct. No functional options. Receivers are one or two letters, consistent per type.
+- **Interfaces belong to the consumer.** A package declares a small unexported interface listing
+  only the methods it calls; constructors return concrete types. An exported interface exists
+  only where an SDK embedder must implement it (`schedule.Dispatcher`, `values.Provider`), and
+  the PR names that embedder.
+- **Comments.** Package and exported docs are lint-enforced (one sentence starting with the
+  identifier). Default to no other comment; add one only for a constraint or
+  rationale (MUST, never, invariant, an upstream quirk with its issue). Banned: step narration,
+  section banners, restating the name above a function, describing your own edit, commented-out
+  code, unprompted TODO or FIXME. Delete narration you find in code you touch.
+- **Elegance.** Names state intent; small functions with one job and straight-line flow; types
+  that make wrong states unrepresentable; no wrappers, single-use helpers or pass-through types;
+  one obvious way, consistent with the surrounding code. Working but convoluted, repetitive or
+  clever code is a review finding.
+
+## Tests
+
+- Stdlib `testing` only; never testify or Ginkgo. Names: `TestThing_Behavior`, `TestE2E_*`
+  (in-process via `cli.Run`, no build tags, no network), `BenchmarkThing_Case` with `b.Loop()`.
+- Table-driven with `t.Run`; helpers call `t.Helper()`.
+- Tests and subtests call `t.Parallel` unless they touch process-global state: `t.Setenv`,
+  `t.Chdir`, `slog.SetDefault` or `log.SetOutput` (including through `cli.Run`),
+  `ssrfguard.Restrict`, go-git protocol registration, a package variable, or
+  `testing.AllocsPerRun`. Such a test stays serial. Never call `t.Parallel` inside a
+  `synctest` bubble.
+- A matrix axis exists only where the code under test branches on it. Worker counts vary only
+  where concurrency is the subject; elsewhere use one count >= 2. Determinism is shown with
+  two runs. No iteration loops to provoke races: use explicit synchronization or
+  `testing/synctest`; no real `time.Sleep` outside benchmarks.
+- `TestE2E_*` asserts only through `cli.Run`; anything else belongs in the package's tests.
+- Fixtures: `t.TempDir()` plus `testutil.WriteFile`; shared corpora live in `testdata/<scenario>/`
+  and are documented in `testdata/TESTDATA.md`. Assert with `internal/assert` or `cmp.Diff`
+  (`-want +got`). No golden files.
+- Every fix lands with a regression test for the reported symptom.
+- Test flate's own logic: nothing an upstream library already covers, nothing for trivial
+  guards; adapt an existing test before adding one.
+
+## Before a PR
+
+```
+mise run lint
+go mod tidy && git diff --exit-code go.mod go.sum
+mise run test        # go test -race, all packages including test/e2e
+mise run vulncheck
+mise run bench       # when touching a package with benchmarks; paste benchstat, base against branch
+```
+
+CI runs the same plus a goreleaser snapshot and workflow lint; "Build Success" is the merge gate
+behind a squash-only merge queue; lint enforces the shape of `//nolint` directives.

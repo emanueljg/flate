@@ -1,153 +1,75 @@
 package manifest
 
 import (
-	"os"
 	"path/filepath"
-	"reflect"
-	"sync"
+	"slices"
 	"testing"
+
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+
+	"github.com/home-operations/flate/internal/assert"
 )
 
-// writeKustomization is a tiny inline fixture writer; manifest can't
-// import internal/testutil (cycle: testutil imports manifest).
-func writeKustomization(t *testing.T, root, rel, body string) {
-	t.Helper()
-	p := filepath.Join(root, rel)
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-		t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
-	}
-	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-		t.Fatalf("write %s: %v", p, err)
-	}
-}
-
-// TestComponentCache_HitAndMiss asserts ComponentCache.Get returns
-// the same result on the first (miss) and second (hit) call for the
-// same (repoRoot, base) — pinning the cache's "stable observable
-// content" contract from the perf refactor plan's cache-invalidation
-// risk note.
-func TestComponentCache_HitAndMiss(t *testing.T) {
-	root := t.TempDir()
-	base := "apps/main"
-	writeKustomization(t, root, filepath.Join(base, "kustomization.yaml"), `
-apiVersion: kustomize.config.k8s.io/v1
-kind: Kustomization
-components:
-  - ../components/cluster-settings
-  - ./component-a
-`)
-
-	cache := NewComponentCache()
-	miss := cache.Get(root, base)
-	want := []string{"../components/cluster-settings", "./component-a"}
-	if !reflect.DeepEqual(miss, want) {
-		t.Fatalf("miss = %v, want %v", miss, want)
-	}
-	hit := cache.Get(root, base)
-	if !reflect.DeepEqual(hit, want) {
-		t.Fatalf("hit = %v, want %v", hit, want)
-	}
-	// Cache stores by-reference; the two calls must hand out the
-	// same backing slice (verifies no per-call re-read).
-	if len(miss) > 0 && &miss[0] != &hit[0] {
-		t.Errorf("hit returned a fresh slice; expected the cached entry to be reused")
-	}
-}
-
-// TestComponentCache_NilReceiverFallsThrough confirms the nil-cache
-// short-circuit: callers that don't want caching pass nil and get
-// the bare ReadKustomizeComponents result.
-func TestComponentCache_NilReceiverFallsThrough(t *testing.T) {
-	root := t.TempDir()
-	base := "apps/x"
-	writeKustomization(t, root, filepath.Join(base, "kustomization.yaml"), `
-apiVersion: kustomize.config.k8s.io/v1
-kind: Kustomization
-components: [./c1]
-`)
-	var nilCache *ComponentCache
-	got := nilCache.Get(root, base)
-	want := []string{"./c1"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("nil-receiver Get = %v, want %v", got, want)
+func TestBuildKSClaims_PathsAndComponents(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, path, source, component, decoded string
+		want                                   []string
+	}{
+		{name: "stub"},
+		{name: "source_root", source: "flux-system", want: []string{""}},
+		{name: "explicit_root", path: "./", want: []string{""}},
+		{name: "dot_prefix", path: "./apps", component: "../..foo", want: []string{"..foo/", "apps/"}},
+		{name: "parent", path: "./apps", component: "../..", want: []string{"apps/"}},
+		{name: "outside", path: "./apps", component: "../../outside", want: []string{"apps/"}},
+		{name: "empty", path: "./apps", want: []string{"apps/"}},
+		{name: "dot", path: "./apps", component: "..", want: []string{"apps/"}},
+		{name: "absolute", path: "./apps", component: "/outside", want: []string{"apps/"}},
+		{name: "url", path: "./apps", component: "https://example.com/x", want: []string{"apps/"}},
+		{name: "same_base", path: "./apps", component: ".", want: []string{"apps/", "apps/"}},
+		{name: "slash_component", path: "./apps", component: "../shared/part", want: []string{"shared/part/", "apps/"}},
+		{name: "backslash_component", path: "./apps", component: `..\shared`, want: []string{`apps/..\shared/`, "apps/"}},
+	} {
+		for _, input := range []string{"authored", "decoded"} {
+			t.Run(input+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				ks := &Kustomization{Name: "root", Path: tc.path, SourceRef: kustomizev1.CrossNamespaceSourceReference{Name: tc.source}, Components: []string{tc.component}}
+				var components map[NamedResource][]string
+				if input == "decoded" {
+					ks.Components = nil
+					components = map[NamedResource][]string{ks.Named(): {tc.component}}
+				}
+				claims := BuildKSClaims([]*Kustomization{ks}, components)
+				var prefixes []string
+				for _, claim := range claims {
+					if claim.ID != ks.Named() {
+						t.Fatalf("claim ID = %v, want %v", claim.ID, ks.Named())
+					}
+					prefixes = append(prefixes, claim.Prefix)
+				}
+				if !slices.Equal(prefixes, tc.want) {
+					t.Fatalf("claim prefixes = %v, want %v", prefixes, tc.want)
+				}
+			})
+		}
 	}
 }
 
-// TestComponentCache_SharedAcrossConsumers asserts two consumers
-// reading the same (repoRoot, base) through one cache observe the
-// same data even when the second one would have read a different
-// answer from disk — i.e. the cache is the source of truth once
-// populated.
-//
-// We mutate the on-disk kustomization.yaml between the two calls;
-// the second call must still return the cached value. This is the
-// "cache shared across consumers" contract from the plan: loader,
-// discovery's orphan pass, and the change Filter all read through
-// the same instance and must agree.
-func TestComponentCache_SharedAcrossConsumers(t *testing.T) {
-	root := t.TempDir()
-	base := "apps/shared"
-	writeKustomization(t, root, filepath.Join(base, "kustomization.yaml"), `
-apiVersion: kustomize.config.k8s.io/v1
-kind: Kustomization
-components: [./first]
-`)
-	cache := NewComponentCache()
-
-	consumerA := cache.Get(root, base)
-	wantA := []string{"./first"}
-	if !reflect.DeepEqual(consumerA, wantA) {
-		t.Fatalf("consumerA = %v, want %v", consumerA, wantA)
-	}
-
-	// Mutate the on-disk file; without the shared cache, consumerB
-	// would observe the new contents. With it, consumerB must see
-	// what consumerA saw.
-	writeKustomization(t, root, filepath.Join(base, "kustomization.yaml"), `
-apiVersion: kustomize.config.k8s.io/v1
-kind: Kustomization
-components: [./second]
-`)
-	consumerB := cache.Get(root, base)
-	if !reflect.DeepEqual(consumerB, wantA) {
-		t.Errorf("consumerB = %v, want shared (cached) %v", consumerB, wantA)
-	}
+func TestBuildKSClaims_StableOrder(t *testing.T) {
+	t.Parallel()
+	first := &Kustomization{Name: "first", Path: "./apps", Components: []string{"."}}
+	second := &Kustomization{Name: "second", Path: "./peer"}
+	claims := BuildKSClaims([]*Kustomization{first, second}, map[NamedResource][]string{first.Named(): {"../team"}})
+	assert.Diff(t, claims, []KSClaim{
+		{ID: first.Named(), Prefix: "apps/"},
+		{ID: first.Named(), Prefix: "apps/"},
+		{ID: first.Named(), Prefix: "team/"},
+		{ID: second.Named(), Prefix: "peer/"},
+	})
 }
 
-// TestComponentCache_ConcurrentReads exercises the RWMutex
-// guarantees: many goroutines hitting Get on the same key see
-// consistent results and the cache holds one canonical entry.
-func TestComponentCache_ConcurrentReads(t *testing.T) {
-	root := t.TempDir()
-	base := "apps/race"
-	writeKustomization(t, root, filepath.Join(base, "kustomization.yaml"), `
-apiVersion: kustomize.config.k8s.io/v1
-kind: Kustomization
-components: [./alpha, ./beta]
-`)
-	cache := NewComponentCache()
-	want := []string{"./alpha", "./beta"}
-
-	const goroutines = 32
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for range goroutines {
-		go func() {
-			defer wg.Done()
-			got := cache.Get(root, base)
-			if !reflect.DeepEqual(got, want) {
-				t.Errorf("concurrent Get = %v, want %v", got, want)
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-// TestNormalizeClaimBase pins the spec.path shapes that must all claim the
-// same repo-relative files. The leading-slash case is #920: Flux resolves
-// spec.path root-relatively, so `/kubernetes/apps` must not keep a slash that
-// a repo-relative source file can never match.
 func TestNormalizeClaimBase(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in, want string
 	}{
@@ -156,12 +78,26 @@ func TestNormalizeClaimBase(t *testing.T) {
 		{"/kubernetes/apps", "kubernetes/apps"},
 		{"/kubernetes/apps/", "kubernetes/apps"},
 		{"//kubernetes/apps", "kubernetes/apps"},
+		{"./apps/../x", "apps/../x"},
+		{"apps//team", "apps/team"},
+		{filepath.FromSlash("apps/team"), "apps/team"},
+		{"alias/../base", "alias/../base"},
+		{"./alias//./../base/.", "alias/../base"},
+		{".//apps", "apps"},
+		{"././", ""},
+		{"../x", "x"},
+		{"../../x", "x"},
+		{".", ""},
+		{"..", ""},
+		{"apps/../../x", "apps/../../x"},
+		{"..foo", "..foo"},
 		{"./", ""},
 		{"/", ""},
 		{"", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
 			if got := NormalizeClaimBase(tc.in); got != tc.want {
 				t.Errorf("NormalizeClaimBase(%q) = %q, want %q", tc.in, got, tc.want)
 			}

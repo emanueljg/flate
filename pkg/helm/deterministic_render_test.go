@@ -1,179 +1,121 @@
 package helm
 
 import (
-	"context"
 	"strings"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
-	"github.com/home-operations/flate/pkg/manifest"
-	"github.com/home-operations/flate/pkg/source/cacheroot"
+	"github.com/home-operations/flate/internal/testutil/cachetest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 )
 
-// TestTemplate_DeterministicNow is the Tier 1 integration guard: a chart
-// that templates `now` must render byte-identically across two UNCACHED
-// renders. sprig registers `now` as time.Now, so with nanosecond precision
-// two renders would differ run to run; the cfg.CustomTemplateFuncs override
-// pins it to deterministic.FixedTime. Caching is disabled (zero-value
-// ClientOptions) so byte-identity can only come from the override, not a
-// cache hit — and the rendered value must reflect the fixed 2020 clock.
-func TestTemplate_DeterministicNow(t *testing.T) {
+func TestTemplate_Deterministic(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	testutil.WriteFile(t, dir, "mychart/Chart.yaml",
 		"apiVersion: v2\nname: mychart\nversion: 0.1.0\ndescription: t\n")
-	// Nanosecond-precision format: an un-overridden time.Now would reliably
-	// differ between the two renders, so this genuinely guards the override
-	// rather than coincidentally passing at second precision.
-	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml",
-		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-cm\ndata:\n  stamp: {{ now | date \"20060102150405.000000000\" | quote }}\n")
+	testutil.WriteFile(t, dir, "mychart/templates/_helpers.tpl", `{{- define "mychart.deterministic" -}}
+{{- tpl .Values.deterministic . -}}
+{{- end -}}`)
+	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-cm
+  annotations:
+    checksum/secret: {{ randAlphaNum 24 | sha256sum | quote }}
+    checksum/shuffled-secret: {{ printf "%s%s" (randAlphaNum 8) (randAscii 12) | shuffle | sha256sum | quote }}
+data:
+  stamp: {{ now | date "20060102150405.000000000" | quote }}
+  token: {{ randAlphaNum 24 | quote }}
+  id: {{ uuidv4 | quote }}
+  bcrypt: {{ bcrypt "password" | quote }}
+  htpasswd: {{ htpasswd "user" "password" | quote }}
+  aes: {{ encryptAES "key" "plaintext" | quote }}
+  pw: {{ "abcdefghijklmnopqrstuvwxyz" | shuffle | quote }}
+  {{- $ca := genCA "my-ca" 3650 }}
+  {{- $cert := genSignedCert "svc" nil (list "svc.default.svc") 365 $ca }}
+  ca.crt: {{ $ca.Cert | b64enc | quote }}
+  tls.crt: {{ $cert.Cert | b64enc | quote }}
+  tls.key: {{ $cert.Key | b64enc | quote }}
+  port: {{ get .Values.ports (keys .Values.ports | first) | quote }}
+  parsed-date: {{ toDate "2006-01-02" "2020-01-01" | unixEpoch | quote }}
+  parsed-must-date: {{ mustToDate "2006-01-02" "2020-01-01" | unixEpoch | quote }}
+  rounded-now: {{ now | durationRound | quote }}
+  rounded-past: {{ now | dateModify "-2h" | durationRound | quote }}
+  ordered-values: {{ values (dict "z" "first" "a" "last" "m" "middle") | join "," | quote }}
+  nested: {{ include "mychart.deterministic" . | quote }}
+`)
 
-	cli, err := NewClientWithOptions(cacheroot.New(t.TempDir()), ClientOptions{})
-	if err != nil {
-		t.Fatalf("NewClientWithOptions: %v", err)
-	}
-	cli.SetSourceResolver(localChartResolver(t, "chart-repo", "flux-system", dir))
+	cli := NewClient(cachetest.New(t, "", sourcecache.New))
 
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		Chart: manifest.HelmChart{
-			Name: "mychart", RepoName: "chart-repo",
-			RepoNamespace: "flux-system", RepoKind: manifest.KindGitRepository,
-		},
+	hr := newHR()
+	values := map[string]any{
+		"ports": map[string]any{"http": 80, "bittorrent": 50413},
+		"deterministic": `{{ toDate "2006-01-02" "2020-01-01" | unixEpoch }}|` +
+			`{{ mustToDate "2006-01-02" "2020-01-01" | unixEpoch }}|` +
+			`{{ now | durationRound }}|{{ now | dateModify "-2h" | durationRound }}|` +
+			`{{ values (dict "z" "first" "a" "last" "m" "middle") | join "," }}`,
 	}
-
-	first, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("first render: %v", err)
-	}
-	second, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("second render: %v", err)
-	}
-	if first != second {
-		t.Errorf("uncached renders differ — `now` not deterministic:\n first=%q\nsecond=%q", first, second)
-	}
-	if !strings.Contains(first, "20200101000000") {
-		t.Errorf("rendered stamp not pinned to FixedTime (2020-01-01):\n%s", first)
+	first, err := cli.Template(t.Context(), hr, values, RenderOptions{Options: Options{}, Sources: localChartResolver(t, "chart-repo", "flux-system", dir)})
+	assert.NoError(t, err)
+	second, err := cli.Template(t.Context(), hr, values, RenderOptions{Options: Options{}, Sources: localChartResolver(t, "chart-repo", "flux-system", dir)})
+	assert.NoError(t, err)
+	assert.Diff(t, second, first)
+	for _, docs := range [][]map[string]any{first, second} {
+		if len(docs) != 1 {
+			t.Fatalf("rendered %d documents, want 1", len(docs))
+		}
+		data := docs[0]["data"].(map[string]any)
+		assert.Equal(t, data["stamp"], any("20200101000000.000000000"))
+		assert.Equal(t, data["port"], any("50413"))
+		assert.Equal(t, data["parsed-date"], any("1577836800"))
+		assert.Equal(t, data["parsed-must-date"], any("1577836800"))
+		assert.Equal(t, data["rounded-now"], any("0s"))
+		assert.Equal(t, data["rounded-past"], any("2h"))
+		assert.Equal(t, data["ordered-values"], any("last,middle,first"))
+		assert.Equal(t, data["nested"], any("1577836800|1577836800|0s|2h|last,middle,first"))
 	}
 }
 
-// TestTemplate_DeterministicRandom is the Tier 2 integration guard: a chart
-// that templates randAlphaNum/uuidv4 — plus a sha256 over a random value, the
-// shape behind checksum/secret annotations — must render byte-identically
-// across two UNCACHED renders. sprig draws these from crypto/rand; the
-// override seeds them from the release identity. Caching is disabled so
-// byte-identity can only come from the seeded stream.
-func TestTemplate_DeterministicRandom(t *testing.T) {
+func TestTemplate_InvalidMustToDate(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "mychart/Chart.yaml",
-		"apiVersion: v2\nname: mychart\nversion: 0.1.0\ndescription: t\n")
-	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml",
-		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-cm\n  annotations:\n    checksum/secret: {{ randAlphaNum 24 | sha256sum | quote }}\ndata:\n  token: {{ randAlphaNum 24 | quote }}\n  id: {{ uuidv4 | quote }}\n")
+	testutil.WriteFile(t, dir, "mychart/Chart.yaml", "apiVersion: v2\nname: mychart\nversion: 0.1.0\n")
+	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm
+data:
+  parsed: {{ mustToDate "2006-01-02" "invalid" | unixEpoch | quote }}
+`)
+	cli := NewClient(cachetest.New(t, "", sourcecache.New))
 
-	cli, err := NewClientWithOptions(cacheroot.New(t.TempDir()), ClientOptions{})
-	if err != nil {
-		t.Fatalf("NewClientWithOptions: %v", err)
+	out, err := cli.Template(t.Context(), newHR(), nil, RenderOptions{Options: Options{}, Sources: localChartResolver(t, "chart-repo", "flux-system", dir)})
+	if err == nil {
+		t.Error("invalid mustToDate rendered successfully")
 	}
-	cli.SetSourceResolver(localChartResolver(t, "chart-repo", "flux-system", dir))
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		Chart: manifest.HelmChart{
-			Name: "mychart", RepoName: "chart-repo",
-			RepoNamespace: "flux-system", RepoKind: manifest.KindGitRepository,
-		},
-	}
-
-	first, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("first render: %v", err)
-	}
-	second, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("second render: %v", err)
-	}
-	if first != second {
-		t.Errorf("uncached renders differ — random funcs not deterministic:\n first=%q\nsecond=%q", first, second)
-	}
+	assert.Diff(t, out, []map[string]any(nil))
 }
 
-// TestTemplate_DeterministicShuffle guards the sprig `shuffle` override: a
-// chart that pipes a value through `| shuffle` — the shape bitnami common's
-// passwords.manage uses for a strong secret_key, behind a checksum/secret
-// annotation — must render byte-identically across two UNCACHED renders. sprig
-// maps shuffle to xstrings.Shuffle, which draws from a process-global,
-// time-seeded RNG; un-overridden, the two renders differ (and real-world
-// checksum/secret annotations flip run-to-run). The override redirects it to
-// the seeded per-render stream. Caching is disabled so byte-identity can only
-// come from the override.
-func TestTemplate_DeterministicShuffle(t *testing.T) {
+func TestTemplate_EncryptAESDecryptRoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "mychart/Chart.yaml",
-		"apiVersion: v2\nname: mychart\nversion: 0.1.0\ndescription: t\n")
-	// A sha256 over a shuffled value mirrors the checksum/secret shape; the
-	// shuffled field itself is also emitted so the guard covers both surfaces.
+	testutil.WriteFile(t, dir, "mychart/Chart.yaml", "apiVersion: v2\nname: mychart\nversion: 0.1.0\n")
 	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml",
-		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-cm\n  annotations:\n    checksum/secret: {{ printf \"%s%s\" (randAlphaNum 8) (randAscii 12) | shuffle | sha256sum | quote }}\ndata:\n  pw: {{ \"abcdefghijklmnopqrstuvwxyz\" | shuffle | quote }}\n")
+		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\ndata:\n  cleartext: {{ encryptAES \"key\" .Values.plaintext | decryptAES \"key\" | quote }}\n")
+	cli := NewClient(cachetest.New(t, "", sourcecache.New))
 
-	cli, err := NewClientWithOptions(cacheroot.New(t.TempDir()), ClientOptions{})
-	if err != nil {
-		t.Fatalf("NewClientWithOptions: %v", err)
-	}
-	cli.SetSourceResolver(localChartResolver(t, "chart-repo", "flux-system", dir))
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		Chart: manifest.HelmChart{
-			Name: "mychart", RepoName: "chart-repo",
-			RepoNamespace: "flux-system", RepoKind: manifest.KindGitRepository,
-		},
-	}
-
-	first, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("first render: %v", err)
-	}
-	second, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("second render: %v", err)
-	}
-	if first != second {
-		t.Errorf("uncached renders differ — shuffle not deterministic:\n first=%q\nsecond=%q", first, second)
-	}
-}
-
-// TestTemplate_DeterministicCerts is the Tier 3 integration guard: a chart
-// that generates a CA and a leaf signed by it (the caBundle/tls.crt shape)
-// must render byte-identically across two UNCACHED renders. sprig draws cert
-// keys/serials from crypto/rand and validity from time.Now; the overrides seed
-// both, so the rendered cert material is reproducible.
-func TestTemplate_DeterministicCerts(t *testing.T) {
-	dir := t.TempDir()
-	testutil.WriteFile(t, dir, "mychart/Chart.yaml",
-		"apiVersion: v2\nname: mychart\nversion: 0.1.0\ndescription: t\n")
-	testutil.WriteFile(t, dir, "mychart/templates/cm.yaml",
-		"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-ca\ndata:\n  {{- $ca := genCA \"my-ca\" 3650 }}\n  {{- $cert := genSignedCert \"svc\" nil (list \"svc.default.svc\") 365 $ca }}\n  ca.crt: {{ $ca.Cert | b64enc | quote }}\n  tls.crt: {{ $cert.Cert | b64enc | quote }}\n  tls.key: {{ $cert.Key | b64enc | quote }}\n")
-
-	cli, err := NewClientWithOptions(cacheroot.New(t.TempDir()), ClientOptions{})
-	if err != nil {
-		t.Fatalf("NewClientWithOptions: %v", err)
-	}
-	cli.SetSourceResolver(localChartResolver(t, "chart-repo", "flux-system", dir))
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		Chart: manifest.HelmChart{
-			Name: "mychart", RepoName: "chart-repo",
-			RepoNamespace: "flux-system", RepoKind: manifest.KindGitRepository,
-		},
-	}
-
-	first, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("first render: %v", err)
-	}
-	second, err := cli.Template(context.Background(), hr, nil, Options{})
-	if err != nil {
-		t.Fatalf("second render: %v", err)
-	}
-	if first != second {
-		t.Errorf("uncached renders differ — cert funcs not deterministic:\n first=%q\nsecond=%q", first, second)
+	for _, plaintext := range []string{"", "hello", strings.Repeat("a", 16), "Unicode: βé"} {
+		t.Run(plaintext, func(t *testing.T) {
+			t.Parallel()
+			out, err := cli.Template(t.Context(), newHR(), map[string]any{"plaintext": plaintext}, RenderOptions{Options: Options{}, Sources: localChartResolver(t, "chart-repo", "flux-system", dir)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasRenderField(out, "cleartext", plaintext) {
+				t.Fatalf("decryptAES round trip differs: %s", out)
+			}
+		})
 	}
 }

@@ -1,44 +1,59 @@
 package loader
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
-	"os"
 
+	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	_ "github.com/home-operations/flate/internal/kustomize" // Loader-only SDK entrypoints MUST install the process scope owner at startup.
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-// parseFile opens path and returns the recognized Flux CRs in document order —
-// a thin collector over decodeFileObjects with keepRaw=false, so unmodeled
-// kinds (manifest.RawObject) are dropped. See decodeFileObjects for the shared
-// decode + filter contract.
-func parseFile(path string, opts manifest.ParseDocOptions) ([]manifest.BaseManifest, error) {
-	var out []manifest.BaseManifest
-	err := decodeFileObjects(path, opts, false, func(obj manifest.BaseManifest) {
-		out = append(out, obj)
-	})
-	return out, err
+func (r documentReader) parseFile(path string, opts manifest.ParseDocOptions) ([]store.Child, error) {
+	out := r.cache[path].objects
+	var err error
+	if out == nil {
+		cached := r.cache[path]
+		err = r.decodeFileObjects(path, opts, r.cache != nil, func(child store.Child) {
+			out = append(out, child)
+		})
+		if r.cache == nil {
+			return out, err
+		}
+		if err == nil {
+			cached.objects = out
+			r.cache[path] = cached
+		}
+	}
+	if out == nil {
+		return nil, err
+	}
+	tracked := make([]store.Child, 0, len(out))
+	for _, child := range out {
+		if manifest.KindOf(child.Obj).Tracked {
+			tracked = append(tracked, child)
+		}
+	}
+	return tracked, err
 }
 
-// decodeFileObjects opens path, decodes every YAML/JSON doc, and yields each
-// parsed object that survives the canonical loader filters — the one place
-// "what counts as a loadable doc" is defined, shared by the file-walk load, the
-// lazy promotion path, and the discovery-time producer scan:
-//
-//   - manifest.ParseDoc per-doc errors are swallowed at Debug level (matches
-//     flux-local — a malformed sibling doc shouldn't poison the rest).
-//   - Objects whose name/namespace still carry `${VAR}` are dropped as
-//     templates: a parent KS's postBuild.substitute(From) resolves them at
-//     render time, and Kubernetes rejects `$` in metadata.name, so the
-//     unsubstituted copy would never reach the API server in real Flux either.
-//   - manifest.RawObject results (kinds flate doesn't model) are dropped unless
-//     keepRaw is set — parseFile only persists understood kinds, while the
-//     producer scan keeps them to read ExternalSecret / SealedSecret targets.
-//
-// Per-doc parse errors carry path in their log fields; file-level errors (open,
-// decode) surface to the caller with the path baked into the wrap.
-func decodeFileObjects(path string, opts manifest.ParseDocOptions, keepRaw bool, yield func(manifest.BaseManifest)) error {
-	f, err := os.Open(path) //nolint:gosec // path came from a tree-walk under the scan root or the ExistenceIndex
+// Raw objects must be retained for producer scans when keepRaw is set.
+// API-version admission errors retain their source path for deferred ownership policy.
+func (r documentReader) decodeFileObjects(path string, opts manifest.ParseDocOptions, keepRaw bool, yield func(store.Child)) error {
+	input, name := r.input(path)
+	path = r.localPath(path)
+	var f fs.File
+	var err error
+	if local, ok := input.(*gittree.FS); ok && r.regular {
+		f, err = local.OpenRegular(name)
+	} else {
+		f, err = input.Open(name)
+	}
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
@@ -47,14 +62,21 @@ func decodeFileObjects(path string, opts manifest.ParseDocOptions, keepRaw bool,
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
-	for _, doc := range docs {
-		obj, err := manifest.ParseDoc(doc, opts)
+	for i, doc := range docs {
+		obj, authoritative, _, err := manifest.ParseDoc(doc, opts)
 		if err != nil {
-			slog.Debug("loader: doc skipped", "path", path, "err", err)
-			manifest.ReleaseDoc(doc)
-			continue
+			if _, invalid := errors.AsType[*field.Error](err); !invalid {
+				slog.Debug("loader: doc skipped", "path", path, "err", err)
+				manifest.ReleaseDoc(doc)
+				continue
+			}
+			for _, pending := range docs[i:] {
+				manifest.ReleaseDoc(pending)
+			}
+			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		if _, isRaw := obj.(*manifest.RawObject); isRaw && !keepRaw {
+		tracked := obj != nil && manifest.KindOf(obj).Tracked
+		if obj == nil || !tracked && !keepRaw {
 			manifest.ReleaseDoc(doc)
 			continue
 		}
@@ -62,11 +84,14 @@ func decodeFileObjects(path string, opts manifest.ParseDocOptions, keepRaw bool,
 		if manifest.HasEnvsubstReference(id.Name) || manifest.HasEnvsubstReference(id.Namespace) {
 			slog.Debug("loader: skipped template doc (unresolved envsubst in name/namespace)",
 				"path", path, "id", id.String())
-			manifest.ReleaseIfNotRetained(doc, obj)
+			manifest.ReleaseDoc(doc)
 			continue
 		}
-		manifest.ReleaseIfNotRetained(doc, obj)
-		yield(obj)
+		if !tracked {
+			manifest.ReleaseDoc(doc)
+			authoritative = nil
+		}
+		yield(store.Child{Obj: obj, Doc: authoritative})
 	}
 	return nil
 }

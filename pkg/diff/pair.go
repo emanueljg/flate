@@ -2,8 +2,13 @@ package diff
 
 import (
 	"cmp"
+	"fmt"
+	"iter"
 	"slices"
 
+	"sigs.k8s.io/yaml"
+
+	"github.com/home-operations/flate/internal/output"
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
@@ -11,55 +16,97 @@ import (
 // (left, right) pair sharing the same parent and identity. Either side
 // is nil when the resource exists on only one side (added/removed).
 type pairedResource struct {
-	parent                Parent
-	kind, namespace, name string
-	a, b                  map[string]any
+	parent     Parent
+	resource   manifest.NamedResource
+	apiVersion string
+	aPos, bPos int
+	a, b       map[string]any
+	aChart     string
+	bChart     string
 }
 
-// label is the resource's human-facing title, e.g. "Deployment apps/web" —
-// the heading the unified and HTML paths put above each resource's diff.
-func (p pairedResource) label() string {
-	return p.kind + " " + joinNS(p.namespace, p.name)
+// A nil side marshals to an empty document, so its counterpart is a full add/remove.
+func changedPairs(paired []pairedResource) iter.Seq2[output.LineChange, error] {
+	return func(yield func(output.LineChange, error) bool) {
+		for _, p := range paired {
+			from, err := marshalForUnified(p.a)
+			if err != nil {
+				yield(output.LineChange{}, err)
+				return
+			}
+			to, err := marshalForUnified(p.b)
+			if err != nil {
+				yield(output.LineChange{}, err)
+				return
+			}
+			if from == to {
+				continue
+			}
+			status, _ := classify(p.a, p.b)
+			if !yield(output.LineChange{
+				Resource:   p.resource,
+				Parent:     p.parent.NamedResource,
+				ParentPath: p.parent.Path, From: from, To: to, Status: string(status),
+			}, nil) {
+				return
+			}
+		}
+	}
+}
+
+// A nil side must stay empty so line formats report a wholesale add/remove.
+func marshalForUnified(m map[string]any) (string, error) {
+	if m == nil {
+		return "", nil
+	}
+	b, err := yaml.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("marshal: %w", err)
+	}
+	return string(b), nil
 }
 
 // pairKey identifies a resource for cross-set matching.
 type pairKey struct {
-	// pPath disambiguates two KS parents with the same (kind, ns, name)
-	// but different spec.path — a real-world collision in repos where
-	// the same KS is rendered twice from different overlays.
-	pKind, pNS, pName, pPath string
-	apiVersion               string
-	kind, ns, name           string
+	parent, resource manifest.NamedResource
 }
 
-// pair matches each resource in left against its counterpart in right
-// by (parent, apiVersion, kind, namespace, name), so a Deployment
-// rendered by HelmRelease A never diffs against the same-named
-// Deployment from HelmRelease B. The result is sorted by parent then
-// resource identity for deterministic output.
-func pair(left, right []Doc) []pairedResource {
+// Duplicate identities must retain the last normalized document, matching apply order.
+func pair(left, right []Doc, opts Options) ([]pairedResource, []manifest.Warning, bool, bool) {
 	idx := make(map[pairKey]*pairedResource, len(left)+len(right))
-	add := func(side int, d Doc) {
-		kind := manifest.DocKind(d.Manifest)
+	var warnings []manifest.Warning
+	add := func(side Side, d, original Doc, pos int) {
 		apiVersion := manifest.DocAPIVersion(d.Manifest)
-		name, ns := manifest.DocMetadata(d.Manifest)
-		k := pairKey{d.Parent.Kind, d.Parent.Namespace, d.Parent.Name, d.Parent.Path, apiVersion, kind, ns, name}
+		resource := manifest.DocIdentity(d.Manifest)
+		k := pairKey{d.Parent.NamedResource, resource}
 		p, ok := idx[k]
 		if !ok {
-			p = &pairedResource{parent: d.Parent, kind: kind, namespace: ns, name: name}
+			p = &pairedResource{resource: resource, aPos: len(left), bPos: len(right)}
 			idx[k] = p
 		}
-		if side == 0 {
-			p.a = d.Manifest
-		} else {
-			p.b = d.Manifest
+		p.parent = d.Parent
+		p.apiVersion = apiVersion
+		dst, dstChart, dstPos := &p.a, &p.aChart, &p.aPos
+		if side == SideCurrent {
+			dst, dstChart, dstPos = &p.b, &p.bChart, &p.bPos
 		}
+		if *dst != nil {
+			warnings = append(warnings, manifest.Warning{
+				Resource: resource, Category: manifest.WarnDuplicateDocument,
+				Message: "duplicate document shadows an earlier document",
+				Detail: []string{"side: " + string(side), "parent: " + d.Parent.String(),
+					"parent path: " + d.Parent.Path, "apiVersion: " + manifest.DocAPIVersion(original.Manifest)},
+			})
+		}
+		*dst, *dstChart, *dstPos = d.Manifest, chartLabel(original.Manifest), pos
 	}
-	for _, d := range left {
-		add(0, d)
+	normalizedLeft, leftCopied := normalizeDocs(left, opts.StripAttrs, opts.StripFields, opts.Normalize)
+	for i, d := range normalizedLeft {
+		add(SideOrig, d, left[i], i)
 	}
-	for _, d := range right {
-		add(1, d)
+	normalizedRight, rightCopied := normalizeDocs(right, opts.StripAttrs, opts.StripFields, opts.Normalize)
+	for i, d := range normalizedRight {
+		add(SideCurrent, d, right[i], i)
 	}
 	out := make([]pairedResource, 0, len(idx))
 	for _, p := range idx {
@@ -67,14 +114,10 @@ func pair(left, right []Doc) []pairedResource {
 	}
 	slices.SortFunc(out, func(a, b pairedResource) int {
 		return cmp.Or(
-			cmp.Compare(a.parent.Kind, b.parent.Kind),
-			cmp.Compare(a.parent.Namespace, b.parent.Namespace),
-			cmp.Compare(a.parent.Name, b.parent.Name),
-			cmp.Compare(a.parent.Path, b.parent.Path),
-			cmp.Compare(a.kind, b.kind),
-			cmp.Compare(a.namespace, b.namespace),
-			cmp.Compare(a.name, b.name),
+			a.parent.Compare(b.parent.NamedResource),
+			a.resource.Compare(b.resource),
 		)
 	})
-	return out
+	slices.SortFunc(warnings, manifest.CompareWarning)
+	return out, warnings, leftCopied, rightCopied
 }

@@ -1,51 +1,50 @@
 package discovery
 
 import (
+	"cmp"
+	"context"
 	"log/slog"
+	"slices"
 
 	"github.com/home-operations/flate/pkg/loader"
+	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-// promoteOrphans materializes Existence entries that no Kustomization
-// will ever render. An "orphan" here is a file-indexed object whose
-// source file is not under any loaded KS's spec.path — render-driven
-// discovery would leave it stranded otherwise. Common shapes:
-//
-//   - A loose HelmRelease/source at repo root that `flate build`
-//     should still render even with no enclosing KS.
-//   - flux-system bootstrap CRs that exist beside the bootstrap KS
-//     itself but aren't inside its spec.path tree.
-//
-// Entries whose path IS under a KS's spec.path stay in Existence —
-// they'll be emitted by that KS's render via emitRenderedChildren
-// (or resolved on-demand by depwait's lazy-promotion fallback when a
-// substituteFrom edge fires before the producing KS reconciles).
-//
-// Shares the parent-path-prefix predicate with the orchestrator's
-// detectOrphans via loader.LongestParent — the two run in
-// complementary phases (pre-reconcile materialization here,
-// post-reconcile failure demotion there) and must agree on the
-// same "under a KS path" predicate so an object can't be classified
-// orphan by one and parented by the other.
-func (d *discoverer) promoteOrphans(prefixes []loader.KSPathPrefix) {
-	if d.loader.Existence == nil {
-		return
+func (d *discoverer) promoteOrphans(ctx context.Context, standaloneSecrets []manifest.NamedResource) {
+	index := d.loader.Index
+	// All admitted stand-ins MUST be removed before promotion so real sibling Secrets take precedence.
+	slices.SortFunc(standaloneSecrets, manifest.NamedResource.Compare)
+	var saved []store.Child
+	for _, id := range standaloneSecrets {
+		record, _ := index.Lookup(id)
+		if obj, ok := d.cfg.Store.GetObject(id).(*manifest.Secret); ok && d.loader.AdmitsRoot(id, record.Path) {
+			_, doc, emission := d.cfg.Store.GetEmission(id)
+			emission.Finish()
+			saved = append(saved, store.Child{Obj: obj, Doc: doc})
+			d.cfg.Store.DeleteObject(id)
+		}
 	}
-	// prefixes is the same KS spec.path list discovery.Run computed for
-	// the parent-index passes (identical repoRoot + shared component
-	// cache). Reusing it keeps this and the parent index in lockstep on
-	// the "under a KS path" predicate and avoids a third rebuild.
-	for id := range d.loader.Existence.All() {
-		if d.cfg.Store.GetObject(id) != nil {
+	for id, record := range index.Files() {
+		if d.cfg.Store.GetObject(id) != nil || !d.loader.AdmitsRoot(id, record.Path) {
 			continue
 		}
-		if file, ok := d.sourceFiles[id]; ok {
-			if _, covered := loader.LongestParent(prefixes, file, id); covered {
-				continue
-			}
+		admit := func(obj manifest.BaseManifest) bool {
+			sibling, ok := index.Lookup(obj.Named())
+			return ok && cmp.Or(sibling.Builder, sibling.File) == cmp.Or(record.Builder, record.File) && d.loader.AdmitsRoot(obj.Named(), record.Path)
 		}
-		if !d.loader.Existence.Promote(d.cfg.Store, id, d.cfg.WipeSecrets) {
+		opts := loader.PromoteOptions{Record: manifest.Production{Authored: record.Authored, Path: record.Path, File: record.File}, WipeSecrets: d.cfg.WipeSecrets, Admit: admit}
+		if record.Path == "" {
+			opts.Documents = d.loader.BuiltDocuments(id)
+		}
+		if !loader.Promote(ctx, d.cfg.Store, id, opts) {
 			slog.Debug("discovery: orphan promotion failed", "id", id.String())
+		}
+	}
+	for _, child := range saved {
+		obj := child.Obj
+		if d.cfg.Store.GetObject(obj.Named()) == nil {
+			d.cfg.Store.AddObject(obj, child.Doc)
 		}
 	}
 }

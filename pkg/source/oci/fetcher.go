@@ -1,90 +1,74 @@
-// Package oci implements the source.Fetcher for KindOCIRepository
-// via oras-go. Generic provider only — IRSA / Workload Identity is
-// out of scope for offline flate.
-//
-// File map:
-//
-//	fetcher.go  — Fetcher type, Fetch entry, authIdentity, ociID
-//	fetch.go    — fetch pipeline (resolve → slot → copy → publish)
-//	client.go   — registry client: TLS, registry-config, credentials
-//	cache.go    — cache keys, resolve-cache, cache-hit gate, artifact
-//	resolve.go  — OCI ref parsing, semver tag picking, revision shape
-//	marker.go   — cached-digest slot meta sidecar
-//	layer.go    — media types, spec.layerSelector copy/extract
-//
-// flate does not verify OCI signatures: spec.verify is ignored and the artifact
-// is pulled unconditionally (see README).
+// Package oci fetches verified OCI source layers through the shared acquisition cache.
 package oci
 
 import (
 	"context"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"helm.sh/helm/v4/pkg/registry"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
+	"github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/store"
 )
 
 // Fetcher is the Fetcher implementation for KindOCIRepository.
 // RegistryConfig is the global --registry-config docker-style
-// config.json path used when no per-repo SecretRef is set. Secrets is
-// the per-repo source.SecretGetter (typically the orchestrator-provided
-// Store.GetByName), required when any OCIRepository has spec.secretRef
-// pointing at a kubernetes.io/dockerconfigjson Secret.
+// config.json path used when no per-repo SecretRef is set. Each Fetch
+// resolves per-repository credentials through its captured inputs.
 type Fetcher struct {
-	Cache          *source.Cache
+	Cache          *cache.Cache
 	RegistryConfig string
-	Secrets        source.SecretGetter
+
+	// Network is the required non-nil invocation owner, borrowed by this fetcher.
+	Network *source.Network
 
 	// ForceGeneric skips the provider gate; the generic path then needs
 	// static credentials (SecretRef or --registry-config) or it fails.
 	ForceGeneric bool
 }
 
-// Fetch implements source.TypedFetcher[*manifest.OCIRepository].
-// The typed signature is wrapped via source.Wrap at orchestrator
-// registration — a payload mismatch returns ErrInput once at the
-// adapter site rather than panicking here.
-//
-// Fetch resolves credentials, TLS, and proxy from the CR's *SecretRef
-// fields, then hands off to fetch() — the workhorse in fetch.go that
-// owns slot lifecycle, oras Copy, layer extraction, and marker writes.
-func (f *Fetcher) Fetch(ctx context.Context, repo *manifest.OCIRepository) (*store.SourceArtifact, error) {
+type operation struct {
+	*Fetcher
+	reads      *store.ReadSet
+	secrets    source.SecretGetter
+	mediaTypes []string
+}
+
+// Fetch acquires content using one execution's captured credentials and declarations.
+func (f *Fetcher) Fetch(ctx context.Context, repo *manifest.OCIRepository, reads *store.ReadSet, policy cache.Policy) (*store.SourceArtifact, error) {
+	var mediaTypes []string
+	if mediaType := repo.LayerMediaType(); mediaType != "" {
+		mediaTypes = []string{mediaType}
+	}
+	operation := operation{Fetcher: f, reads: reads, secrets: source.SecretLookup(reads), mediaTypes: mediaTypes}
+	return operation.fetchSource(ctx, repo, policy)
+}
+
+// FetchChart acquires chart layers using Helm's supported media types.
+func (f *Fetcher) FetchChart(ctx context.Context, repo *manifest.OCIRepository, reads *store.ReadSet, policy cache.Policy) (*store.SourceArtifact, error) {
+	operation := operation{Fetcher: f, reads: reads, secrets: source.SecretLookup(reads),
+		mediaTypes: []string{registry.ChartLayerMediaType, registry.LegacyChartLayerMediaType}}
+	return operation.fetchSource(ctx, repo, policy)
+}
+
+func (f *operation) fetchSource(ctx context.Context, repo *manifest.OCIRepository, policy cache.Policy) (*store.SourceArtifact, error) {
 	if !f.ForceGeneric && repo.Provider != "" && repo.Provider != sourcev1.GenericOCIProvider {
-		return nil, source.ErrUnsupportedProvider("OCIRepository",
-			repo.Namespace, repo.Name, repo.Provider, sourcev1.GenericOCIProvider,
+		return nil, source.ErrUnsupportedProvider(repo.Named(), repo.Provider, sourcev1.GenericOCIProvider,
 			"SecretRef or --registry-config credentials")
 	}
-	configPath, cleanup, err := f.resolveRegistryConfig(repo)
-	if err != nil {
-		return nil, err
+	if f.secrets != nil {
+		for _, ref := range []*manifest.LocalObjectReference{repo.SecretRef, repo.CertSecretRef, repo.ProxySecretRef} {
+			if ref != nil {
+				f.secrets(repo.Namespace, ref.Name)
+			}
+		}
 	}
-	defer cleanup()
-	tlsCfg, err := f.resolveTLS(repo)
-	if err != nil {
-		return nil, err
-	}
-	proxy, err := source.ResolveProxy(f.Secrets, repo.Namespace, "OCIRepository",
-		repo.Namespace+"/"+repo.Name, repo.ProxySecretRef)
-	if err != nil {
-		return nil, err
-	}
-	return fetch(ctx, f, repo, configPath, tlsCfg, proxy)
-}
 
-// ociID is the "OCIRepository <namespace>/<name>" prefix shared by this
-// package's error messages — wraps source.QualifiedName so every fetcher
-// formats its kind/ns/name identically.
-func ociID(repo *manifest.OCIRepository) string {
-	return source.QualifiedName("OCIRepository", repo.Namespace, repo.Name)
-}
-
-// authIdentity returns the cache-key auth tag for an OCIRepository.
-// Combines SecretRef (registry creds), CertSecretRef (TLS material), and
-// ProxySecretRef since each can change which artifact bytes a reconcile
-// resolves to.
-func authIdentity(repo *manifest.OCIRepository) string {
-	return source.AuthIdentityFromRefs(repo.Namespace,
-		repo.SecretRef, repo.CertSecretRef, repo.ProxySecretRef)
+	credStore, err := f.resolveRegistryConfig(ctx, repo, policy)
+	if err != nil {
+		return nil, err
+	}
+	return f.fetchWithCredentials(ctx, repo, credStore, policy)
 }

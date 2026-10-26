@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"cmp"
+	"time"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 )
@@ -26,11 +27,53 @@ type Bucket struct {
 
 // Named identifies the Bucket.
 func (b *Bucket) Named() NamedResource {
-	return NamedResource{Kind: KindBucket, Namespace: b.Namespace, Name: b.Name}
+	return NamedResource{Group: kindTable[kindBucket].Group, Kind: KindBucket, Namespace: b.Namespace, Name: b.Name}
 }
+
+// BootstrapAlias returns a local copy; a nil Git descriptor selects a derived frozen root.
+func (b *Bucket) BootstrapAlias(root string) (BaseManifest, *GitRepository) {
+	out := *b
+	out.Endpoint, out.BucketName = "file://"+root, b.Name
+	return &out, nil
+}
+
+// Content returns the source inputs for the effective bucket endpoint.
+func (b *Bucket) Content(endpoint string, secure bool) any {
+	var auth []NamedResource
+	b.references(func(ref Reference) bool {
+		if ref.Content && ref.Name != "" {
+			auth = append(auth, ref.NamedResource)
+		}
+		return true
+	})
+	return struct {
+		Endpoint   string
+		Secure     bool
+		BucketName string
+		Prefix     string
+		Region     string
+		Auth       []NamedResource
+	}{endpoint, secure, b.BucketName, b.Prefix, b.Region, auth}
+}
+
+// WithNamespace returns a shallow namespace copy; borrowed payloads MUST remain immutable.
+func (b *Bucket) WithNamespace(namespace string) BaseManifest {
+	out := *b
+	out.Namespace = namespace
+	return &out
+}
+
+// ProjectionCompatible reports whether an eligible previous projection can be reused.
+func (b *Bucket) ProjectionCompatible(BaseManifest) bool { return true }
 
 // Suspended reports whether reconciliation is paused on this resource.
 func (b *Bucket) Suspended() bool { return b.Suspend }
+
+// ExistenceOnly reports whether readiness requires no artifact acquisition.
+func (b *Bucket) ExistenceOnly() bool { return false }
+
+// SourceInterval returns the authored source refresh interval.
+func (b *Bucket) SourceInterval() time.Duration { return b.Interval.Duration }
 
 // parseBucket decodes a Bucket CR via the source-controller typed
 // schema.
@@ -46,17 +89,21 @@ func parseBucket(doc map[string]any) (*Bucket, error) {
 		return nil, inputf("Bucket %s/%s missing spec.endpoint", cr.Namespace, cr.Name)
 	}
 	cr.Spec.Provider = cmp.Or(cr.Spec.Provider, sourcev1.BucketProviderGeneric)
-	owner := cr.Namespace + "/" + cr.Name
-	if err := validateOptionalRefs("Bucket", owner,
-		secretRefCheck{Field: "spec.secretRef", Ref: cr.Spec.SecretRef},
-		secretRefCheck{Field: "spec.certSecretRef", Ref: cr.Spec.CertSecretRef},
-		secretRefCheck{Field: "spec.proxySecretRef", Ref: cr.Spec.ProxySecretRef},
-	); err != nil {
-		return nil, err
-	}
-	return &Bucket{
+	out := &Bucket{
 		Name:       cr.Name,
 		Namespace:  cr.Namespace,
 		BucketSpec: cr.Spec,
-	}, nil
+	}
+	var err error
+	out.references(validateSecretReference(out.Named(), &err))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
+
+func (b *Bucket) references(yield func(Reference) bool) {
+	credentialReferences(yield, b.Namespace, b.SecretRef, b.CertSecretRef, b.ProxySecretRef)
+}
+
+func (b *Bucket) kind() KindInfo { return kindTable[kindBucket].KindInfo }

@@ -1,7 +1,10 @@
 package store
 
 import (
+	"context"
+	"io/fs"
 	"reflect"
+	"slices"
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
@@ -10,20 +13,6 @@ import (
 // Controllers type-assert to the concrete type they expect.
 type Artifact interface {
 	artifact()
-}
-
-// RenderedArtifact is satisfied by artifacts that carry a rendered
-// manifest set — KustomizationArtifact and HelmReleaseArtifact. CLI
-// emitters use it to collect rendered output without caring which
-// controller produced it.
-type RenderedArtifact interface {
-	Artifact
-	RenderedManifests() []map[string]any
-	// RenderedFingerprint is the stable hash of the inputs that produced
-	// RenderedManifests (named distinctly from the Fingerprint field). The
-	// controllers' shared dedup short-circuit (base.Controller.FingerprintDedup)
-	// compares it to skip a re-render whose inputs are byte-identical.
-	RenderedFingerprint() string
 }
 
 // SourceArtifact is the unified working-tree artifact produced by
@@ -38,6 +27,8 @@ type RenderedArtifact interface {
 // Size is the artifact size in bytes when known, and Metadata holds
 // kind-specific annotations (OCI image annotations, bucket ETag…).
 type SourceArtifact struct {
+	// Reads retains the declaration and material that produced this acquisition.
+	Reads     *ReadSet
 	Kind      string
 	URL       string
 	LocalPath string
@@ -45,126 +36,163 @@ type SourceArtifact struct {
 	Digest    string
 	Size      int64
 	Metadata  map[string]string
+
+	// LocalRoot is the selected input's ownership origin, which may be synthetic.
+	// Only an admitted bootstrap uses its original checkout root for Git metadata.
+	LocalRoot string
+
+	// Key identifies an immutable acquisition family; Revision and Digest select its generation.
+	// Empty Key with FS denotes mutable content requiring cache validation.
+	// Nonempty Key without FS requires acquisition before reading.
+	Key string
+	// InputAlias marks source shaping derived from the selected bootstrap input,
+	// rather than an authored committed source pin.
+	InputAlias bool
+	// FS supplies acquired content; LocalPath and LocalRoot are coordinates only.
+	// Nil FS is unavailable or existence-only, regardless of Key or LocalPath.
+	FS fs.FS
+	// Warnings is immutable acquisition evidence, excluded from content identity.
+	Warnings []manifest.Warning
+	// ContentFingerprint lazily identifies selected bytes at their source owner.
+	// Nil or an empty result supplies no equality evidence; acquisition identity stays separate.
+	ContentFingerprint func(context.Context, fs.FS) (string, error) `json:"-"`
 }
 
 func (*SourceArtifact) artifact() {}
 
-// KustomizationArtifact is the rendered output of a Kustomization build.
-//
-// Fingerprint mirrors HelmReleaseArtifact: a stable hash of the inputs
-// that determine the rendered output (path, inline contents, spec,
-// expanded substitutions, resolved source root). The KS controller
-// compares it on every reconcile and skips re-running kustomize when
-// a re-AddObject event arrives with the same effective spec — the
-// same wasted-work pattern HR had before PR #219, just for KS.
-type KustomizationArtifact struct {
-	Path        string
-	Manifests   []map[string]any
-	Fingerprint string
+type artifactRecord struct {
+	value Artifact
+	authority
 }
 
-func (*KustomizationArtifact) artifact() {}
-
-// RenderedManifests implements RenderedArtifact.
-func (a *KustomizationArtifact) RenderedManifests() []map[string]any { return a.Manifests }
-
-// RenderedFingerprint implements RenderedArtifact.
-func (a *KustomizationArtifact) RenderedFingerprint() string { return a.Fingerprint }
-
-// HelmReleaseArtifact is the rendered output of a HelmRelease template.
-//
-// Fingerprint is a stable hash of the inputs that determine the
-// rendered output (chart identity, expanded values, install/upgrade
-// flags). The HR controller compares it on every reconcile and
-// skips the helm render — which is by far the hot path — when a
-// re-AddObject event arrives with the same effective spec. Typical
-// trigger: the parent Kustomization's render re-emits the HR with
-// `kustomize.toolkit.fluxcd.io/{name,namespace}` ownership labels
-// stamped on metadata, which fails AddObject's reflect-DeepEqual
-// gate even though the rendered output would be byte-identical.
-type HelmReleaseArtifact struct {
-	Manifests   []map[string]any
-	Fingerprint string
-}
-
-func (*HelmReleaseArtifact) artifact() {}
-
-// RenderedManifests implements RenderedArtifact.
-func (a *HelmReleaseArtifact) RenderedManifests() []map[string]any { return a.Manifests }
-
-// RenderedFingerprint implements RenderedArtifact.
-func (a *HelmReleaseArtifact) RenderedFingerprint() string { return a.Fingerprint }
-
-// ResourceSetArtifact is the rendered output of a ResourceSet expansion.
-//
-// Fingerprint mirrors KustomizationArtifact: a stable hash of the inputs
-// that determine the rendered output (the RS spec plus the resolved
-// inputsFrom provider set). The RS controller compares it on every
-// reconcile and skips re-running resourceset.Render when a re-dispatch
-// (a parent KS re-emit, or a drain-rerun whose inputs converged) arrives
-// with the same effective inputs — the same wasted-work short-circuit
-// KS and HR carry.
-type ResourceSetArtifact struct {
-	Manifests   []map[string]any
-	Fingerprint string
-}
-
-func (*ResourceSetArtifact) artifact() {}
-
-// RenderedManifests implements RenderedArtifact.
-func (a *ResourceSetArtifact) RenderedManifests() []map[string]any { return a.Manifests }
-
-// RenderedFingerprint implements RenderedArtifact.
-func (a *ResourceSetArtifact) RenderedFingerprint() string { return a.Fingerprint }
-
-// --- Store operations on artifacts ---
-
-// SetArtifact stores an artifact for id and dispatches an
-// ArtifactUpdated event. Re-setting with a content-equal value is a
-// no-op.
-//
-// Equality cascade, cheapest-first:
-//
-//  1. Pointer identity (prev == artifact): trivially equal, no-op.
-//     Source-controller refresh loops cache their own SourceArtifact
-//     and re-publish the same pointer on every tick; the short-
-//     circuit avoids reflection entirely for that case (~3× faster
-//     than the legacy reflect.DeepEqual-on-aliased-pointers fast
-//     path, which still walks struct headers).
-//  2. reflect.DeepEqual fallback for distinct-pointer dedup. Phase 1
-//     evaluated hashing here (FNV64a via both json.Marshal and a
-//     hand-rolled walker) and benched it against DeepEqual on the
-//     realistic KS / HR re-emit shape (20-200 docs, fresh maps every
-//     reconcile, no aliased sub-pointers). Result: DeepEqual was
-//     ≥2× faster than either hash variant because the FNV walker
-//     pays full per-leaf write cost on every call, while DeepEqual
-//     short-circuits on the first leaf mismatch and is hand-tuned by
-//     the runtime for nested map / slice shapes. The plan
-//     acknowledged this outcome ("if JSON encode is slower than
-//     DeepEqual on the artifact size you have, this is a wash. Bench
-//     it."). The pointer-identity short-circuit is the residual win.
+// SetArtifact stores fetched content or a rendered inventory and notifies live readers.
+// Equal payloads are deduplicated; hidden writes remain private.
 func (s *Store) SetArtifact(id manifest.NamedResource, artifact Artifact) {
 	sh := s.shardFor(id)
 	sh.mu.Lock()
 	prev, exists := sh.artifacts[id]
-	// Dedup cheapest-first: pointer identity (the hot path when a
-	// fetcher caches its own SourceArtifact and re-publishes the same
-	// pointer every refresh tick, skipping reflection entirely) before
-	// the reflect.DeepEqual fallback for distinct-pointer equal content.
-	if exists && (prev == artifact || reflect.DeepEqual(prev, artifact)) {
+	if exists && sameArtifact(prev.value, artifact) {
+		var retired *ReadSet
+		if a, ok := artifact.(*SourceArtifact); ok && a.Reads != nil {
+			if before, ok := prev.value.(*SourceArtifact); ok && before.Reads != a.Reads {
+				retired = before.Reads
+				prev.value = artifact
+				sh.artifacts[id] = prev
+			}
+		}
+		sh.mu.Unlock()
+		retired.Retire()
+		return
+	}
+	sh.requireCapacityLocked(prev.authority)
+	if prev.generation == 0 {
+		if !sh.canAdmit(1) {
+			sh.mu.Unlock()
+			panic("store: authority generation exhausted")
+		}
+		sh.admitAbsenceLocked(id, artifactFacet)
+	}
+	prev.authority, prev.value = sh.advanceLocked(prev.authority), artifact
+	sh.artifacts[id] = prev
+	if sh.derived && sh.cells[id].hidden {
 		sh.mu.Unlock()
 		return
 	}
-	sh.artifacts[id] = artifact
-	dispatch := s.fireUnderLock(EventArtifactUpdated, id, artifact)
+	dispatch := fireUnderLock(s, EventArtifactUpdated, id)
+	dispatch.payload = artifact
 	sh.mu.Unlock()
-	dispatch()
+	dispatch.run()
 }
 
 // GetArtifact returns the artifact for id, or nil if none was set.
 func (s *Store) GetArtifact(id manifest.NamedResource) Artifact {
 	sh := s.shardFor(id)
 	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	return sh.artifacts[id]
+	if sh.derived && sh.cells[id].hidden {
+		sh.mu.RUnlock()
+		return nil
+	}
+	var view capture
+	sh.captureLocked(id, sh.cells[id], &view)
+	artifact := sh.artifacts[id].value
+	if view.payload != nil {
+		artifact = view.payload
+	}
+	e, emitted := artifact.(*Emission)
+	sh.mu.RUnlock()
+	if emitted && !emissionCurrent(e, view) {
+		return nil
+	}
+	return artifact
+}
+
+// Family and generation metadata pin payload identity; never walk a filesystem under the shard lock.
+func sameArtifact(prev, next Artifact) bool {
+	if prev == next {
+		return true
+	}
+	if a, ok := prev.(*Emission); ok {
+		b, ok := next.(*Emission)
+		return ok && a != nil && b != nil && a.Complete == b.Complete &&
+			(a.Children == nil) == (b.Children == nil) &&
+			slices.EqualFunc(a.Children, b.Children, childEqual) && a.sameContent(b)
+	}
+	a, aok := prev.(*SourceArtifact)
+	b, bok := next.(*SourceArtifact)
+	if !aok || !bok {
+		return reflect.DeepEqual(prev, next)
+	}
+	if (a.FS == nil) != (b.FS == nil) || a.FS != nil && (a.Key == "" || b.Key == "") {
+		return false
+	}
+	ac, bc := *a, *b
+	ac.FS, bc.FS = nil, nil
+	ac.Reads, bc.Reads = nil, nil
+	ac.Warnings, bc.Warnings = nil, nil
+	ac.ContentFingerprint, bc.ContentFingerprint = nil, nil
+	return reflect.DeepEqual(ac, bc)
+}
+
+func emissionCurrent(e *Emission, view capture) bool {
+	input := view.child
+	if !reconcileDocumentEqual(e.input, e.inputDoc, input.Doc) || e.inputHead.binding != view.source {
+		return false
+	}
+	if e.input == nil || e.input == input.Obj {
+		return true
+	}
+	if e.validated != nil {
+		if validated := e.validated.Load(); validated != nil && *validated == input.Obj {
+			return true
+		}
+	}
+	if !semanticEqual(Child{Obj: e.input, Doc: e.inputDoc}, input) {
+		return false
+	}
+	if e.validated != nil {
+		validated := new(manifest.BaseManifest)
+		*validated = input.Obj
+		e.validated.Store(validated)
+	}
+	return true
+}
+
+func payloadEqual(a, b *SourceArtifact) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a == b || sameArtifact(a, b)
+}
+
+func (sh *shard) clearFacetsLocked(id manifest.NamedResource) {
+	sh.requireCapacityLocked(sh.conditions[id].stamp(), sh.artifacts[id].authority)
+	if record := sh.conditions[id]; len(record.conditions) > 0 || record.failure != nil {
+		record.advanceLocked(sh)
+		record.conditions, record.failure = record.conditions[:0], nil
+		sh.conditions[id] = record
+	}
+	if record := sh.artifacts[id]; record.value != nil {
+		record.authority, record.value = sh.advanceLocked(record.authority), nil
+		sh.artifacts[id] = record
+	}
 }

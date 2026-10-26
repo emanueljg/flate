@@ -2,13 +2,26 @@ package resourceset
 
 import (
 	"context"
+	"fmt"
+	"slices"
+	"sync/atomic"
 	"testing"
 
+	"github.com/home-operations/flate/pkg/schedule"
+
+	"github.com/home-operations/flate/internal/testutil"
+	"github.com/home-operations/flate/pkg/controllers/base"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
+	"github.com/google/go-cmp/cmp"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/home-operations/flate/internal/testutil/controllertest"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/resourceset"
 	"github.com/home-operations/flate/pkg/store"
 	"github.com/home-operations/flate/pkg/task"
 )
@@ -20,29 +33,13 @@ func newController(t *testing.T) (*Controller, *store.Store) {
 	s := store.New()
 	tasks := task.NewBounded(0)
 	c := New(s, tasks, true)
-	c.Configure(Options{})
-	c.Start(context.Background())
+	c.Configure(base.Options{})
+	c.StartLifecycle()
 	t.Cleanup(func() {
-		c.Close()
+
 		tasks.BlockTillDone()
 	})
 	return c, s
-}
-
-// dispatchToFixpoint drives id through ReconcileNode with escalating
-// drain levels (none→cascade→force), mirroring the scheduler's
-// structural fixpoint, until the node terminalizes (no blocked deps) or
-// drain is exhausted, then returns the final store status. Mirrors the
-// kustomization controller test harness.
-func dispatchToFixpoint(t *testing.T, c *Controller, s *store.Store, id manifest.NamedResource) store.StatusInfo {
-	t.Helper()
-	for _, drain := range []int{0, 1, 2} {
-		if blocked := c.ReconcileNode(context.Background(), id, drain); len(blocked) == 0 {
-			break
-		}
-	}
-	info, _ := s.GetStatus(id)
-	return info
 }
 
 func staticRSIP(name, ns string, labels map[string]string, defaults map[string]string) *manifest.ResourceSetInputProvider {
@@ -61,7 +58,7 @@ func staticRSIP(name, ns string, labels map[string]string, defaults map[string]s
 
 // findDoc reports whether the RS artifact carries a doc of the given kind
 // and metadata.name.
-func hasRenderedDoc(art *store.ResourceSetArtifact, kind, name string) bool {
+func hasRenderedDoc(art *store.Emission, kind, name string) bool {
 	if art == nil {
 		return false
 	}
@@ -81,11 +78,12 @@ func hasRenderedDoc(art *store.ResourceSetArtifact, kind, name string) bool {
 // a NAMED inputsFrom parks on the RSIP (blocked) until the RSIP is in the
 // store, then renders the full input set once it arrives.
 func TestReconcile_NamedInputsFrom_ParksOnRSIP(t *testing.T) {
+	t.Parallel()
 	c, s := newController(t)
 	rs := &manifest.ResourceSet{
 		Name: "acl", Namespace: "flux-system",
 		InputsFrom: []fluxopv1.InputProviderReference{
-			{Kind: manifest.KindResourceSetInputProvider, Name: "rsip"},
+			{Name: "rsip"},
 		},
 		ResourcesTemplate: `---
 apiVersion: example.com/v1
@@ -97,23 +95,23 @@ metadata: {name: << inputs.user >>, namespace: flux-system}
 
 	// First dispatch (no RSIP yet): the named dep is absent, so the node
 	// blocks rather than terminalizing.
-	blocked := c.ReconcileNode(context.Background(), rs.Named(), 0)
+	blocked := c.ReconcileNode(context.Background(), rs.Named(), 0).Blocked
 	if len(blocked) != 1 {
 		t.Fatalf("first dispatch blocked = %v, want [rsip] (parked on the named RSIP)", blocked)
 	}
-	want := manifest.NamedResource{Kind: manifest.KindResourceSetInputProvider, Namespace: "flux-system", Name: "rsip"}
+	want := manifest.NamedResource{Group: manifest.FluxOperatorDomain, Kind: manifest.KindResourceSetInputProvider, Namespace: "flux-system", Name: "rsip"}
 	if blocked[0] != want {
 		t.Fatalf("blocked on %v, want %v", blocked[0], want)
 	}
 
 	// RSIP arrives → re-dispatch renders the Widget from its inputs.
 	s.AddObject(staticRSIP("rsip", "flux-system", nil, map[string]string{"user": "alice"}))
-	s.UpdateStatus(want, store.StatusReady, "")
-	info := dispatchToFixpoint(t, c, s, rs.Named())
+	s.UpdateStatus(want, store.StatusInfo{Status: store.StatusReady, Reason: "", Message: ""})
+	info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode})
 	if info.Status != store.StatusReady {
 		t.Fatalf("status = %+v, want Ready", info)
 	}
-	art, _ := s.GetArtifact(rs.Named()).(*store.ResourceSetArtifact)
+	art, _ := s.GetArtifact(rs.Named()).(*store.Emission)
 	if !hasRenderedDoc(art, "Widget", "alice") {
 		t.Fatalf("expected rendered Widget/alice; artifact = %+v", art)
 	}
@@ -122,54 +120,79 @@ metadata: {name: << inputs.user >>, namespace: flux-system}
 	}
 }
 
-// TestReconcile_SelectorInputsFrom_LateRSIP pins (b): a selector
-// inputsFrom RS renders the complete set even when the matching RSIP
-// arrives AFTER the first render. The first pass renders zero docs (no
-// match); WantsDrainRerun reports true (so the scheduler re-runs at the
-// fixpoint); a re-dispatch after the RSIP arrives renders the full set.
 func TestReconcile_SelectorInputsFrom_LateRSIP(t *testing.T) {
-	c, s := newController(t)
-	rs := &manifest.ResourceSet{
-		Name: "acl", Namespace: "flux-system",
-		InputsFrom: []fluxopv1.InputProviderReference{
-			{Kind: manifest.KindResourceSetInputProvider, Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"role": "db"},
-			}},
-		},
-		// Guard on inputs so the no-match first pass (nil input set under
-		// Flatten) renders nothing; once the RSIP arrives the input set is
-		// populated and the Widget emits.
-		ResourcesTemplate: `<< if inputs >>---
-apiVersion: example.com/v1
-kind: Widget
-metadata: {name: << inputs.user >>, namespace: flux-system}
-<< end >>`,
-	}
+	t.Parallel()
+	s := store.New()
+	tasks := task.NewBounded(2)
+	c := New(s, tasks, true)
+	c.Configure(base.Options{})
+	c.StartLifecycle()
+
+	rs := selectorFixture("acl", "blue")
 	s.AddObject(rs)
+	if _, err := c.newExecution(rs.Named()).run.RequireRefresh(t.Context(), rs, manifest.GateInputs, manifest.DrainNone); err != nil {
+		t.Fatal("selector-only input must not require an ID gate")
+	}
+	provider := staticRSIP("rsip", "ns", map[string]string{"color": "blue"}, nil)
+	child := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "ns", Name: provider.Name}
+	var inventories []int
+	unsub := s.AddListener(store.EventArtifactUpdated, func(id manifest.NamedResource, payload any) {
+		emission, ok := payload.(*store.Emission)
+		if id != rs.Named() || !ok || !emission.Complete {
+			return
+		}
+		inventories = append(inventories, len(emission.Manifests))
+		switch len(inventories) {
+		case 1:
+			if len(emission.Manifests) != 0 {
+				t.Error("empty selector query rendered an input")
+			}
+			s.AddObject(provider)
+		case 2:
+			if !hasRenderedDoc(emission, "ConfigMap", provider.Name) || s.GetObject(child) == nil {
+				t.Error("late provider was not published as an output")
+			}
+			removed := *provider
+			removed.Labels = map[string]string{"color": "red"}
+			s.AddObject(&removed)
+		}
+	}, false)
+	defer unsub()
+	dispatches := 0
+	info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{
+		Tasks: tasks, Store: s, ID: rs.Named(),
+		ReconcileNode: func(ctx context.Context, id manifest.NamedResource, level manifest.DrainLevel) *base.Execution {
+			dispatches++
+			return c.ReconcileNode(ctx, id, level)
+		},
+	})
+	if info.Status != store.StatusReady || dispatches != 3 || !slices.Equal(inventories, []int{0, 1, 0}) {
+		t.Fatalf("status=%+v dispatches=%d inventories=%v, want Ready, 3, [0 1 0]", info, dispatches, inventories)
+	}
+	artifact, _ := s.GetArtifact(rs.Named()).(*store.Emission)
+	if artifact == nil || len(artifact.Manifests) != 0 || s.GetObject(child) != nil {
+		t.Fatalf("removed selector member survived: artifact=%+v child=%v", artifact, s.GetObject(child))
+	}
+	if rs.InputsFrom[0].Selector.MatchLabels["color"] != "blue" {
+		t.Fatal("query changed the authored selector")
+	}
+}
 
-	// A selector-only RS always wants a drain rerun (no nameable dep).
-	if !c.WantsDrainRerun(rs.Named()) {
-		t.Fatal("WantsDrainRerun = false, want true for a selector-only inputsFrom RS")
+func TestReconcile_SelectorInputs_InvalidSelector(t *testing.T) {
+	t.Parallel()
+	c, s := newController(t)
+	rs := selectorFixture("invalid", "blue")
+	rs.InputsFrom = []fluxopv1.InputProviderReference{{Selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "color", Operator: "invalid"}}}}}
+	s.AddObject(rs)
+	resolve := resourceset.StoreResolver(s)
+	if _, fp, err := renderWithAdmission(rs, resolve, "previous"); err == nil || fp != "" {
+		t.Fatalf("invalid selector fingerprint=%q error=%v", fp, err)
 	}
-
-	// First dispatch: no matching RSIP, renders nothing, terminalizes Ready.
-	info := dispatchToFixpoint(t, c, s, rs.Named())
-	if info.Status != store.StatusReady {
-		t.Fatalf("first dispatch status = %+v, want Ready (empty render)", info)
+	if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusFailed {
+		t.Fatalf("status=%+v, want Failed", info)
 	}
-	if art, _ := s.GetArtifact(rs.Named()).(*store.ResourceSetArtifact); hasRenderedDoc(art, "Widget", "alice") {
-		t.Fatal("first dispatch should render no Widget (RSIP not yet present)")
-	}
-
-	// RSIP arrives late → the drain-rerun re-dispatch renders the full set.
-	s.AddObject(staticRSIP("rsip", "flux-system", map[string]string{"role": "db"}, map[string]string{"user": "alice"}))
-	info = dispatchToFixpoint(t, c, s, rs.Named())
-	if info.Status != store.StatusReady {
-		t.Fatalf("drain-rerun status = %+v, want Ready", info)
-	}
-	art, _ := s.GetArtifact(rs.Named()).(*store.ResourceSetArtifact)
-	if !hasRenderedDoc(art, "Widget", "alice") {
-		t.Fatalf("expected rendered Widget/alice after late RSIP; artifact = %+v", art)
+	if artifact := s.GetArtifact(rs.Named()); artifact != nil {
+		t.Fatalf("invalid selector published artifact=%v", artifact)
 	}
 }
 
@@ -177,69 +200,361 @@ metadata: {name: << inputs.user >>, namespace: flux-system}
 // Kustomization) emitted by the RS render lands in the store as a
 // reconcilable object (AddObject), not merely as rendered data.
 func TestReconcile_EmitsFluxChildToStore(t *testing.T) {
+	t.Parallel()
 	c, s := newController(t)
 	rs := &manifest.ResourceSet{
 		Name: "fleet", Namespace: "flux-system",
-		ResourcesTemplate: `---
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata: {name: child, namespace: flux-system}
-spec:
-  path: ./child
+		ResourcesTemplate: "---\n" +
+			testutil.KustomizationYAML("child", "", `  path: ./child
   sourceRef: {kind: GitRepository, name: flux-system}
+`) + "---\n" +
+			`apiVersion: apps/v1
+kind: Deployment
+metadata: {name: bare}
+` + "---\n" +
+			`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: bare}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: config}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: explicit, namespace: other}
+---
+apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSet
+metadata: {name: fleet}
+spec: {}
 `,
 	}
 	s.AddObject(rs)
 
-	info := dispatchToFixpoint(t, c, s, rs.Named())
+	info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode})
 	if info.Status != store.StatusReady {
 		t.Fatalf("status = %+v, want Ready", info)
 	}
-	childID := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "child"}
+	childID := testutil.KustomizationID("flux-system", "child")
 	child, ok := s.Get[*manifest.Kustomization](childID)
 	if !ok || child == nil {
 		t.Fatalf("expected RS-emitted Kustomization %s in store (AddObject), got ok=%v", childID, ok)
 	}
+	art := s.GetArtifact(rs.Named()).(*store.Emission)
+	for _, child := range art.Children {
+		if child.Obj.Named() == rs.Named() {
+			t.Fatal("effective self child published")
+		}
+	}
+	before := make([]map[string]any, len(art.Manifests))
+	for i, doc := range art.Manifests {
+		before[i] = manifest.DeepCopyMap(doc)
+		name, ns := manifest.DocMetadata(doc)
+		want := rs.Namespace
+		if name == "explicit" {
+			want = "other"
+		} else if manifest.DocKind(doc) == "ClusterRole" {
+			want = ""
+		}
+		authored := ""
+		if name == "explicit" {
+			authored = "other"
+		}
+		if ns != authored {
+			t.Fatalf("rendered namespace = %q, want authored absence", ns)
+		}
+		if s.GetObject(manifest.NamedResource{Group: schema.FromAPIVersionAndKind(manifest.DocAPIVersion(doc), manifest.DocKind(doc)).Group, Kind: manifest.DocKind(doc), Namespace: want, Name: name}) == nil {
+			t.Fatalf("missing effective child %s/%s", want, name)
+		}
+	}
+	if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusReady {
+		t.Fatalf("repeat reconcile: %+v", info)
+	}
+	if delta := cmp.Diff(before, art.Manifests); delta != "" {
+		t.Fatalf("replay mutated output (-want +got):\n%s", delta)
+	}
+
 }
 
-// TestReconcile_RenderError_MarksFailed pins that a malformed RS template
-// (referencing a nonexistent input) marks the RS Failed and surfaces the
-// error — the failure path the deleted post-run pass used to own.
 func TestReconcile_RenderError_MarksFailed(t *testing.T) {
-	c, s := newController(t)
-	rs := &manifest.ResourceSet{
-		Name: "broken", Namespace: "flux-system",
-		ResourcesTemplate: `---
-apiVersion: v1
-kind: ConfigMap
-metadata: {name: << .nonexistent.field >>}
-`,
-	}
-	s.AddObject(rs)
-
-	info := dispatchToFixpoint(t, c, s, rs.Named())
-	if info.Status != store.StatusFailed {
-		t.Fatalf("status = %+v, want Failed", info)
+	t.Parallel()
+	for _, fault := range []string{"template", "provider export", "provider resolution"} {
+		t.Run(fault, func(t *testing.T) {
+			t.Parallel()
+			c, s := newController(t)
+			rs := &manifest.ResourceSet{
+				Name: "broken", Namespace: "flux-system",
+				ResourcesTemplate: "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: output}\n",
+			}
+			provider := staticRSIP("input", rs.Namespace, nil, map[string]string{"value": "valid"})
+			switch fault {
+			case "provider export":
+				rs.InputsFrom = []fluxopv1.InputProviderReference{{Kind: manifest.KindResourceSetInputProvider, Selector: &metav1.LabelSelector{}}}
+			case "provider resolution":
+				rs.InputsFrom = []fluxopv1.InputProviderReference{{Kind: manifest.KindResourceSetInputProvider, Name: provider.Name}}
+				s.AddObject(provider)
+			}
+			s.AddObject(rs)
+			if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusReady {
+				t.Fatalf("initial render: %+v", info)
+			}
+			artifact := s.GetArtifact(rs.Named()).(*store.Emission)
+			if artifact.Fingerprint == "" {
+				t.Fatal("successful render lacks replay candidate")
+			}
+			switch fault {
+			case "template":
+				changed := *rs
+				changed.ResourcesTemplate = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: << .nonexistent.field >>}\n"
+				s.AddObject(&changed)
+			case "provider export":
+				changed := *provider
+				changed.DefaultValues = fluxopv1.ResourceSetInput{"value": {Raw: []byte("invalid json")}}
+				s.AddObject(&changed)
+			case "provider resolution":
+				changed := *rs
+				changed.InputsFrom = []fluxopv1.InputProviderReference{{Kind: manifest.KindResourceSetInputProvider, Name: "missing"}}
+				s.AddObject(&changed)
+			}
+			if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusFailed {
+				t.Fatalf("status = %+v, want Failed", info)
+			}
+		})
 	}
 }
 
-// TestWantsDrainRerun_NamedOnly pins that an RS whose inputsFrom are all
-// NAMED (no selector) does NOT ask for a drain rerun — it parks on the
-// named RSIP instead.
-func TestWantsDrainRerun_NamedOnly(t *testing.T) {
+func TestReconcile_NamedOnlyRetainsNamedGate(t *testing.T) {
+	t.Parallel()
 	c, s := newController(t)
 	rs := &manifest.ResourceSet{
 		Name: "named", Namespace: "flux-system",
-		InputsFrom: []fluxopv1.InputProviderReference{
-			{Kind: manifest.KindResourceSetInputProvider, Name: "rsip"},
-		},
+		InputsFrom: []fluxopv1.InputProviderReference{{Kind: manifest.KindResourceSetInputProvider, Name: "rsip"}},
 	}
 	s.AddObject(rs)
-	if c.WantsDrainRerun(rs.Named()) {
-		t.Error("WantsDrainRerun = true for a named-only inputsFrom RS, want false")
+	execution := c.ReconcileNode(t.Context(), rs.Named(), manifest.DrainNone)
+	defer execution.Close()
+	want := manifest.NamedResource{Group: manifest.FluxOperatorDomain, Kind: manifest.KindResourceSetInputProvider, Namespace: "flux-system", Name: "rsip"}
+	if !slices.Equal(execution.Blocked, []manifest.NamedResource{want}) {
+		t.Fatalf("named-only dependencies = %v, want [%s]", execution.Blocked, want)
 	}
-	// Unknown id → false.
-	if c.WantsDrainRerun(manifest.NamedResource{Kind: manifest.KindResourceSet, Name: "ghost"}) {
-		t.Error("WantsDrainRerun = true for an absent RS, want false")
+	unknown := c.ReconcileNode(t.Context(), manifest.NamedResource{Group: manifest.FluxOperatorDomain, Kind: manifest.KindResourceSet, Name: "ghost"}, manifest.DrainNone)
+	defer unknown.Close()
+	if unknown.Outcome() == schedule.Blocked {
+		t.Fatalf("absent declaration has dependencies: %v", unknown.Blocked)
+	}
+}
+
+func TestReconcile_AlreadyReady_NoTransientPending(t *testing.T) {
+	t.Parallel()
+	c, s := newController(t)
+	rs := &manifest.ResourceSet{Name: "ready", Namespace: "apps", ResourcesTemplate: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: output}`}
+	s.AddObject(rs)
+	if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusReady {
+		t.Fatalf("first status = %+v, want Ready", info)
+	}
+	artifact := s.GetArtifact(rs.Named())
+	unsub := s.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
+		if id == rs.Named() && payload.(store.StatusInfo).Status == store.StatusPending {
+			t.Error("already-Ready ResourceSet transiently became Pending")
+		}
+	}, false)
+	t.Cleanup(unsub)
+	c.ReconcileNode(t.Context(), rs.Named(), manifest.DrainNone)
+	if info, _ := s.GetStatus(rs.Named()); info.Status != store.StatusReady {
+		t.Errorf("final status = %+v, want Ready", info)
+	}
+	if s.GetArtifact(rs.Named()) != artifact {
+		t.Error("no-op reconcile replaced artifact")
+	}
+}
+
+func TestReconcile_DisabledUsesSuspensionGate(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{fluxopv1.DisabledValue, "DISABLED"} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			c, s := newController(t)
+			doc := map[string]any{
+				"apiVersion": fluxopv1.GroupVersion.String(), "kind": manifest.KindResourceSet,
+				"metadata": map[string]any{"name": "disabled", "namespace": "default", "annotations": map[string]any{fluxopv1.ReconcileAnnotation: value}},
+				"spec":     map[string]any{"inputsFrom": []any{map[string]any{"name": "missing"}}, "resourcesTemplate": "<< inputs.missing >>"},
+			}
+			obj, _, _, err := manifest.ParseDoc(doc, manifest.ParseDocOptions{DefaultNamespace: ""})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.AddObject(obj)
+			blocked := c.ReconcileNode(t.Context(), obj.Named(), manifest.DrainNone).Blocked
+			if len(blocked) != 0 {
+				t.Fatalf("disabled ResourceSet blocked on %v", blocked)
+			}
+			info, _ := s.GetStatus(obj.Named())
+			if info.Outcome() != store.OutcomeSuspended || info.Message != "suspended" {
+				t.Fatalf("status = %+v, want Ready/suspended", info)
+			}
+			if art := s.GetArtifact(obj.Named()); art != nil {
+				t.Fatalf("disabled ResourceSet rendered: %v", art)
+			}
+		})
+	}
+}
+
+func TestReconcile_SuspensionAfterRefresh(t *testing.T) {
+	t.Parallel()
+	for _, suspended := range []bool{false, true} {
+		t.Run(fmt.Sprintf("suspended=%t", suspended), func(t *testing.T) {
+			t.Parallel()
+			st := store.New()
+			tasks := task.NewBounded(2)
+			c := New(st, tasks, true)
+			var deliveries atomic.Int64
+			c.Configure(base.Options{})
+			c.StartLifecycle()
+
+			parent := &manifest.Kustomization{Name: "parent", Namespace: "flux-system"}
+			st.AddObject(parent)
+			st.UpdateStatus(parent.Named(), store.StatusInfo{Status: store.StatusReady, Reason: "", Message: ""})
+			provider := staticRSIP("provider", "flux-system", nil, map[string]string{"user": "rs-refresh-output"})
+			st.AddObject(provider)
+			st.UpdateStatus(provider.Named(), store.StatusInfo{Status: store.StatusReady, Reason: "", Message: ""})
+			doc := map[string]any{
+				"apiVersion": fluxopv1.GroupVersion.String(), "kind": manifest.KindResourceSet,
+				"metadata": map[string]any{"name": "fleet", "namespace": "flux-system"},
+				"spec": map[string]any{
+					"inputsFrom":        []any{map[string]any{"kind": manifest.KindResourceSetInputProvider, "name": provider.Name}},
+					"resourcesTemplate": "apiVersion: example.com/v1\nkind: Widget\nmetadata: {name: stale-output}\n" + "---\n" + testutil.KustomizationYAML("rs-refresh-child", "", "  {path: ./child, sourceRef: {kind: GitRepository, name: flux-system}}\n"),
+				},
+			}
+			children, _ := publishDocuments(c, parent.Named(), []map[string]any{doc}, manifest.ParseDocOptions{WipeSecrets: false, DefaultNamespace: parent.Named().Namespace})
+			if len(children) != 1 {
+				t.Fatalf("initial publication: %v", children)
+			}
+			rs := children[0].Obj.(*manifest.ResourceSet)
+			original, _, _, err := manifest.ParseDoc(manifest.DeepCopyMap(doc), manifest.ParseDocOptions{DefaultNamespace: ""})
+			if err != nil {
+				t.Fatal(err)
+			}
+			st.UpdateStatus(rs.Named(), store.StatusInfo{Status: store.StatusPending, Reason: "", Message: ""})
+			replacement := manifest.DeepCopyMap(doc)
+			replacement["spec"].(map[string]any)["resourcesTemplate"] = "apiVersion: example.com/v1\nkind: Widget\nmetadata: {name: << inputs.user >>}\n" + "---\n" + testutil.KustomizationYAML("rs-refresh-child", "", "  {path: ./child, sourceRef: {kind: GitRepository, name: flux-system}}\n")
+			if suspended {
+				replacement["metadata"].(map[string]any)["annotations"] = map[string]any{fluxopv1.ReconcileAnnotation: fluxopv1.DisabledValue}
+			}
+			var observations atomic.Int64
+			var fired, published atomic.Bool
+			unsub := st.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
+				info, ok := payload.(store.StatusInfo)
+				if id != rs.Named() || !ok || info.Message != "resolving dependencies" {
+					return
+				}
+				observations.Add(1)
+				if fired.Swap(true) {
+					return
+				}
+				publishDocuments(c, parent.Named(), []map[string]any{replacement}, manifest.ParseDocOptions{WipeSecrets: false, DefaultNamespace: parent.Named().Namespace})
+				published.Store(true)
+			}, false)
+			t.Cleanup(unsub)
+			controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: tasks, Store: st, ID: rs.Named(), ReconcileNode: c.ReconcileNode})
+			if observations.Load() < 1 || !published.Load() || tasks.Failures() != 0 {
+				t.Fatalf("observations=%d published=%t panics=%d", observations.Load(), published.Load(), tasks.Failures())
+			}
+			fresh, ok := st.Get[*manifest.ResourceSet](rs.Named())
+			if !ok || fresh == rs || fresh.Suspend != suspended || fresh.ResourcesTemplate != replacement["spec"].(map[string]any)["resourcesTemplate"] {
+				t.Fatalf("canonical replacement = %+v", fresh)
+			}
+			if diff := cmp.Diff(original, rs); diff != "" {
+				t.Fatalf("original mutated (-want +got):\n%s", diff)
+			}
+			if owners := testutil.Owners(st.Productions(rs.Named(), nil)); !slices.Contains(owners, parent.Named()) {
+				t.Fatalf("missing independent contributor: %v", owners)
+			}
+			info, _ := st.GetStatus(rs.Named())
+			art, _ := st.GetArtifact(rs.Named()).(*store.Emission)
+			child := testutil.KustomizationID("flux-system", "rs-refresh-child")
+			if suspended {
+				if info.Outcome() != store.OutcomeSuspended || info.Message != "suspended" {
+					t.Errorf("status = %+v, want Ready/suspended", info)
+				}
+				_, _, inventory := st.GetEmission(rs.Named())
+				if art != nil || st.GetObject(child) != nil || deliveries.Load() != 0 || len(inventory.Children) != 0 {
+					t.Errorf("disabled replacement rendered: artifact=%+v child=%v raw deliveries=%d", art, st.GetObject(child), deliveries.Load())
+				}
+			} else if info.Status != store.StatusReady || !hasRenderedDoc(art, "Widget", "rs-refresh-output") || st.GetObject(child) == nil {
+				t.Fatalf("active replacement output: status=%+v artifact=%+v child=%v raw deliveries=%d", info, art, st.GetObject(child), deliveries.Load())
+			}
+		})
+	}
+}
+
+func TestReconcile_InputsFromPreservesAuthoredKind(t *testing.T) {
+	t.Parallel()
+	c, s := newController(t)
+	provider := staticRSIP("inputs", "apps", nil, map[string]string{"user": "alice"})
+	s.AddObject(provider)
+	obj, _, _, err := manifest.ParseDoc(map[string]any{
+		"apiVersion": "fluxcd.controlplane.io/v1", "kind": manifest.KindResourceSet,
+		"metadata": map[string]any{"name": "app", "namespace": "apps"},
+		"spec": map[string]any{
+			"inputsFrom":        []any{map[string]any{"kind": "Unsupported", "name": "inputs"}},
+			"resourcesTemplate": "apiVersion: example.com/v1\nkind: Widget\nmetadata: {name: << inputs.user >>, namespace: apps}\n",
+		},
+	}, manifest.ParseDocOptions{DefaultNamespace: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := obj.(*manifest.ResourceSet)
+	s.AddObject(rs)
+	want := manifest.NamedResource{Kind: "Unsupported", Namespace: "apps", Name: provider.Name}
+	if blocked := c.ReconcileNode(t.Context(), rs.Named(), manifest.DrainNone).Blocked; len(blocked) != 1 || blocked[0] != want {
+		t.Fatalf("blocked = %v, want [%s]", blocked, want)
+	}
+	if info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode}); info.Status != store.StatusFailed {
+		t.Fatalf("status = %+v, want Failed", info)
+	}
+	if art := s.GetArtifact(rs.Named()); art != nil {
+		t.Fatalf("unsupported input kind rendered: artifact = %+v", art)
+	}
+	if rs.InputsFrom[0].Kind != "Unsupported" {
+		t.Fatal("authored input kind mutated")
+	}
+}
+
+func TestReconcile_WarningsBeforeExit(t *testing.T) {
+	t.Parallel()
+	for _, hit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hit=%t", hit), func(t *testing.T) {
+			t.Parallel()
+			c, s := newController(t)
+			provider := &manifest.ResourceSetInputProvider{Name: "dynamic", Namespace: "apps", Type: fluxopv1.InputProviderGitHubBranch}
+			rs := &manifest.ResourceSet{Name: "reader", Namespace: "apps",
+				Inputs: []fluxopv1.ResourceSetInput{{"name": {Raw: []byte(`"inline"`)}}}, InputsFrom: []fluxopv1.InputProviderReference{{Name: provider.Name}},
+				ResourcesTemplate: "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: output}\n"}
+			if !hit {
+				rs.ResourcesTemplate = "<< invalid template"
+			}
+			s.AddObjects([]manifest.BaseManifest{rs, provider})
+			s.UpdateStatus(provider.Named(), store.StatusInfo{Status: store.StatusReady, Reason: "", Message: ""})
+			if hit {
+				_, _, err := resourceset.Render(rs, resourceset.StoreResolver(s), func(content any) (bool, error) {
+					s.SetArtifact(rs.Named(), &store.Emission{Fingerprint: manifest.Fingerprint(content), Complete: true})
+					return true, nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			info := controllertest.DispatchToFixpoint(t.Context(), t, controllertest.Dispatch{Tasks: c.Tasks, Store: s, ID: rs.Named(), ReconcileNode: c.ReconcileNode})
+			if (info.Status == store.StatusReady) != hit {
+				t.Fatalf("reconcile status = %+v, hit=%t", info, hit)
+			}
+			warnings := s.Warnings()
+			if len(warnings) != 1 || warnings[0].Category != manifest.WarnOfflineInputProvider || warnings[0].Resource != rs.Named() || warnings[0].Count != 1 {
+				t.Fatalf("early return lost warnings: %+v", warnings)
+			}
+		})
 	}
 }

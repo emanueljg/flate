@@ -2,11 +2,64 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
+
+func BenchmarkListenerFire_ChangedWrite(b *testing.B) {
+	for _, listeners := range []int{0, 1, 50} {
+		b.Run(fmt.Sprintf("listeners=%d", listeners), func(b *testing.B) {
+			s := New()
+			for range listeners {
+				s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) {}, false)
+			}
+			objects := [2]*manifest.RawObject{
+				{APIVersion: "v1", Kind: "ConfigMap", Name: "app", Spec: map[string]any{"data": "first"}},
+				{APIVersion: "v1", Kind: "ConfigMap", Name: "app", Spec: map[string]any{"data": "second"}},
+			}
+			var i int
+			for b.Loop() {
+				s.AddObject(objects[i%len(objects)])
+				i++
+			}
+		})
+	}
+}
+
+func BenchmarkAddRendered(b *testing.B) {
+	for _, listeners := range []bool{false, true} {
+		b.Run(fmt.Sprintf("listeners=%t", listeners), func(b *testing.B) {
+			for _, distinct := range []bool{false, true} {
+				b.Run(fmt.Sprintf("distinct=%t", distinct), func(b *testing.B) {
+					s := New()
+					if listeners {
+						s.AddListener(EventObjectAdded, func(manifest.NamedResource, any) {}, false)
+					}
+					obj := &manifest.RawObject{
+						APIVersion: "apps/v1", Kind: "Deployment", Name: "app", Namespace: "ns",
+						Spec: map[string]any{"replicas": 2, "template": map[string]any{
+							"spec": map[string]any{"containers": []any{map[string]any{
+								"name": "app", "image": "example/app:1.0",
+							}}},
+						}},
+					}
+					s.AddObject(obj)
+					twin := obj
+					if distinct {
+						twin = obj.Clone()
+					}
+					b.ReportAllocs()
+					for b.Loop() {
+						s.AddObject(twin)
+					}
+				})
+			}
+		})
+	}
+}
 
 // BenchmarkAddObject_Contended exercises the hot path with a single
 // Kind under writer contention — measures the within-shard cost
@@ -14,7 +67,7 @@ import (
 // shard) so a regression in the dedup / setLocked / fireUnderLock
 // chain shows up clean.
 func BenchmarkAddObject_Contended(b *testing.B) {
-	for _, p := range []int{1, 4, 8, 16} {
+	for _, p := range []int{1, 4, 16} {
 		b.Run(fmt.Sprintf("parallel=%d", p), func(b *testing.B) {
 			s := New()
 			b.SetParallelism(p)
@@ -70,5 +123,41 @@ func BenchmarkAddObject_MixedKinds(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkGetObject_LongNames(b *testing.B) {
+	s := New()
+	obj := &manifest.Kustomization{
+		Namespace: strings.Repeat("n", 31),
+		Name:      strings.Repeat("a", 31),
+	}
+	s.AddObject(obj)
+	id := obj.Named()
+	b.ReportAllocs()
+	for b.Loop() {
+		s.GetObject(id)
+	}
+}
+
+func BenchmarkRecordEmitted_Replacement1000(b *testing.B) {
+	s := New()
+	parent := &manifest.Kustomization{Name: "parent", Namespace: "ns"}
+	s.AddObject(parent)
+	var versions [2][]Child
+	for side := range versions {
+		for i := range 1000 {
+			versions[side] = append(versions[side], Child{Obj: &manifest.ConfigMap{Name: fmt.Sprintf("child-%d-%04d", side, i), Namespace: "ns", Data: map[string]any{"key": "value"}}})
+		}
+	}
+	i := 0
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _, next := s.GetEmission(parent.Named())
+		next.Children = versions[i%2]
+		next.Complete = true
+		s.RecordEmitted(parent.Named(), &next, nil)
+		next.Finish()
+		i++
 	}
 }

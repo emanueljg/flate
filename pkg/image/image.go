@@ -1,23 +1,12 @@
-// Package image discovers container images inside rendered Kubernetes
-// manifests by parsing string values, not by hard-coding a table of
-// kinds and field names.
-//
-// Every string value reachable in a manifest tree is fed through
-// distribution/reference — the canonical OCI image reference parser
-// used by Docker, containerd, and Kubernetes. A string is recognised
-// as an image when it parses as a named reference AND carries either
-// a tag or a digest, which excludes plain hostnames, paths, and
-// version-only strings like "v1.2.3".
-//
-// Because detection is purely value-based, new CRDs that embed image
-// references are picked up automatically — no per-kind override list
-// to maintain.
+// Package image discovers tagged or digested named references in rendered
+// Kubernetes manifests using distribution/reference. Discovery is advisory:
+// strings in arbitrary fields and unknown kinds are included when they parse,
+// so unrelated values such as "count:up0" may appear in image reports.
 package image
 
 import (
 	"maps"
 	"slices"
-	"strings"
 
 	"github.com/distribution/reference"
 )
@@ -30,36 +19,6 @@ func Extract(doc map[string]any) []string {
 		return nil
 	}
 	return slices.Sorted(maps.Keys(set))
-}
-
-// Split separates an OCI image reference into its repository name and
-// its version — the tag, or the digest when one is present (a digest is
-// more specific, so it wins when a reference carries both). The name is
-// returned verbatim, NOT normalized: "nginx:1" splits to ("nginx", "1"),
-// not ("docker.io/library/nginx", …). Intended for references Extract
-// returned; a value that doesn't parse as a reference yields (ref, "").
-//
-// Pairs with Extract for per-repository version diffing — detecting that
-// ghcr.io/home-operations/sonarr moved from v4.0.0 to v4.1.0 — so a
-// consumer doesn't hand-roll a string split that mishandles a registry
-// port (host:5000/img) or a tag+digest reference.
-func Split(ref string) (name, version string) {
-	parsed, err := reference.Parse(ref)
-	if err != nil {
-		return ref, ""
-	}
-	named, ok := parsed.(reference.Named)
-	if !ok {
-		return ref, ""
-	}
-	name = named.Name()
-	if d, ok := parsed.(reference.Digested); ok {
-		return name, d.Digest().String()
-	}
-	if t, ok := parsed.(reference.Tagged); ok {
-		return name, t.Tag()
-	}
-	return name, ""
 }
 
 func walk(v any, set map[string]struct{}) {
@@ -79,36 +38,7 @@ func walk(v any, set map[string]struct{}) {
 	}
 }
 
-// isImageRef reports whether s looks like a tagged or digested OCI image
-// reference. distribution/reference is permissive — many non-image strings
-// ("count:up0", "system:auth-delegator", "localhost:11220") parse cleanly as
-// `name:tag` — so we apply cheap heuristics first to weed out common false
-// positives.
 func isImageRef(s string) bool {
-	if len(s) < 5 {
-		return false
-	}
-	if strings.Contains(s, "://") || strings.HasPrefix(s, "/") {
-		return false // URLs / filesystem paths
-	}
-	if !strings.ContainsAny(s, ":@") {
-		return false // images always carry a tag or digest
-	}
-	if strings.Contains(s, "${") {
-		return false // unsubstituted postBuild placeholder
-	}
-	// Every real image reference contains a `/` somewhere — either
-	// separating the registry from the repository (`ghcr.io/foo:v1`)
-	// or separating the registry:port from the path
-	// (`localhost:5000/foo:v1`). Bare-name references like
-	// `nginx:latest` aren't seen in production GitOps manifests, and
-	// requiring `/` rules out PromQL recording rules
-	// ("apiserver_request:burnrate1d"), RBAC role bindings
-	// ("system:auth-delegator"), and hostname-port pairs
-	// ("localhost:11220") in one shot.
-	if !strings.Contains(s, "/") {
-		return false
-	}
 	ref, err := reference.ParseNormalizedNamed(s)
 	if err != nil {
 		return false

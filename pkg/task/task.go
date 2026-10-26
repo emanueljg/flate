@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const slowTaskThreshold = time.Second
+
 // Service tracks active goroutines.
 type Service struct {
 	wgActive sync.WaitGroup
@@ -57,14 +59,14 @@ func (s *Service) Go(ctx context.Context, name string, fn func(context.Context))
 		started := time.Now()
 		defer s.wgActive.Done()
 		defer func() {
-			if d := time.Since(started); d > time.Second {
-				slog.Debug("task complete", "name", name, "duration", d)
+			if d := time.Since(started); d > slowTaskThreshold {
+				slog.Debug("task: complete", "name", name, "duration", d)
 			}
 		}()
 		defer func() {
 			if r := recover(); r != nil {
 				s.failures.Add(1)
-				slog.Error("task panicked", "name", name, "panic", r)
+				slog.Error("task: panicked", "name", name, "panic", r)
 			}
 		}()
 		if s.sem != nil {
@@ -97,25 +99,16 @@ func (s *Service) Go(ctx context.Context, name string, fn func(context.Context))
 // On an unbounded Service (NewBounded(<=0)), fn runs unchanged.
 func (s *Service) YieldSlot(fn func()) {
 	if s.sem != nil {
-		defer s.releaseSlot()()
+		<-s.sem
+		defer func() { s.sem <- struct{}{} }()
 	}
 	fn()
-}
-
-// releaseSlot drops the calling goroutine's worker slot and returns a
-// closure that re-acquires one. Callers defer the returned closure so a
-// panic in the released gap still restores the slot count; otherwise
-// Service.Go's outer `defer <-s.sem` drains a phantom slot on unwind,
-// eventually hanging a goroutine that legitimately owns a slot. Only
-// valid on a bounded Service (s.sem != nil).
-func (s *Service) releaseSlot() func() {
-	<-s.sem
-	return func() { s.sem <- struct{}{} }
 }
 
 // Failures returns the number of panicked tasks observed.
 func (s *Service) Failures() int64 { return s.failures.Load() }
 
-// BlockTillDone waits until every active task has finished. Safe to
-// call concurrently with Go.
+// BlockTillDone waits until every active task has finished.
+// When idle, initial Go submissions MUST precede waiting. Tasks may submit more
+// work while active; a new phase MUST begin only after prior waits return.
 func (s *Service) BlockTillDone() { s.wgActive.Wait() }

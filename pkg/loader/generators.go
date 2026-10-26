@@ -1,101 +1,90 @@
 package loader
 
 import (
-	"cmp"
+	"context"
 	"encoding/base64"
-	"strings"
+	"fmt"
+	"io/fs"
+	"path/filepath"
 
+	"sigs.k8s.io/kustomize/api/ifc"
+	"sigs.k8s.io/kustomize/api/kv"
+	"sigs.k8s.io/kustomize/api/provider"
+	"sigs.k8s.io/kustomize/api/types"
+
+	"github.com/home-operations/flate/internal/kustomizeinput"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/tree"
 )
 
-// generatorRecord captures one configMapGenerator or secretGenerator
-// entry found in a kustomization.yaml during discovery, plus enough
-// context to resolve the effective namespace post-walk (kustomize
-// inherits namespace from the calling Flux Kustomization when neither
-// the generator nor the surrounding kustomization.yaml sets one).
-//
-// Tracking these records lets flate's depwait resolve dependencies
-// like `substituteFrom: [ConfigMap/<ns>/cluster-settings]` even when
-// the CM is produced by a configMapGenerator inside a Component —
-// the CM has no on-disk YAML, so the file-walker would otherwise
-// miss it.
 type generatorRecord struct {
-	// file is the absolute path to the kustomization.yaml that
-	// declared the generator. Used by the post-walk finalizer to
-	// look up the enclosing Flux Kustomization via KSPathPrefixes.
-	file string
-	// kustomizationNS is the kustomization.yaml's own `namespace:`
-	// field. Empty means "inherit from the enclosing Flux KS."
-	kustomizationNS string
-	// entryNS is the generator entry's own `namespace:`. Overrides
-	// kustomizationNS when set.
-	entryNS string
-
+	reader      documentReader
+	root        string
+	file        string
+	owner       manifest.NamedResource
+	namespace   string
 	isConfigMap bool
-	name        string
-	literals    []string
+	args        types.GeneratorArgs
 }
 
-// collectGeneratorRecords harvests every configMapGenerator and
-// secretGenerator declaration in k. Files/Envs entries are NOT
-// materialized (kustomize parses those at render time against the
-// caller's file system); literals are enough to make depwait happy
-// for the common cluster-settings pattern.
-func collectGeneratorRecords(k *kustomization, file string) []generatorRecord {
-	if k == nil {
-		return nil
-	}
-	out := make([]generatorRecord, 0, len(k.ConfigMapGenerator)+len(k.SecretGenerator))
-	collect := func(entries []kvPairGenerator, isConfigMap bool) {
-		for _, g := range entries {
-			if g.Name == "" {
-				continue
+var errRemoteInputs = fmt.Errorf("%w: remote generator input requires HTTPInputs", manifest.ErrInput)
+
+func (r generatorRecord) materialize(ctx context.Context, opts Options) (manifest.BaseManifest, error) {
+	var ldr ifc.Loader
+	if len(r.args.EnvSources)+len(r.args.FileSources) != 0 {
+		input, name := r.reader.input(r.root)
+		input, err := fs.Sub(input, name)
+		if err != nil {
+			return nil, fmt.Errorf("%w: generator fs %s: %w", manifest.ErrInput, r.root, err)
+		}
+		confined := tree.NewBuilder(input)
+		root, dir := r.root, filepath.Dir(r.file)
+		ldr = generatorFileLoader{load: func(file string) ([]byte, error) {
+			if _, _, ok := kustomizeinput.CutHTTPScheme(file); ok {
+				if opts.RemoteInputs == nil {
+					return nil, errRemoteInputs
+				}
+				acquired, err := opts.RemoteInputs.Acquire(ctx, file, opts.RemoteRetry, nil)
+				if err != nil {
+					return nil, err
+				}
+				return fs.ReadFile(acquired, "content")
 			}
-			out = append(out, generatorRecord{
-				file: file, kustomizationNS: k.Namespace, entryNS: g.Namespace,
-				isConfigMap: isConfigMap, name: g.Name, literals: g.Literals,
-			})
-		}
+			if !filepath.IsAbs(file) {
+				file = filepath.Join(dir, file)
+			}
+			name, err := filepath.Rel(root, file)
+			if err != nil {
+				return nil, err
+			}
+			return fs.ReadFile(confined, filepath.ToSlash(name))
+		}}
 	}
-	collect(k.ConfigMapGenerator, true)
-	collect(k.SecretGenerator, false)
-	return out
-}
-
-// materialize builds the synthesized manifest from r. parentNS is the
-// namespace inherited from the enclosing Flux Kustomization; the
-// caller looks it up via KSPathPrefixes against r.file. Precedence
-// matches kustomize: entry.namespace > kustomization.namespace >
-// parent (Flux KS) namespace.
-//
-// Data fidelity: literals are split on the first `=` per kustomize's
-// own KvSources conventions. Secrets land in Data (base64-encoded)
-// to match what a real k8s Secret carries; ConfigMaps land in Data
-// as strings.
-func (r generatorRecord) materialize(parentNS string) manifest.BaseManifest {
-	// kustomize precedence: entry.namespace > kustomization.namespace > parent namespace.
-	ns := cmp.Or(r.entryNS, r.kustomizationNS, parentNS)
+	pairs, err := kv.NewLoader(ldr, provider.NewDefaultDepProvider().GetFieldValidator()).Load(r.args.KvPairSources)
+	if err != nil {
+		return nil, fmt.Errorf("%w: generator %s in %s: %w", manifest.ErrInput, r.args.Name, r.file, err)
+	}
+	data := make(map[string]any, len(pairs))
+	for _, pair := range pairs {
+		value := pair.Value
+		if opts.WipeSecrets {
+			value = manifest.WipeValue(pair.Key, value, nil, false)
+		}
+		if !r.isConfigMap {
+			value = base64.StdEncoding.EncodeToString([]byte(value))
+		}
+		data[pair.Key] = value
+	}
 	if r.isConfigMap {
-		// ConfigMap data keeps the literal value as-is.
-		return &manifest.ConfigMap{Name: r.name, Namespace: ns, Data: r.literalData(func(v string) any { return v })}
+		return &manifest.ConfigMap{Name: r.args.Name, Namespace: r.namespace, Data: data}, nil
 	}
-	// Secret data is base64-encoded to match what a real k8s Secret carries.
-	return &manifest.Secret{Name: r.name, Namespace: ns, Data: r.literalData(func(v string) any {
-		return base64.StdEncoding.EncodeToString([]byte(v))
-	})}
+	return &manifest.Secret{Name: r.args.Name, Namespace: r.namespace, Data: data}, nil
 }
 
-// literalData splits each `key=value` literal into a data map, passing every
-// value through encode before it lands in the map. Literals without an `=`
-// are skipped, per kustomize's KvSources conventions.
-func (r generatorRecord) literalData(encode func(string) any) map[string]any {
-	data := make(map[string]any, len(r.literals))
-	for _, lit := range r.literals {
-		k, v, ok := strings.Cut(lit, "=")
-		if !ok {
-			continue
-		}
-		data[k] = encode(v)
-	}
-	return data
+// KV loading is synchronous; the adapter binds only the current materialization.
+type generatorFileLoader struct {
+	ifc.Loader
+	load func(string) ([]byte, error)
 }
+
+func (l generatorFileLoader) Load(file string) ([]byte, error) { return l.load(file) }

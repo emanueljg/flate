@@ -1,0 +1,8 @@
+---
+- id: flate
+  name: Check flux resources with flate
+  description: Check flux resources with flate (https://github.com/home-operations/flate)
+  stages: [pre-commit]
+  language: golang
+  entry: flate test all
+  pass_filenames: false

@@ -1,31 +1,162 @@
 package change
 
 import (
-	"bytes"
+	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
+	"fmt"
+	"hash"
 	"io"
 	"io/fs"
-	"log/slog"
 	"maps"
-	"os"
-	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/home-operations/flate/pkg/loader"
+	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/source/sourceignore"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-// Set is the immutable result of Detect — the set of file paths
-// (relative to the scan roots) whose contents differ.
+// Set carries immutable bootstrap-path changes and qualified source evidence.
+// Completed sets are immutable and safe to share; CollectInputs is construction-only.
 type Set struct {
-	paths map[string]struct{}
+	oneSided [2]map[string]struct{}
+	origins  [2]*store.SourceArtifact
+	inputs   map[manifest.NamedResource]string
+	paths    map[string]struct{}
+	sources  map[manifest.NamedResource]sourceDelta
+	groups   []sourceGroup
 }
 
-// NewSet constructs a Set from an iterable of relative paths.
+type sourceDelta struct {
+	changes      *Set
+	artifacts    [2]*store.SourceArtifact
+	declarations [2]manifest.BaseManifest
+}
+
+type sourceGroup struct {
+	changes *Set
+	refs    []manifest.NamedResource
+}
+
+// Qualify compares available admitted source pairs before reconciliation.
+// Supplied changes retain their bootstrap coordinates and are never mutated.
+func Qualify(ctx context.Context, changes *Set, before, after *store.Store) (*Set, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stores := [2]*store.Store{before, after}
+	ids := map[manifest.NamedResource]struct{}{manifest.BootstrapSourceID: {}}
+	for _, st := range stores {
+		for _, obj := range st.Objects() {
+			if _, ok := st.GetArtifact(obj.Named()).(*store.SourceArtifact); ok {
+				ids[obj.Named()] = struct{}{}
+			}
+		}
+	}
+	out := &Set{sources: make(map[manifest.NamedResource]sourceDelta, len(ids))}
+	type readerPair struct {
+		before, after any
+		exclusions    [2]string
+	}
+	compared := map[readerPair]*Set{}
+	for _, id := range slices.SortedFunc(maps.Keys(ids), manifest.NamedResource.Compare) {
+		evidence := sourceDelta{}
+		for i, st := range stores {
+			evidence.artifacts[i], _ = st.GetArtifact(id).(*store.SourceArtifact)
+			evidence.declarations[i] = st.GetObject(id)
+		}
+		a, b := evidence.artifacts[0], evidence.artifacts[1]
+		if a == nil || b == nil || a.FS == nil || b.FS == nil {
+			if id == manifest.BootstrapSourceID && changes == nil {
+				return nil, fmt.Errorf("%w: both admitted inputs required", manifest.ErrInput)
+			}
+			continue
+		}
+		delta := changes
+		if id != manifest.BootstrapSourceID || delta == nil {
+			pair := readerPair{before: a, after: b}
+			for i, input := range evidence.artifacts {
+				exclusion, err := filepath.Rel(input.LocalPath, evidence.artifacts[1-i].LocalPath)
+				exclusion = filepath.ToSlash(exclusion)
+				if err == nil && fs.ValidPath(exclusion) && exclusion != "." {
+					pair.exclusions[i] = exclusion
+				}
+			}
+			if reflect.ValueOf(a.FS).Comparable() && reflect.ValueOf(b.FS).Comparable() {
+				pair.before, pair.after = a.FS, b.FS
+			}
+			delta = compared[pair]
+			if delta == nil {
+				selected := id != manifest.BootstrapSourceID
+				equal := selected && a.Key != "" && a.Key == b.Key && a.Revision == b.Revision && a.Digest == b.Digest
+				if selected && !equal && a.ContentFingerprint != nil && b.ContentFingerprint != nil {
+					var fingerprints [2]string
+					for i, input := range evidence.artifacts {
+						var err error
+						fingerprints[i], err = input.ContentFingerprint(ctx, input.FS)
+						if err != nil {
+							if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+								return nil, err
+							}
+							return nil, fmt.Errorf("%w: fingerprint source %s: %w", manifest.ErrInput, id, err)
+						}
+					}
+					equal = fingerprints[0] != "" && fingerprints[0] == fingerprints[1]
+				}
+				if equal {
+					delta = &Set{}
+				} else {
+					var err error
+					delta, err = Detect(ctx, a, b)
+					if err != nil {
+						return nil, fmt.Errorf("compare source %s: %w", id, err)
+					}
+				}
+				compared[pair] = delta
+			}
+		}
+		evidence.changes = delta
+		out.sources[id] = evidence
+		if id == manifest.BootstrapSourceID {
+			out.paths, out.inputs, out.origins, out.oneSided = delta.paths, delta.inputs, evidence.artifacts, delta.oneSided
+		}
+	}
+	if out.paths == nil && changes != nil {
+		out.paths = changes.paths
+	}
+	out.groupSources()
+	return out, nil
+}
+
+func (s *Set) groupSources() {
+	s.groups = nil
+	groups := make(map[*Set]int)
+	add := func(ref manifest.NamedResource, changes *Set) {
+		i, known := groups[changes]
+		if !known {
+			i = len(s.groups)
+			groups[changes] = i
+			s.groups = append(s.groups, sourceGroup{changes: changes})
+		}
+		s.groups[i].refs = append(s.groups[i].refs, ref)
+	}
+	if _, known := s.sources[manifest.BootstrapSourceID]; !known {
+		add(manifest.BootstrapSourceID, s)
+	}
+	for _, ref := range slices.SortedFunc(maps.Keys(s.sources), manifest.NamedResource.Compare) {
+		add(ref, s.sources[ref].changes)
+	}
+}
+
+// NewSet constructs a path-only Set without Detect's one-sided input identities.
 func NewSet(paths []string) *Set {
 	out := &Set{paths: make(map[string]struct{}, len(paths))}
 	for _, p := range paths {
@@ -61,355 +192,362 @@ func (s *Set) Contains(rel string) bool {
 	return ok
 }
 
-// Reroot returns a copy of s with prefix prepended to every entry —
-// used to lift a change set produced from a subdir-relative diff up
-// into the repo-relative coordinate system that SourceFiles uses.
-func (s *Set) Reroot(prefix string) *Set {
-	if s == nil {
-		return nil
+// Detect compares admitted filesystems under each side's Flux ignore policy.
+func Detect(ctx context.Context, before, after *store.SourceArtifact) (*Set, error) {
+	if before == nil || after == nil || before.FS == nil || after.FS == nil {
+		return nil, fmt.Errorf("%w: both admitted inputs required", manifest.ErrInput)
 	}
-	prefix = strings.TrimSuffix(filepath.ToSlash(prefix), "/")
-	if prefix == "" || prefix == "." {
-		return s
-	}
-	out := &Set{paths: make(map[string]struct{}, len(s.paths))}
-	for p := range s.paths {
-		out.paths[prefix+"/"+p] = struct{}{}
-	}
-	return out
-}
-
-// Detect returns the set of repo-relative file paths that differ
-// between before and after.
-//
-// Fast path: when git is on $PATH, `git diff --no-index --name-status
-// -z` does the comparison in C. For a 50k-file tree with one changed
-// file, this finishes in ~10–50ms vs ~200ms–3s for the Go walker —
-// because git's tree-walk + content-compare is implemented in C and
-// uses index-style optimizations the Go walker can't match. The Go
-// path remains as a fallback for: (a) systems without git installed,
-// (b) git invocations that fail with an unexpected exit code, and
-// (c) paths where git refuses to operate.
-//
-// Slow path: walks before and after concurrently, then hashes every
-// same-sized file pair. The previous (size, mtime) fast-path was
-// removed — on coarse-granularity filesystems (HFS+ 1s, fresh `git
-// checkout` clock-stamping) two distinct same-sized files written in
-// the same second produce indistinguishable mtimes, so trusting them
-// as identical silently dropped real changes. Always hashing is the
-// only correctness-preserving option on the fallback path; the git
-// path doesn't need it because content comparison is intrinsic to
-// git's diff machinery.
-//
-// Directories whose name begins with "." (e.g. .git, .flate-cache)
-// and well-known noise dirs (node_modules, vendor) are skipped on
-// both paths.
-func Detect(before, after string) (*Set, error) {
-	if before == "" || after == "" {
-		return nil, errors.New("change.Detect: both paths required")
-	}
-
-	set, err := detectViaGit(before, after)
-	if err == nil {
-		return set, nil
-	}
-	// Distinguish "git not on PATH" (expected on minimal CI
-	// containers) from "git failed unexpectedly" (worth a log so
-	// operators can investigate). LookPath returns
-	// *exec.Error{Err: ErrNotFound}; everything else is a real
-	// fault on the git path that callers might want to know about.
-	if lookErr, ok := errors.AsType[*exec.Error](err); !ok || !errors.Is(lookErr.Err, exec.ErrNotFound) {
-		slog.Debug("change.Detect: git path failed, falling back to Go walker", "err", err)
-	}
-	return detectViaWalker(before, after)
-}
-
-// detectViaGit runs `git diff --no-index --name-status -z` between
-// the two paths and parses the NUL-separated output. Each entry is a
-// (status, path) pair: status is one byte (A/D/M/T...), path is the
-// absolute path on whichever side reported the change. Strip the
-// before/after prefix to get the repo-relative path; filter out paths
-// inside skip-dirs the Go walker would have skipped (.git/, etc.).
-//
-// Returns an error if git is not installed, if the diff command
-// errors out unexpectedly, or if the output is malformed. Callers
-// fall back to the Go walker on any error.
-func detectViaGit(before, after string) (*Set, error) {
-	if _, err := exec.LookPath("git"); err != nil {
-		return nil, err
-	}
-	absBefore, err := filepath.Abs(before)
-	if err != nil {
-		return nil, err
-	}
-	absAfter, err := filepath.Abs(after)
-	if err != nil {
-		return nil, err
-	}
-	// G204: git is a fixed binary on $PATH (we just LookPath'd it);
-	// absBefore and absAfter are caller-controlled directory paths
-	// the orchestrator passes from validated --path / --path-orig
-	// flags. The "--" separator before them disambiguates against
-	// any path starting with `-`.
-	cmd := exec.Command("git", "diff", "--no-index", "--name-status", //nolint:gosec // see comment above
-		"-z", "--no-renames", "--", absBefore, absAfter)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if runErr := cmd.Run(); runErr != nil {
-		// Exit 1 = differences found (expected); other exits = real
-		// failure (e.g. one path doesn't exist, missing-newline
-		// complaints, etc.).
-		if ee, ok := errors.AsType[*exec.ExitError](runErr); !ok || ee.ExitCode() != 1 {
-			return nil, runErr
+	var digests [2]map[string]string
+	for i, input := range [2]*store.SourceArtifact{before, after} {
+		if source, ok := input.FS.(*gittree.FS); ok {
+			digests[i] = source.FileDigests()
 		}
 	}
-
-	beforePrefix := filepath.ToSlash(absBefore) + "/"
-	afterPrefix := filepath.ToSlash(absAfter) + "/"
-	paths := make(map[string]struct{})
-
-	// Output format with --name-status -z (and --no-renames): NUL-separated
-	// (status, path) pairs. Walk with IndexByte to avoid the full subslice
-	// allocation that bytes.Split would produce for large diffs.
-	data := stdout.Bytes()
-	for len(data) > 0 {
-		// Consume status field.
-		i := bytes.IndexByte(data, 0)
-		if i < 0 {
-			break
-		}
-		status := data[:i]
-		data = data[i+1:]
-		// Consume path field.
-		j := bytes.IndexByte(data, 0)
-		if j < 0 {
-			break
-		}
-		rawPath := data[:j]
-		data = data[j+1:]
-		if len(status) == 0 || len(rawPath) == 0 {
-			continue
-		}
-		p := filepath.ToSlash(string(rawPath))
-		rel, ok := strings.CutPrefix(p, beforePrefix)
-		if !ok {
-			rel, ok = strings.CutPrefix(p, afterPrefix)
-		}
-		if !ok {
-			// Unexpected path shape — skip rather than mis-attribute.
-			// Defensive only: git always reports paths under the input
-			// directories we passed.
-			continue
-		}
-		if isFilteredPath(rel) {
-			continue
-		}
-		paths[rel] = struct{}{}
+	if digests[0] == nil || digests[1] == nil {
+		digests = [2]map[string]string{}
 	}
-	return &Set{paths: paths}, nil
-}
-
-// isFilteredPath reports whether any path segment matches the
-// skip-dir rules (mirrors the directory-pruning the Go walker does
-// inline). git diff doesn't honor .gitignore on --no-index mode and
-// happily reports .git/ internals, so we post-filter to keep the
-// fast and slow paths producing identical results.
-func isFilteredPath(rel string) bool {
-	for segment := range strings.SplitSeq(rel, "/") {
-		if shouldSkipDir(segment) {
-			return true
-		}
-	}
-	return false
-}
-
-// detectViaWalker is the git-less fallback: walk both trees,
-// content-hash every same-sized file pair. Slower than the git path
-// but doesn't depend on an external binary, and is the only correct
-// option for environments where git isn't available.
-func detectViaWalker(before, after string) (*Set, error) {
-	var (
-		eg       errgroup.Group
-		beforeFS map[string]fileMeta
-		afterFS  map[string]fileMeta
-	)
+	var bef, aft map[string]fileMeta
+	eg, scanCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		tree, err := scanTree(before)
-		beforeFS = tree
+		var err error
+		bef, err = scanTree(scanCtx, before, after, digests[0])
 		return err
 	})
 	eg.Go(func() error {
-		tree, err := scanTree(after)
-		afterFS = tree
+		var err error
+		aft, err = scanTree(scanCtx, after, before, digests[1])
 		return err
 	})
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
-
-	paths := make(map[string]struct{}, len(afterFS)/8)
+	paths := make(map[string]struct{}, len(aft)/8)
 	type hashJob struct {
-		rel                 string
-		beforeAbs, afterAbs string
-		// symlink applies to both sides: a job is only queued when the
-		// before/after entry kinds agree (a type swap is handled above).
-		symlink bool
+		name    string
+		changed bool
 	}
-	var hashJobs []hashJob
-
-	for rel, aft := range afterFS {
-		bef, ok := beforeFS[rel]
-		if !ok {
-			paths[rel] = struct{}{}
+	var jobs []hashJob
+	var oneSided []string
+	for name, right := range aft {
+		left, ok := bef[name]
+		if !ok || left.size != right.size || digests[0] != nil && digests[0][name] != digests[1][name] {
+			paths[name] = struct{}{}
+			if !ok {
+				oneSided = append(oneSided, name)
+			}
 			continue
 		}
-		// A type swap (regular ↔ symlink) is a content change in git's
-		// --no-index view; flag it without bothering to hash.
-		if bef.symlink != aft.symlink {
-			paths[rel] = struct{}{}
-			continue
+		if digests[0] == nil {
+			jobs = append(jobs, hashJob{name: name})
 		}
-		if bef.size != aft.size {
-			paths[rel] = struct{}{}
-			continue
+	}
+	for name := range bef {
+		if _, ok := aft[name]; !ok {
+			paths[name] = struct{}{}
+			oneSided = append(oneSided, name)
 		}
-		// Same size, unknown mtime trustworthiness — hash both sides.
-		// The pre-removal mtime fast-path silently dropped real edits
-		// on coarse-mtime filesystems; correctness over speed here.
-		hashJobs = append(hashJobs, hashJob{
-			rel: rel, beforeAbs: bef.abs, afterAbs: aft.abs,
-			symlink: aft.symlink,
+	}
+	hg, hashCtx := errgroup.WithContext(ctx)
+	const hashWorkers = 8
+	for worker := range min(hashWorkers, len(jobs)) {
+		hg.Go(func() error {
+			for i := worker; i < len(jobs); i += hashWorkers {
+				if err := hashCtx.Err(); err != nil {
+					return err
+				}
+				job := &jobs[i]
+				b, err := hashFile(hashCtx, before.FS, job.name)
+				if err != nil {
+					return err
+				}
+				a, err := hashFile(hashCtx, after.FS, job.name)
+				if err != nil {
+					return err
+				}
+				job.changed = a != b
+			}
+			return nil
 		})
 	}
-	for rel := range beforeFS {
-		if _, ok := afterFS[rel]; !ok {
-			paths[rel] = struct{}{}
+	if err := hg.Wait(); err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		if job.changed {
+			paths[job.name] = struct{}{}
 		}
 	}
-
-	if len(hashJobs) > 0 {
-		var mu sync.Mutex
-		var hg errgroup.Group
-		const hashWorkers = 8
-		jobs := make(chan hashJob, len(hashJobs))
-		for range hashWorkers {
-			hg.Go(func() error {
-				for j := range jobs {
-					b, err := hashEntry(j.beforeAbs, j.symlink)
-					if err != nil {
-						return err
-					}
-					a, err := hashEntry(j.afterAbs, j.symlink)
-					if err != nil {
-						return err
-					}
-					if a != b {
-						mu.Lock()
-						paths[j.rel] = struct{}{}
-						mu.Unlock()
-					}
-				}
-				return nil
-			})
+	out := &Set{paths: paths, origins: [2]*store.SourceArtifact{before, after}}
+	slices.Sort(oneSided)
+	for _, name := range oneSided {
+		_, onAfter := aft[name]
+		input := before.FS
+		if onAfter {
+			input = after.FS
 		}
-		for _, j := range hashJobs {
-			jobs <- j
-		}
-		close(jobs)
-		if err := hg.Wait(); err != nil {
+		if err := out.CollectInputs(ctx, input, name, !onAfter); err != nil {
 			return nil, err
 		}
 	}
-
-	return &Set{paths: paths}, nil
-}
-
-// fileMeta is the per-entry metadata scanTree collects. symlink is
-// true when the entry is a symbolic link rather than a regular file —
-// git's --no-index diff treats symlinks as files whose "content" is
-// the link target text and reports type-swaps (symlink↔regular) as
-// content changes, so the walker mirrors that.
-type fileMeta struct {
-	size    int64
-	abs     string
-	symlink bool
-}
-
-// scanTree walks root collecting per-file metadata. Prunes skip-dirs
-// (via shouldSkipDir) and records symlinks alongside regular files so
-// the diff matches git's --no-index view.
-func scanTree(root string) (map[string]fileMeta, error) {
-	out := map[string]fileMeta{}
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if p != root && shouldSkipDir(d.Name()) {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		typ := d.Type()
-		// Regular files and symlinks both participate in the diff;
-		// other entry kinds (sockets, devices, named pipes) don't
-		// land in a Flux tree and would confuse the comparison.
-		isLink := typ&fs.ModeSymlink != 0
-		if !typ.IsRegular() && !isLink {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		// For symlinks Info() reports the link's own size (the target
-		// path length) — exactly the bytes we'll hash via readlink.
-		out[filepath.ToSlash(rel)] = fileMeta{
-			size:    info.Size(),
-			abs:     p,
-			symlink: isLink,
-		}
-		return nil
-	})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// hashEntry returns the SHA-256 hex digest of an entry's content. For
-// regular files this is the file body; for symlinks it's the link
-// target text (matching git --no-index's content view of a symlink),
-// so a target-rewrite is detected without following the link.
-func hashEntry(path string, isSymlink bool) (string, error) {
-	if isSymlink {
-		target, err := os.Readlink(path)
-		if err != nil {
-			return "", err
-		}
-		sum := sha256.Sum256([]byte(target))
-		return hex.EncodeToString(sum[:]), nil
-	}
-	return hashFile(path)
-}
+type inputReader func([]byte) (int, error)
 
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path) //nolint:gosec // path is a tree-walk result, not user-controlled
+func (r inputReader) Read(p []byte) (int, error) { return r(p) }
+
+// CollectInputs records a path admitted on exactly one side and the data it defines.
+// Before identifies the baseline side; WithReaders resolves its exact read dependents.
+// Call only while constructing an unpublished Set, never concurrently, and discard
+// the set on error. Completed sets returned by Detect or baseline resolution MUST
+// remain immutable.
+func (s *Set) CollectInputs(ctx context.Context, input fs.FS, name string, before bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	side := 1
+	if before {
+		side = 0
+	}
+	if s.oneSided[side] == nil {
+		s.oneSided[side] = make(map[string]struct{})
+	}
+	s.oneSided[side][name] = struct{}{}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".yaml", ".yml", ".json":
+	default:
+		return nil
+	}
+	f, err := input.Open(name)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("%w: open input %s: %w", manifest.ErrInput, name, err)
 	}
 	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	var terminal, readErr error
+	reader := inputReader(func(p []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			terminal = err
+			return 0, err
+		}
+		n, err := f.Read(p)
+		terminal = err
+		if err != nil && err != io.EOF { //nolint:errorlint // io.Reader requires an unwrapped EOF; preserve other read errors.
+			readErr = err
+		}
+		if err := ctx.Err(); err != nil {
+			terminal = err
+			return 0, err
+		}
+		return n, err
+	})
+	docs, decodeErr := manifest.DecodeDocs(reader)
+	if decodeErr != nil && terminal == nil {
+		// A parser error must not hide later file errors or cancellation.
+		_, _ = io.Copy(io.Discard, reader)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	err = ctx.Err()
+	if err == nil && readErr != nil {
+		err = fmt.Errorf("%w: read input %s: %w", manifest.ErrInput, name, readErr)
+	}
+	if err != nil {
+		for _, doc := range docs {
+			manifest.ReleaseDoc(doc)
+		}
+		return err
+	}
+	if decodeErr != nil {
+		return nil
+	}
+	for _, doc := range docs {
+		id := manifest.NamedResource{Kind: manifest.DocKind(doc)}
+		id.Name, id.Namespace = manifest.DocMetadata(doc)
+		eligible := manifest.DocAPIVersion(doc) == manifest.CoreAPIVersion && id.KindInfo().Data &&
+			id.Name != "" && !manifest.HasEnvsubstReference(id.Name) && !manifest.HasEnvsubstReference(id.Namespace)
+		manifest.ReleaseDoc(doc)
+		if eligible {
+			if s.inputs == nil {
+				s.inputs = make(map[manifest.NamedResource]string)
+			}
+			s.inputs[id] = name
+		}
+	}
+	return ctx.Err()
 }
 
-func shouldSkipDir(name string) bool {
-	return strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor"
+// WithReaders returns a set including consumers of one-sided files in their admitting index.
+// The receiver and both discovery indexes remain immutable.
+func (s *Set) WithReaders(before, after *manifest.DiscoveryIndex) *Set {
+	if s == nil {
+		return nil
+	}
+	indexes := [2]*manifest.DiscoveryIndex{before, after}
+	roots := [2]string{}
+	origins := s.origins
+	if bootstrap, ok := s.sources[manifest.BootstrapSourceID]; ok {
+		origins = bootstrap.artifacts
+	}
+	for side, input := range origins {
+		if input != nil {
+			roots[side] = input.LocalPath
+		}
+	}
+	if len(s.sources) == 0 {
+		return s.withReaders(indexes, manifest.BootstrapSourceID, origins, roots)
+	}
+	out := *s
+	out.sources = maps.Clone(s.sources)
+	for ref, evidence := range s.sources {
+		evidence.changes = evidence.changes.withReaders(indexes, ref, evidence.artifacts, roots)
+		out.sources[ref] = evidence
+		if ref == manifest.BootstrapSourceID {
+			out.inputs = evidence.changes.inputs
+		}
+	}
+	out.groupSources()
+	return &out
+}
+
+func (s *Set) withReaders(indexes [2]*manifest.DiscoveryIndex, source manifest.NamedResource, artifacts [2]*store.SourceArtifact, roots [2]string) *Set {
+	if len(s.oneSided[0])+len(s.oneSided[1]) == 0 {
+		return s
+	}
+	out := *s
+	out.inputs = maps.Clone(s.inputs)
+	for side, index := range indexes {
+		if index == nil {
+			continue
+		}
+		for name := range s.oneSided[side] {
+			file := name
+			if input := artifacts[side]; input != nil && roots[side] != "" {
+				relative, err := filepath.Rel(roots[side], loader.OriginPath(input, filepath.Join(input.LocalPath, filepath.FromSlash(name))))
+				if err != nil {
+					continue
+				}
+				file = filepath.ToSlash(relative)
+			}
+			for reader := range index.ReadersOfFile(file) {
+				if reader.Source != source {
+					continue
+				}
+				if out.inputs == nil {
+					out.inputs = make(map[manifest.NamedResource]string)
+				}
+				out.inputs[reader.Reader] = name
+			}
+		}
+	}
+	return &out
+}
+
+type fileMeta struct {
+	size int64
+}
+
+// Excluded directories MUST still be traversed so deeper .sourceignore re-includes
+// survive, matching github.com/fluxcd/pkg/sourceignore v0.19.0 LoadIgnorePatterns.
+func scanTree(ctx context.Context, input, opposite *store.SourceArtifact, digests map[string]string) (map[string]fileMeta, error) {
+	out := make(map[string]fileMeta)
+	scoped := input.FS
+	oppositeName, err := filepath.Rel(input.LocalPath, opposite.LocalPath)
+	if err == nil {
+		oppositeName = filepath.ToSlash(oppositeName)
+	}
+
+	if digests != nil {
+		oppositePrefix := oppositeName + "/"
+		for name := range digests {
+			if name != oppositeName && !strings.HasPrefix(name, oppositePrefix) {
+				out[name] = fileMeta{}
+			}
+		}
+		return out, nil
+	}
+
+	files := []string{}
+	err = fs.WalkDir(scoped, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if name != "." && (d.Name() == ".git" || name == oppositeName) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Name() == ".sourceignore" {
+			files = append(files, name)
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		out[name] = fileMeta{size: info.Size()}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var matcher *sourceignore.Matcher
+	if admitted, ok := scoped.(*gittree.FS); ok {
+		matcher, err = admitted.SourcePolicy(ctx)
+	} else {
+		matcher, err = sourceignore.NewFS(scoped, files, "", true)
+	}
+	if err != nil {
+		return nil, err
+	}
+	sourceignore.Select(matcher, out, files)
+	return out, nil
+}
+
+type hashBuffer struct {
+	hash  hash.Hash
+	bytes [32 * 1024]byte
+	sum   [sha256.Size]byte
+}
+
+var hashBuffers = sync.Pool{New: func() any {
+	return &hashBuffer{hash: sha256.New()}
+}}
+
+func hashFile(ctx context.Context, input fs.FS, name string) ([sha256.Size]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	f, err := input.Open(name)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	defer func() { _ = f.Close() }()
+	buf := hashBuffers.Get().(*hashBuffer)
+	defer hashBuffers.Put(buf)
+	h := buf.hash
+	h.Reset()
+	for {
+		if err := ctx.Err(); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+		n, err := f.Read(buf.bytes[:])
+		if n > 0 {
+			_, _ = h.Write(buf.bytes[:n])
+		}
+		if err == io.EOF { //nolint:errorlint // io.Reader requires an unwrapped EOF; preserve other read errors.
+			break
+		}
+		if err != nil {
+			return [sha256.Size]byte{}, err
+		}
+	}
+	h.Sum(buf.sum[:0])
+	return buf.sum, nil
 }

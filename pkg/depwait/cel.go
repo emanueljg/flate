@@ -7,34 +7,21 @@ import (
 	"sync"
 
 	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/types"
-	"cel.dev/cel-go/common/types/ref"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
 
-// celCache memoizes compileReadyExpr results keyed by source text.
-// dependsOn typically references the same expression many times (one
-// per consumer), so compiling once per process saves the parse + check
-// pass that cel-go does internally. The cache also memoizes *errors*
-// so a malformed expression doesn't recompile on every fire of
-// watchReadyExpr — every re-evaluation against a known-bad expression
-// reuses the cached error.
-//
-// sync.Map (rather than map+Mutex) was chosen because the cache is
-// read-heavy and rarely-mutated: thousands of evaluations against a
-// stable corpus of a few dozen expressions. sync.Map's read path is
-// lock-free for hits, which removes the per-evaluation Mutex
-// contention multiple parallel waiters previously paid.
 var celCache sync.Map // map[string]celCacheEntry
 
-// celCacheEntry caches one of (program, error). Exactly one field is
-// non-nil; readers branch on err first.
 type celCacheEntry struct {
-	prog cel.Program
-	err  error
+	prog       cel.Program
+	err        error
+	selfStatus bool
 }
 
 // celEnv is the singleton CEL environment used by all ReadyExpr
@@ -58,43 +45,45 @@ func mustCELEnv() *cel.Env {
 	return env
 }
 
-// evaluateReadyExpr compiles (memoized) and evaluates expr against the
-// projected views of self (consumer) and dep (dependency). Returns true
-// iff the program produces a bool true.
-//
-// Errors are split: a compile/program error is wrapped in *celCompileErr
-// (terminal — the expression itself is broken); an eval error against
-// the projected object is returned unwrapped (transient — the dep's
-// status may not yet be populated, so callers polling on store events
-// should keep waiting).
-func evaluateReadyExpr(expr string, s *store.Store, self, dep manifest.NamedResource) (bool, error) {
-	prog, err := compileReadyExpr(expr)
+func (w *Waiter) evaluateReadyExpr(expr string, dep manifest.NamedResource, obj manifest.BaseManifest, conds []store.Condition) (bool, error) {
+	compiled, err := compileReadyExpr(expr)
 	if err != nil {
 		return false, &celCompileErr{err}
 	}
-	// Bind self/dep as lazy thunks (cel-go's `func() any` activation
-	// form). The interpreter resolves a name at most once per eval, and
-	// only when the program actually references it — so projectObject
-	// (a store-locked Snapshot plus several map allocations) runs only
-	// for the variables the expression reads. The dominant Flux idiom
-	// touches `dep` alone, leaving `self` unprojected. The produced
-	// value and the adapter path are identical to passing the map
-	// directly, so eval semantics are byte-for-byte unchanged.
-	val, _, err := prog.Eval(map[string]any{
-		"self": func() any { return projectObject(s, self) },
-		"dep":  func() any { return projectObject(s, dep) },
-	})
+	var dependency, self func() any
+	parent, st := w.Parent, w.Store
+	if parent == dep {
+		var projected any
+		dependency = func() any {
+			if projected == nil {
+				projected = projectObject(dep, obj, conds)
+			}
+			return projected
+		}
+		self = dependency
+	} else {
+		dependency = func() any { return projectObject(dep, obj, conds) }
+		if compiled.selfStatus {
+			self = func() any {
+				obj, info := st.Snapshot(parent, true)
+				return projectObject(parent, obj, info.Conditions)
+			}
+		} else {
+			self = func() any { return projectObject(parent, st.GetObject(parent), nil) }
+		}
+	}
+	val, _, err := compiled.prog.Eval(map[string]any{"self": self, "dep": dependency})
 	if err != nil {
 		return false, fmt.Errorf("eval: %w", err)
 	}
-	// asBool errors are type-shape problems with the expression itself
-	// (e.g. `dep.metadata.name` returns a string). The user's expr is
-	// broken regardless of dep state, so surface as terminal.
-	ok, err := asBool(val)
-	if err != nil {
-		return false, &celCompileErr{err}
+	// A non-bool result is an expression error, independent of dependency state.
+	if val == nil {
+		return false, &celCompileErr{errors.New("readyExpr returned nil")}
 	}
-	return ok, nil
+	if b, ok := val.Value().(bool); ok {
+		return b, nil
+	}
+	return false, &celCompileErr{fmt.Errorf("readyExpr must return bool; got %s", val.Type().TypeName())}
 }
 
 // celCompileErr signals an unrecoverable expression problem (parse,
@@ -105,20 +94,15 @@ type celCompileErr struct{ err error }
 func (e *celCompileErr) Error() string { return e.err.Error() }
 func (e *celCompileErr) Unwrap() error { return e.err }
 
-func compileReadyExpr(expr string) (cel.Program, error) {
+func compileReadyExpr(expr string) (celCacheEntry, error) {
 	v, ok := celCache.Load(expr)
 	if !ok {
-		// LoadOrStore: concurrent compiles of the same expr both race; the
-		// loser's entry is discarded and we return the winner's. cel-go's
-		// compilation is deterministic so the two results are equivalent.
 		v, _ = celCache.LoadOrStore(expr, buildCacheEntry(expr))
 	}
 	e := v.(celCacheEntry)
-	return e.prog, e.err
+	return e, e.err
 }
 
-// buildCacheEntry compiles expr into the program (or terminal error)
-// that compileReadyExpr memoizes.
 func buildCacheEntry(expr string) celCacheEntry {
 	ast, issues := celEnv.Compile(expr)
 	if issues != nil && issues.Err() != nil {
@@ -128,103 +112,75 @@ func buildCacheEntry(expr string) celCacheEntry {
 	if err != nil {
 		return celCacheEntry{err: fmt.Errorf("program: %w", err)}
 	}
-	return celCacheEntry{prog: prog}
+	return celCacheEntry{prog: prog, selfStatus: readsSelfStatus(ast)}
 }
 
-// projectObject builds the unstructured-shaped value the CEL
-// expression sees for `self` / `dep`. Includes:
-//   - apiVersion + kind
-//   - metadata.{name,namespace,generation,labels,annotations}
-//   - status.{observedGeneration,conditions}
-//
-// Labels and annotations are surfaced from the typed manifest in the
-// store when available — common upstream Flux readiness idioms like
-// `dep.metadata.annotations['app.kubernetes.io/component'] == 'cache'`
-// rely on these being populated. The full spec is not yet projected;
-// CEL expressions touching spec.* read undefined (documented gap).
-func projectObject(s *store.Store, id manifest.NamedResource) map[string]any {
-	// Snapshot the object AND its conditions atomically. Independent
-	// GetObject + GetConditions calls would each take their own
-	// s.mu.RLock; between them a writer can land an AddObject and/or
-	// SetCondition, mixing the freshly-projected object with stale
-	// conditions (or vice versa). For correlation-style CEL like
-	//   dep.metadata.labels['component'] == 'cache' &&
-	//   dep.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True')
-	// the mixed snapshot can render a false positive/negative until
-	// the next event triggers re-evaluation.
-	obj, conds := s.Snapshot(id)
+func readsSelfStatus(checked *cel.Ast) bool {
+	for _, ident := range ast.MatchDescendants(ast.NavigateAST(checked.NativeRep()), ast.KindMatcher(ast.IdentKind)) {
+		if ident.AsIdent() != "self" || shadowsSelf(ident) {
+			continue
+		}
+		parent, ok := ident.Parent()
+		if ok {
+			switch parent.Kind() {
+			case ast.SelectKind:
+				if parent.AsSelect().FieldName() != "status" {
+					continue
+				}
+			case ast.CallKind:
+				call := parent.AsCall()
+				args := call.Args()
+				if call.FunctionName() == operators.Index && len(args) == 2 && args[0].ID() == ident.ID() && args[1].Kind() == ast.LiteralKind {
+					if key, ok := args[1].AsLiteral().Value().(string); ok && key != "status" {
+						continue
+					}
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func shadowsSelf(ident ast.NavigableExpr) bool {
+	for child := ident; ; {
+		parent, ok := child.Parent()
+		if !ok {
+			return false
+		}
+		if parent.Kind() == ast.ComprehensionKind {
+			comp := parent.AsComprehension()
+			inLoop := child.ID() == comp.LoopCondition().ID() || child.ID() == comp.LoopStep().ID()
+			if inLoop && (comp.IterVar() == "self" || comp.IterVar2() == "self") {
+				return true
+			}
+			if comp.AccuVar() == "self" && (inLoop || child.ID() == comp.Result().ID()) {
+				return true
+			}
+		}
+		child = parent
+	}
+}
+
+func projectObject(id manifest.NamedResource, obj manifest.BaseManifest, conds []store.Condition) any {
+	doc, err := manifest.ObjectDocument(id, obj)
+	if err != nil {
+		return types.WrapErr(err)
+	}
 	if obj == nil {
-		// Status entry without an object — only the metadata/status
-		// derived from id is reachable; labels and annotations are
-		// absent. A CEL expression like dep.metadata.labels['x']
-		// evaluating against this view sees no labels (has() returns
-		// false), which is correct: the dep isn't fully visible yet.
-		// Logged at Debug so an operator chasing a "readyExpr never
-		// satisfied" can see whether the dep had reached the store as
-		// an object or only as a phantom status entry.
-		slog.Debug("depwait: projectObject sees status without object",
-			"id", id.String())
+		slog.Debug("depwait: projectObject sees status without object", "id", id.String())
 	}
 	condsAny := make([]any, 0, len(conds))
 	for _, c := range conds {
 		condsAny = append(condsAny, conditionToMap(c))
 	}
-	meta := map[string]any{
-		"name":      id.Name,
-		"namespace": id.Namespace,
-		// flate has no apiserver, so there is no monotonically-
-		// increasing generation count to model. The single-snapshot
-		// render pins both metadata.generation and
-		// status.observedGeneration to the same value so CEL
-		// expressions like
-		//   dep.status.observedGeneration == dep.metadata.generation
-		// — a common Flux readiness idiom — never spuriously fail.
-		"generation": int64(1),
+	// Offline snapshots have no apiserver generation; normalize both sides together.
+	doc["metadata"].(map[string]any)["generation"] = int64(1)
+	doc["status"] = map[string]any{
+		"observedGeneration": int64(1),
+		"conditions":         condsAny,
 	}
-	labels, annotations := labelsAndAnnotations(obj)
-	if labels != nil {
-		meta["labels"] = labels
-	}
-	if annotations != nil {
-		meta["annotations"] = annotations
-	}
-	return map[string]any{
-		"kind":       id.Kind,
-		"apiVersion": kindAPIVersion[id.Kind],
-		"metadata":   meta,
-		"status": map[string]any{
-			"observedGeneration": int64(1),
-			"conditions":         condsAny,
-		},
-	}
-}
-
-// labelsAndAnnotations extracts metadata.labels / metadata.annotations
-// from the typed manifest when the type carries them. Returns nil maps
-// when missing (so CEL's `has(dep.metadata.labels)` evaluates false
-// rather than seeing an empty map). The conversion to map[string]any
-// is needed because the CEL DynType resolver doesn't deep-walk
-// map[string]string.
-func labelsAndAnnotations(obj manifest.BaseManifest) (labels, annotations map[string]any) {
-	type withMeta interface {
-		GetLabels() map[string]string
-		GetAnnotations() map[string]string
-	}
-	if m, ok := obj.(withMeta); ok {
-		return stringMapToAny(m.GetLabels()), stringMapToAny(m.GetAnnotations())
-	}
-	return nil, nil
-}
-
-func stringMapToAny(in map[string]string) map[string]any {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	return doc
 }
 
 func conditionToMap(c metav1.Condition) map[string]any {
@@ -235,32 +191,4 @@ func conditionToMap(c metav1.Condition) map[string]any {
 		"message":            c.Message,
 		"observedGeneration": c.ObservedGeneration,
 	}
-}
-
-// kindAPIVersion maps each tracked Kind to its canonical apiVersion.
-// Used by projectObject so CEL expressions inspecting object.apiVersion
-// behave sensibly. Kinds absent from the map return "" — most ReadyExpr
-// formulations don't read it, so the empty value is a safe default.
-var kindAPIVersion = map[string]string{
-	manifest.KindKustomization:    manifest.FluxKustomizeDomain + "/v1",
-	manifest.KindHelmRelease:      manifest.HelmReleaseDomain + "/v2",
-	manifest.KindGitRepository:    manifest.SourceDomain + "/v1",
-	manifest.KindOCIRepository:    manifest.SourceDomain + "/v1",
-	manifest.KindHelmRepository:   manifest.SourceDomain + "/v1",
-	manifest.KindHelmChart:        manifest.SourceDomain + "/v1",
-	manifest.KindBucket:           manifest.SourceDomain + "/v1",
-	manifest.KindExternalArtifact: manifest.SourceDomain + "/v1",
-}
-
-func asBool(v ref.Val) (bool, error) {
-	if v == nil {
-		return false, errors.New("readyExpr returned nil")
-	}
-	if b, ok := v.Value().(bool); ok {
-		return b, nil
-	}
-	if v.Type() == types.BoolType {
-		return v.Equal(types.True).Value().(bool), nil
-	}
-	return false, fmt.Errorf("readyExpr must return bool; got %s", v.Type().TypeName())
 }

@@ -3,6 +3,8 @@ package diff
 import (
 	"fmt"
 	"testing"
+
+	"github.com/home-operations/flate/internal/testutil"
 )
 
 // BenchmarkDiff_LargeTree measures RenderDocs against two 100-resource
@@ -15,7 +17,7 @@ func BenchmarkDiff_LargeTree(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out, err := RenderDocs(left, right, Options{Format: FormatGitHub})
+		out, _, err := RenderDocs(left, right, Options{Format: FormatGitHub})
 		if err != nil {
 			b.Fatalf("RenderDocs: %v", err)
 		}
@@ -66,7 +68,7 @@ func BenchmarkNormalizeDocs(b *testing.B) {
 					},
 				},
 			},
-			Parent: Parent{Kind: "HelmRelease", Namespace: "default", Name: fmt.Sprintf("hr-%d", i)},
+			Parent: Parent{NamedResource: testutil.HelmReleaseID("default", fmt.Sprintf("hr-%d", i))},
 		})
 	}
 	attrs := []string{
@@ -80,7 +82,7 @@ func BenchmarkNormalizeDocs(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_ = normalizeDocs(docs, attrs, nil, nil)
+		_, _ = normalizeDocs(docs, attrs, nil, nil)
 	}
 }
 
@@ -92,7 +94,7 @@ func buildDiffCorpus(n, changeCount int) (left, right []Doc) {
 	right = make([]Doc, 0, n)
 	for i := range n {
 		name := fmt.Sprintf("cm-%d", i)
-		parent := Parent{Kind: "HelmRelease", Namespace: "default", Name: fmt.Sprintf("hr-%d", i/10)}
+		parent := Parent{NamedResource: testutil.HelmReleaseID("default", fmt.Sprintf("hr-%d", i/10))}
 		baseValue := fmt.Sprintf("value-%d", i)
 		other := baseValue
 		if i < changeCount {

@@ -19,10 +19,9 @@ import (
 // kustomization.yaml glue that wires them together.
 func BenchmarkLoad_LargeRepo(b *testing.B) {
 	dir := b.TempDir()
-	synthLargeRepo(b, dir, 200, 100, 50)
+	synthLargeRepo(b, dir)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		s := store.New()
 		if _, err := New(s).Load(context.Background(), dir); err != nil {
@@ -39,7 +38,6 @@ func BenchmarkLoad_DeepComponents(b *testing.B) {
 	synthDeepComponents(b, dir, 5)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		s := store.New()
 		if _, err := New(s).Load(context.Background(), dir); err != nil {
@@ -48,19 +46,10 @@ func BenchmarkLoad_DeepComponents(b *testing.B) {
 	}
 }
 
-// BenchmarkParseFile_Kustomization measures parseFile (the loader's
-// canonical entry that DecodeDocs + ParseDoc + envsubst-filter) for a
-// single Flux Kustomization YAML.
 func BenchmarkParseFile_Kustomization(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "ks.yaml")
-	body := `apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: apps
-  namespace: flux-system
-spec:
-  interval: 10m
+	body := testutil.KustomizationYAML("apps", "flux-system", `  interval: 10m
   path: ./apps
   prune: true
   sourceRef:
@@ -76,16 +65,16 @@ spec:
   dependsOn:
   - name: cluster-config
     namespace: flux-system
-`
+`)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		b.Fatal(err)
 	}
-	opts := manifest.ParseDocOptions{WipeSecrets: true}
+	opts := manifest.ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""}
+	reader := readerForTest(dir)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		objs, err := parseFile(path, opts)
+		objs, err := reader.parseFile(path, opts)
 		if err != nil {
 			b.Fatalf("parseFile: %v", err)
 		}
@@ -95,8 +84,6 @@ spec:
 	}
 }
 
-// BenchmarkParseFile_HelmRelease measures parseFile on a single
-// HelmRelease YAML — the other major hot kind during a load.
 func BenchmarkParseFile_HelmRelease(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "hr.yaml")
@@ -153,18 +140,63 @@ spec:
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		b.Fatal(err)
 	}
-	opts := manifest.ParseDocOptions{WipeSecrets: true}
+	opts := manifest.ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""}
+	reader := readerForTest(dir)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		objs, err := parseFile(path, opts)
+		objs, err := reader.parseFile(path, opts)
 		if err != nil {
 			b.Fatalf("parseFile: %v", err)
 		}
 		if len(objs) == 0 {
 			b.Fatalf("expected at least one object")
 		}
+	}
+}
+
+func BenchmarkRecordObject_HelmRelease(b *testing.B) {
+	benchmarkRecordObject(b, manifest.KindHelmRelease)
+}
+
+func BenchmarkRecordObject_Kustomization(b *testing.B) {
+	benchmarkRecordObject(b, manifest.KindKustomization)
+}
+
+func benchmarkRecordObject(b *testing.B, kind string) {
+	b.Helper()
+	for _, count := range []int{0, 1, 3, 16} {
+		b.Run(fmt.Sprintf("refs=%d", count), func(b *testing.B) {
+			var obj manifest.BaseManifest = &manifest.Kustomization{Name: "app", Namespace: "ns"}
+			if kind == manifest.KindHelmRelease {
+				obj = &manifest.HelmRelease{Name: "app", Namespace: "ns"}
+			}
+			if count > 0 {
+				refs := make([]any, count-1)
+				for i := range refs {
+					refs[i] = map[string]any{"kind": "ConfigMap", "name": fmt.Sprintf("vars-%d", i)}
+				}
+				api := "kustomize.toolkit.fluxcd.io/v1"
+				spec := map[string]any{"sourceRef": map[string]any{"kind": "GitRepository", "name": "repo"},
+					"postBuild": map[string]any{"substituteFrom": refs}}
+				if kind == manifest.KindHelmRelease {
+					api = "helm.toolkit.fluxcd.io/v2"
+					spec = map[string]any{"chart": map[string]any{"spec": map[string]any{"chart": "app", "sourceRef": map[string]any{"kind": "HelmRepository", "name": "repo"}}}, "valuesFrom": refs}
+				}
+				var err error
+				obj, _, _, err = manifest.ParseDoc(map[string]any{"apiVersion": api, "kind": kind,
+					"metadata": map[string]any{"name": "app", "namespace": "ns"}, "spec": spec}, manifest.ParseDocOptions{DefaultNamespace: ""})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			l := New(store.New())
+			b.ReportAllocs()
+			for b.Loop() {
+				l.Index.Records = map[manifest.NamedResource]manifest.DiscoveryRecord{}
+				l.recordObject(obj, "/repo/object.yaml")
+			}
+		})
 	}
 }
 
@@ -178,7 +210,7 @@ func BenchmarkIgnoreMatches(b *testing.B) {
 		fmt.Fprintf(&patterns, "ignored-%d/**\n", i)
 	}
 	testutil.WriteFile(b, root, ".krmignore", patterns.String())
-	ig, err := loadIgnore(root)
+	ig, err := readerForTest(root).loadIgnore(root)
 	if err != nil {
 		b.Fatalf("loadIgnore: %v", err)
 	}
@@ -189,7 +221,6 @@ func BenchmarkIgnoreMatches(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		for _, p := range probes {
 			_ = ig.matches(p, root, false)
@@ -197,13 +228,13 @@ func BenchmarkIgnoreMatches(b *testing.B) {
 	}
 }
 
-// synthLargeRepo writes nKS Kustomizations, nHR HelmReleases, and nSrc
-// source CRs spread across an apps/ tree under root. Each KS gets its
-// own kustomization.yaml so the loader walks the resource graph; HRs
-// and sources are added as referenced resources.
-func synthLargeRepo(b *testing.B, root string, nKS, nHR, nSrc int) {
+func synthLargeRepo(b *testing.B, root string) {
 	b.Helper()
-	// Top-level kustomization with one resource entry per app dir.
+	const (
+		nKS  = 200
+		nHR  = 100
+		nSrc = 50
+	)
 	var topResources strings.Builder
 	for i := range nKS {
 		fmt.Fprintf(&topResources, "  - ./apps/app-%d\n", i)
@@ -213,9 +244,6 @@ func synthLargeRepo(b *testing.B, root string, nKS, nHR, nSrc int) {
 
 	for i := range nKS {
 		base := fmt.Sprintf("apps/app-%d", i)
-		// Per-app kustomization includes the Flux KS plus optionally
-		// an HR and a source. Spread HRs and sources across the first
-		// N apps so the loader has a mix of kinds.
 		var resources strings.Builder
 		resources.WriteString("  - ./ks.yaml\n")
 		if i < nHR {
@@ -226,21 +254,7 @@ func synthLargeRepo(b *testing.B, root string, nKS, nHR, nSrc int) {
 		}
 		testutil.WriteFile(b, root, base+"/kustomization.yaml",
 			"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n"+resources.String())
-		testutil.WriteFile(b, root, base+"/ks.yaml", fmt.Sprintf(
-			`apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: app-%d
-  namespace: flux-system
-spec:
-  interval: 10m
-  path: ./apps/app-%d
-  prune: true
-  sourceRef:
-    kind: GitRepository
-    name: flux-system
-    namespace: flux-system
-`, i, i))
+		testutil.WriteFile(b, root, base+"/ks.yaml", testutil.KustomizationYAML("app-"+fmt.Sprintf("%d", i), "flux-system", "  interval: 10m\n  path: ./apps/app-"+fmt.Sprintf("%d", i)+"\n  prune: true\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n    namespace: flux-system\n"))
 		if i < nHR {
 			testutil.WriteFile(b, root, base+"/hr.yaml", fmt.Sprintf(
 				`apiVersion: helm.toolkit.fluxcd.io/v2

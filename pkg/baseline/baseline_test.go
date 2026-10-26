@@ -1,6 +1,9 @@
 package baseline
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,35 +15,42 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage"
+	"github.com/go-git/go-git/v5/storage/memory"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
-	"github.com/home-operations/flate/pkg/source/cacheroot"
+	"github.com/home-operations/flate/internal/testutil/cachetest"
+	"github.com/home-operations/flate/pkg/manifest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/gitrepo"
+	"github.com/home-operations/flate/pkg/source/gittree"
 )
 
-// TestAutoResolve_ExplicitBase pins the --base=<rev> escape hatch: an
-// explicit rev bypasses the auto-detection ladder and the named commit
-// becomes the baseline.
+// An explicit base bypasses the auto-detection ladder.
 func TestAutoResolve_ExplicitBase(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	commitA := initRepoWithFile(t, dir, "a.yaml", "original")
-	commitB := writeAndCommit(t, dir, "a.yaml", "updated")
+	writeAndCommit(t, dir, "a.yaml", "updated")
 
-	res, err := AutoResolve(dir, commitA.String(), cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, commitA.String(), cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if !strings.HasPrefix(res.Source, "explicit --base=") {
-		t.Errorf("Source = %q, want prefix 'explicit --base='", res.Source)
+
+	if !strings.HasPrefix(res.Source.Metadata["baseline-selection"], "explicit --base=") {
+		t.Errorf("Source = %q, want prefix 'explicit --base='", res.Source.Metadata["baseline-selection"])
 	}
-	got, err := os.ReadFile(filepath.Join(res.TempDir, "a.yaml"))
+	assert.Equal(t, res.Source.LocalRoot, dir)
+	assert.Equal(t, res.Source.URL, "")
+	got, err := fs.ReadFile(res.BaseInput.FS, "a.yaml")
 	if err != nil {
 		t.Fatalf("read materialized: %v", err)
 	}
 	if string(got) != "original" {
 		t.Errorf("materialized a.yaml = %q, want %q (should be commitA's tree, not HEAD's)", got, "original")
 	}
-	_ = commitB
 }
 
 // TestAutoResolve_SelfURLsCarryRemotes pins that Result.SelfURLs carries the
@@ -51,6 +61,7 @@ func TestAutoResolve_ExplicitBase(t *testing.T) {
 // unresolved and the whole tree renders empty (every resource a wholesale
 // addition).
 func TestAutoResolve_SelfURLsCarryRemotes(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	commit := initRepoWithFile(t, dir, "a.yaml", "x")
 	repo, err := git.PlainOpen(dir)
@@ -62,18 +73,40 @@ func TestAutoResolve_SelfURLsCarryRemotes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := AutoResolve(dir, commit.String(), cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, commit.String(), cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
 
 	if !slices.Contains(res.SelfURLs, url) {
 		t.Errorf("Result.SelfURLs = %v; want it to contain %q", res.SelfURLs, url)
 	}
 	// The materialized tree must NOT carry a synthetic .git anymore.
-	if _, err := os.Stat(filepath.Join(res.TempDir, ".git")); !os.IsNotExist(err) {
+	if _, err := fs.Stat(res.BaseInput.FS, ".git"); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("materialized baseline must have no .git marker; stat err = %v", err)
+	}
+}
+
+func TestResolvePaths_AncestorLookupError(t *testing.T) {
+	t.Parallel()
+	for _, side := range []string{"original", "current"} {
+		t.Run(side, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			assert.Equal(t, os.Symlink(".git", filepath.Join(parent, ".git")), nil)
+			child := filepath.Join(parent, "exported")
+			assert.Equal(t, os.Mkdir(child, 0o750), nil)
+			current, original := t.TempDir(), child
+			if side == "current" {
+				current, original = original, current
+			}
+
+			result, err := ResolvePaths(t.Context(), current, original)
+			assert.Equal(t, err, nil)
+			assert.Equal(t, result.Source.LocalPath, current)
+			assert.Equal(t, result.BaseInput.LocalPath, original)
+			assert.Equal(t, len(result.SelfURLs), 0)
+		})
 	}
 }
 
@@ -81,6 +114,7 @@ func TestAutoResolve_SelfURLsCarryRemotes(t *testing.T) {
 // a branch whose config points at a remote-tracking ref, and the
 // merge-base resolves correctly.
 func TestAutoResolve_UpstreamMergeBase(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainCommit := initRepoWithFile(t, dir, "a.yaml", "main")
 	// Set up a remote-tracking ref that points at mainCommit (simulates
@@ -93,20 +127,22 @@ func TestAutoResolve_UpstreamMergeBase(t *testing.T) {
 	}
 	branchName := head.Name().Short()
 	setRef(t, repo, plumbing.NewRemoteReferenceName("origin", branchName), mainCommit)
-	configureBranch(t, repo, branchName, "origin", "refs/heads/"+branchName)
+	configureBranch(t, repo, &config.Branch{
+		Name: branchName, Remote: "origin", Merge: head.Name(),
+	})
 
 	// Move forward on the local branch.
 	writeAndCommit(t, dir, "a.yaml", "diverged")
 
-	res, err := AutoResolve(dir, "", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Source != "merge-base with @{u}" {
-		t.Errorf("Source = %q, want 'merge-base with @{u}'", res.Source)
+
+	if res.Source.Metadata["baseline-selection"] != "merge-base with @{u}" {
+		t.Errorf("Source = %q, want 'merge-base with @{u}'", res.Source.Metadata["baseline-selection"])
 	}
-	got, err := os.ReadFile(filepath.Join(res.TempDir, "a.yaml"))
+	got, err := fs.ReadFile(res.BaseInput.FS, "a.yaml")
 	if err != nil {
 		t.Fatalf("read materialized: %v", err)
 	}
@@ -118,6 +154,7 @@ func TestAutoResolve_UpstreamMergeBase(t *testing.T) {
 // TestAutoResolve_OriginHEAD: no @{u}, but origin/HEAD symref present.
 // Verifies the second rung fires.
 func TestAutoResolve_OriginHEAD(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainCommit := initRepoWithFile(t, dir, "a.yaml", "base")
 	repo := openHelper(t, dir)
@@ -129,13 +166,13 @@ func TestAutoResolve_OriginHEAD(t *testing.T) {
 
 	writeAndCommit(t, dir, "a.yaml", "new")
 
-	res, err := AutoResolve(dir, "", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Source != "merge-base with origin/HEAD" {
-		t.Errorf("Source = %q, want 'merge-base with origin/HEAD'", res.Source)
+
+	if res.Source.Metadata["baseline-selection"] != "merge-base with origin/HEAD" {
+		t.Errorf("Source = %q, want 'merge-base with origin/HEAD'", res.Source.Metadata["baseline-selection"])
 	}
 }
 
@@ -146,6 +183,7 @@ func TestAutoResolve_OriginHEAD(t *testing.T) {
 // fetch-depth=1 lands the PR branch and origin/* but no sibling
 // local refs; we shouldn't force users to type `--base origin/main`.
 func TestAutoResolve_ExplicitBaseFallsBackToOrigin(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainCommit := initRepoWithFile(t, dir, "a.yaml", "base")
 	repo := openHelper(t, dir)
@@ -153,28 +191,69 @@ func TestAutoResolve_ExplicitBaseFallsBackToOrigin(t *testing.T) {
 	setRef(t, repo, plumbing.NewRemoteReferenceName("origin", "main"), mainCommit)
 	writeAndCommit(t, dir, "a.yaml", "pr-tip")
 
-	res, err := AutoResolve(dir, "main", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, "main", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve(--base=main) should fall back to origin/main: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if got := res.Rev; got != shortRev(mainCommit) {
-		t.Errorf("Rev = %q, want %q", got, shortRev(mainCommit))
+
+	if got := res.BaseInput.Revision; got != mainCommit.String() {
+		t.Errorf("Revision = %q, want %q", got, mainCommit.String())
 	}
-	if !strings.Contains(res.Source, "via origin/main") {
-		t.Errorf("Source = %q, want to mention 'via origin/main'", res.Source)
+	if !strings.Contains(res.Source.Metadata["baseline-selection"], "via origin/main") {
+		t.Errorf("Source = %q, want to mention 'via origin/main'", res.Source.Metadata["baseline-selection"])
 	}
+}
+
+func TestAutoResolve_ExplicitBaseRemoteTrackingBranch(t *testing.T) {
+	t.Parallel()
+	for _, base := range []string{"release/v1", "origin/release/v1"} {
+		t.Run(base, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			commit := initRepoWithFile(t, dir, "a.yaml", "base")
+			repo := openHelper(t, dir)
+			setRef(t, repo, plumbing.NewRemoteReferenceName("origin", "release/v1"), commit)
+
+			res, err := AutoResolve(t.Context(), dir, base, cachetest.New(t, "", sourcecache.New))
+			assert.NoError(t, err)
+			assert.Equal(t, res.BaseInput.Revision, commit.String())
+			assert.Equal(t, res.BaseInput.Revision, commit.String())
+			got, err := fs.ReadFile(res.BaseInput.FS, "a.yaml")
+			assert.NoError(t, err)
+			assert.Equal(t, string(got), "base")
+		})
+	}
+}
+
+func TestAutoResolve_ExplicitBaseLocalBranchPrecedesOrigin(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	older := initRepoWithFile(t, dir, "a.yaml", "older")
+	newer := writeAndCommit(t, dir, "a.yaml", "newer")
+	repo := openHelper(t, dir)
+	setRef(t, repo, plumbing.NewBranchReferenceName("release/v1"), older)
+	setRef(t, repo, plumbing.NewRemoteReferenceName("origin", "release/v1"), newer)
+
+	res, err := AutoResolve(t.Context(), dir, "release/v1", cachetest.New(t, "", sourcecache.New))
+	assert.NoError(t, err)
+	assert.Equal(t, res.BaseInput.Revision, older.String())
+	got, err := fs.ReadFile(res.BaseInput.FS, "a.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, string(got), "older")
 }
 
 // TestAutoResolve_ExplicitBaseNeitherLocalNorRemote: when --base
 // resolves neither locally nor as origin/<base>, the error names
 // both lookup attempts so the user knows what to fix.
 func TestAutoResolve_ExplicitBaseNeitherLocalNorRemote(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	initRepoWithFile(t, dir, "a.yaml", "base")
 	writeAndCommit(t, dir, "a.yaml", "pr-tip")
 
-	_, err := AutoResolve(dir, "nonexistent", cacheroot.Layout{})
+	_, err := AutoResolve(t.Context(), dir, "nonexistent", cachetest.New(t, "", sourcecache.New))
+	assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+	assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
 	if err == nil {
 		t.Fatal("expected error for unresolvable --base")
 	}
@@ -186,6 +265,7 @@ func TestAutoResolve_ExplicitBaseNeitherLocalNorRemote(t *testing.T) {
 // TestAutoResolve_OriginMainFallback exercises the third rung: no
 // @{u}, no origin/HEAD, but origin/main exists.
 func TestAutoResolve_OriginMainFallback(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainCommit := initRepoWithFile(t, dir, "a.yaml", "base")
 	repo := openHelper(t, dir)
@@ -194,13 +274,72 @@ func TestAutoResolve_OriginMainFallback(t *testing.T) {
 
 	writeAndCommit(t, dir, "a.yaml", "new")
 
-	res, err := AutoResolve(dir, "", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Source != "merge-base with origin/main" {
-		t.Errorf("Source = %q, want 'merge-base with origin/main'", res.Source)
+
+	if res.Source.Metadata["baseline-selection"] != "merge-base with origin/main" {
+		t.Errorf("Source = %q, want 'merge-base with origin/main'", res.Source.Metadata["baseline-selection"])
+	}
+}
+
+func TestAutoResolve_Ladder(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, main, master, remoteHEAD, upstream, want string
+	}{
+		{name: "master only", master: "base", want: "master"},
+		{name: "main and master, different tips", main: "tip", master: "base", want: "main"},
+		{name: "origin/HEAD disjoint, origin/main valid", remoteHEAD: "disjoint", main: "tip", want: "main"},
+		{name: "@{u} disjoint, origin/HEAD valid", upstream: "disjoint", remoteHEAD: "tip", want: "HEAD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			base := initRepoWithFile(t, dir, "a.yaml", "base")
+			tip := writeAndCommit(t, dir, "a.yaml", "tip")
+			repo := openHelper(t, dir)
+			disjoint, err := repo.CommitObject(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			disjoint.Message = "disjoint root"
+			encoded := repo.Storer.NewEncodedObject()
+			if err := disjoint.Encode(encoded); err != nil {
+				t.Fatal(err)
+			}
+			disjointHash, err := repo.Storer.SetEncodedObject(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hashes := map[string]plumbing.Hash{"base": base, "tip": tip, "disjoint": disjointHash}
+			for _, ref := range []struct{ name, commit string }{
+				{"main", tc.main}, {"master", tc.master}, {"HEAD", tc.remoteHEAD}, {"upstream", tc.upstream},
+			} {
+				if ref.commit != "" {
+					setRef(t, repo, plumbing.NewRemoteReferenceName("origin", ref.name), hashes[ref.commit])
+				}
+			}
+			if tc.upstream != "" {
+				head, err := repo.Head()
+				if err != nil {
+					t.Fatal(err)
+				}
+				configureBranch(t, repo, &config.Branch{
+					Name: head.Name().Short(), Remote: "origin", Merge: plumbing.NewBranchReferenceName("upstream"),
+				})
+			}
+
+			res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
+			if err != nil {
+				t.Fatalf("AutoResolve: %v", err)
+			}
+
+			if want := "merge-base with origin/" + tc.want; res.Source.Metadata["baseline-selection"] != want {
+				t.Errorf("Source = %q, want %q", res.Source.Metadata["baseline-selection"], want)
+			}
+		})
 	}
 }
 
@@ -208,6 +347,7 @@ func TestAutoResolve_OriginMainFallback(t *testing.T) {
 // @{u} rung is unreachable (no branch → no config); the algorithm
 // must fall through to origin/HEAD. This is the GH Actions PR case.
 func TestAutoResolve_DetachedHEAD(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainCommit := initRepoWithFile(t, dir, "a.yaml", "base")
 	writeAndCommit(t, dir, "a.yaml", "pr-tip")
@@ -224,34 +364,32 @@ func TestAutoResolve_DetachedHEAD(t *testing.T) {
 		t.Fatalf("detach HEAD: %v", err)
 	}
 
-	res, err := AutoResolve(dir, "", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Source != "merge-base with origin/HEAD" {
-		t.Errorf("Source = %q, want 'merge-base with origin/HEAD' (detached HEAD should skip @{u})", res.Source)
+
+	if res.Source.Metadata["baseline-selection"] != "merge-base with origin/HEAD" {
+		t.Errorf("Source = %q, want 'merge-base with origin/HEAD' (detached HEAD should skip @{u})", res.Source.Metadata["baseline-selection"])
 	}
 }
 
-// TestAutoResolve_NoGit: a path that isn't inside a .git ancestor must
-// error with a message naming the alternative flags.
 func TestAutoResolve_NoGit(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	testutil.WriteFileAt(t, filepath.Join(dir, "f.yaml"), "x")
-	_, err := AutoResolve(dir, "", cacheroot.Layout{})
-	if err == nil {
-		t.Fatal("expected error for non-git path")
-	}
-	if !strings.Contains(err.Error(), "not inside a git working tree") {
+	_, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
+	if !errors.Is(err, manifest.ErrInput) || !strings.Contains(err.Error(), "not inside a git working tree") {
 		t.Errorf("error %q: should explain why and suggest --path-orig / --base", err)
 	}
+	assert.Equal(t, os.Symlink(".git", filepath.Join(dir, ".git")), nil)
+	res, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
+	assert.Equal(t, errors.Is(err, manifest.ErrInput) && errors.Is(err, manifest.ErrFlux), true)
+	assert.Equal(t, res == nil, true)
 }
 
-// TestAutoResolve_Shallow: presence of .git/shallow is the CI shallow-
-// clone signal and must produce a distinct error from "no upstream"
-// so users know to set fetch-depth: 0.
 func TestAutoResolve_Shallow(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	initRepoWithFile(t, dir, "a.yaml", "x")
 	if err := os.WriteFile(filepath.Join(dir, ".git", "shallow"), []byte("deadbeef\n"), 0o600); err != nil {
@@ -259,7 +397,9 @@ func TestAutoResolve_Shallow(t *testing.T) {
 	}
 	// No upstream, no origin refs → the resolution ladder falls
 	// through; the shallow detection fires last.
-	_, err := AutoResolve(dir, "", cacheroot.Layout{})
+	_, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
+	assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+	assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
 	if err == nil {
 		t.Fatal("expected shallow error")
 	}
@@ -274,9 +414,12 @@ func TestAutoResolve_Shallow(t *testing.T) {
 // TestAutoResolve_NoUpstream: real (non-shallow) repo with no upstream
 // and no origin refs at all. Errors cleanly suggesting --base.
 func TestAutoResolve_NoUpstream(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	initRepoWithFile(t, dir, "a.yaml", "x")
-	_, err := AutoResolve(dir, "", cacheroot.Layout{})
+	_, err := AutoResolve(t.Context(), dir, "", cachetest.New(t, "", sourcecache.New))
+	assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+	assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
 	if err == nil {
 		t.Fatal("expected no-upstream error")
 	}
@@ -291,49 +434,43 @@ func TestAutoResolve_NoUpstream(t *testing.T) {
 // TestAutoResolve_PathOutsideRepo: --path resolves outside the .git
 // ancestor → refuse early with a clear suggestion.
 func TestAutoResolve_PathOutsideRepo(t *testing.T) {
+	t.Parallel()
 	outerDir := t.TempDir()
 	repoDir := filepath.Join(outerDir, "repo")
 	if err := os.Mkdir(repoDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	initRepoWithFile(t, repoDir, "a.yaml", "x")
-	// Sibling directory, outside the repo. We expect openRepo to find
-	// no .git ancestor for outerDir/sibling, and surface a clear error.
+	// A sibling directory has no containing checkout.
 	sibling := filepath.Join(outerDir, "sibling")
 	if err := os.Mkdir(sibling, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	_, err := AutoResolve(sibling, "", cacheroot.Layout{})
+	_, err := AutoResolve(t.Context(), sibling, "", cachetest.New(t, "", sourcecache.New))
 	if err == nil {
 		t.Fatal("expected error for path outside repo")
 	}
 }
 
-// TestAutoResolve_PathOrigMappedToSubdir: when --path is a subdir,
-// the synthetic PathOrig must be <tempdir>/<rel>, not just tempdir.
-// This is the load-bearing case the agents flagged in PR #348's
-// validation: real users point at cluster/, not the repo root.
 func TestAutoResolve_PathOrigMappedToSubdir(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	initRepoWithFile(t, dir, "kubernetes/flux/cluster/cluster.yaml", "x")
-	commit := writeAndCommit(t, dir, "kubernetes/flux/cluster/cluster.yaml", "y")
-
-	clusterDir := filepath.Join(dir, "kubernetes", "flux", "cluster")
-	res, err := AutoResolve(clusterDir, commit.String(), cacheroot.Layout{})
+	commit := initRepoWithFile(t, dir, "kubernetes/flux/cluster/cluster.yaml", "x")
+	cluster := filepath.Join(dir, "kubernetes", "flux", "cluster")
+	link := filepath.Join(t.TempDir(), "cluster")
+	assert.NoError(t, os.Symlink(cluster, link))
+	result, err := AutoResolve(t.Context(), link, commit.String(), cachetest.New(t, "", sourcecache.New))
 	if err != nil {
-		t.Fatalf("AutoResolve: %v", err)
+		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	wantSuffix := filepath.Join("kubernetes", "flux", "cluster")
-	if !strings.HasSuffix(res.PathOrig, wantSuffix) {
-		t.Errorf("PathOrig = %q, want suffix %q", res.PathOrig, wantSuffix)
+	if result.Source.LocalPath != dir || result.BaseInput.LocalRoot != dir {
+		t.Fatalf("coordinates: %#v %#v", result.Source, result.BaseInput)
 	}
-	if !strings.HasPrefix(res.PathOrig, res.TempDir) {
-		t.Errorf("PathOrig = %q, want prefix %q", res.PathOrig, res.TempDir)
-	}
-	// The mapped file must exist at the synthetic --path-orig.
-	if _, err := os.Stat(filepath.Join(res.PathOrig, "cluster.yaml")); err != nil {
-		t.Errorf("expected materialized file at PathOrig: %v", err)
+	assert.Equal(t, result.ScanPath, cluster)
+	assert.Equal(t, result.BaseScanPath, filepath.Join(result.BaseInput.LocalPath, "kubernetes", "flux", "cluster"))
+	assert.Equal(t, result.BaseInput.FS.(*gittree.FS).Location(), result.Source.FS.(*gittree.FS).Location())
+	if data, err := fs.ReadFile(result.BaseInput.FS, "kubernetes/flux/cluster/cluster.yaml"); err != nil || string(data) != "x" {
+		t.Fatalf("baseline file: %q %v", data, err)
 	}
 }
 
@@ -342,119 +479,42 @@ func TestAutoResolve_PathOrigMappedToSubdir(t *testing.T) {
 // Result (TempDir / SelfURLs) and threaded explicitly, so the marker the
 // old repo-root "widen" heuristic needed is gone.
 func TestAutoResolve_NoGitMarker(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	initRepoWithFile(t, dir, "a.yaml", "x")
 	commit := writeAndCommit(t, dir, "a.yaml", "y")
-	res, err := AutoResolve(dir, commit.String(), cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, commit.String(), cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
+
 	// The materialized file is present...
-	if _, err := os.Stat(filepath.Join(res.TempDir, "a.yaml")); err != nil {
+	if _, err := fs.Stat(res.BaseInput.FS, "a.yaml"); err != nil {
 		t.Errorf("expected materialized file in TempDir: %v", err)
 	}
 	// ...but no synthetic .git marker.
-	if _, err := os.Stat(filepath.Join(res.TempDir, ".git")); !os.IsNotExist(err) {
+	if _, err := fs.Stat(res.BaseInput.FS, ".git"); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("materialized baseline must have no .git marker; stat err = %v", err)
 	}
 }
 
-// TestAutoResolve_CachedReusesSlot: when cacheRoot is non-empty, the
-// baseline lands at <cacheRoot>/baselines/<sha>/. A second AutoResolve
-// against the same commit returns Persistent=true with the same dir
-// and skips re-materialization. Removing a file from the materialized
-// tree before the second call would normally be a no-op since we don't
-// re-walk — locking that contract here.
-func TestAutoResolve_CachedReusesSlot(t *testing.T) {
+func TestAutoResolve_PreservesExecutableBit(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	initRepoWithFile(t, dir, "a.yaml", "x")
-	commit := writeAndCommit(t, dir, "a.yaml", "y")
-	cacheRoot := t.TempDir()
-
-	res1, err := AutoResolve(dir, commit.String(), cacheroot.New(cacheRoot))
-	if err != nil {
-		t.Fatalf("AutoResolve 1: %v", err)
-	}
-	if !res1.Persistent {
-		t.Error("cached AutoResolve should report Persistent=true")
-	}
-	want := filepath.Join(cacheRoot, "baselines", commit.String())
-	if res1.TempDir != want {
-		t.Errorf("TempDir = %q, want %q", res1.TempDir, want)
-	}
-	// Stamp a sentinel so we can prove run 2 didn't re-materialize
-	// (which would replace the stamp).
-	sentinel := filepath.Join(res1.TempDir, ".flate-test-stamp")
-	if err := os.WriteFile(sentinel, []byte("kept"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	res2, err := AutoResolve(dir, commit.String(), cacheroot.New(cacheRoot))
-	if err != nil {
-		t.Fatalf("AutoResolve 2: %v", err)
-	}
-	if res2.TempDir != res1.TempDir {
-		t.Errorf("second call drifted: %q vs %q", res2.TempDir, res1.TempDir)
-	}
-	if got, _ := os.ReadFile(sentinel); string(got) != "kept" { //nolint:gosec // sentinel built under t.TempDir
-		t.Errorf("second call re-materialized; sentinel = %q", got)
-	}
-}
-
-// TestAutoResolve_NoCacheRootIsTempdir confirms the legacy path still
-// works: empty cacheRoot → MkdirTemp directory, Persistent=false.
-func TestAutoResolve_NoCacheRootIsTempdir(t *testing.T) {
-	dir := t.TempDir()
-	initRepoWithFile(t, dir, "a.yaml", "x")
-	commit := writeAndCommit(t, dir, "a.yaml", "y")
-
-	res, err := AutoResolve(dir, commit.String(), cacheroot.Layout{})
-	if err != nil {
-		t.Fatalf("AutoResolve: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Persistent {
-		t.Error("uncached AutoResolve should report Persistent=false")
-	}
-	if !strings.HasPrefix(filepath.Base(res.TempDir), "flate-baseline-") {
-		t.Errorf("uncached TempDir = %q, want flate-baseline-* basename", res.TempDir)
-	}
-}
-
-// TestMaterialize_PreservesExecutableBit: blobs stored as executable
-// must be written with the exec bit set so downstream consumers (e.g.,
-// scripts referenced by configMapGenerator with envs:) behave the
-// same against the baseline as against the working tree.
-func TestMaterialize_PreservesExecutableBit(t *testing.T) {
-	dir := t.TempDir()
-	r, err := git.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := testutil.GitInit(t, dir)
 	script := filepath.Join(dir, "run.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil { //nolint:gosec // test fixture
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := wt.Add("run.sh"); err != nil {
-		t.Fatal(err)
-	}
-	commit, err := wt.Commit("init", &git.CommitOptions{
+	commit := testutil.GitCommitAll(t, r, "init", &git.CommitOptions{
 		Author: &object.Signature{Name: "t", Email: "t@example", When: time.Unix(0, 0)},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := AutoResolve(dir, commit.String(), cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), dir, commit.String(), cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	info, err := os.Stat(filepath.Join(res.TempDir, "run.sh"))
+
+	info, err := fs.Stat(res.BaseInput.FS, "run.sh")
 	if err != nil {
 		t.Fatalf("stat materialized run.sh: %v", err)
 	}
@@ -463,28 +523,31 @@ func TestMaterialize_PreservesExecutableBit(t *testing.T) {
 	}
 }
 
-// TestAutoResolve_LinkedWorktree pins auto-resolution inside a linked
-// worktree. Opened without the common dir, no ref resolves at all and
-// the ladder never gets past HEAD.
+// Linked metadata must open through the common directory.
 func TestAutoResolve_LinkedWorktree(t *testing.T) {
+	t.Parallel()
 	mainDir := t.TempDir()
 	baseCommit := initRepoWithFile(t, mainDir, "a.yaml", "base")
 	repo := openHelper(t, mainDir)
+	const remoteURL = "https://example.invalid/upstream.git"
+	_, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{remoteURL}})
+	assert.Equal(t, err, nil)
 	setRef(t, repo, plumbing.NewRemoteReferenceName("origin", "main"), baseCommit)
 	headCommit := writeAndCommit(t, mainDir, "a.yaml", "new")
 	setRef(t, repo, plumbing.NewBranchReferenceName("feature"), headCommit)
 
 	wtDir := linkedWorktree(t, mainDir, "wt", plumbing.NewBranchReferenceName("feature"))
 
-	res, err := AutoResolve(wtDir, "", cacheroot.Layout{})
+	res, err := AutoResolve(t.Context(), wtDir, "", cachetest.New(t, "", sourcecache.New))
 	if err != nil {
 		t.Fatalf("AutoResolve in linked worktree: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(res.TempDir) }()
-	if res.Source != "merge-base with origin/main" {
-		t.Errorf("Source = %q, want 'merge-base with origin/main'", res.Source)
+
+	assert.Diff(t, res.SelfURLs, []string{remoteURL})
+	if res.Source.Metadata["baseline-selection"] != "merge-base with origin/main" {
+		t.Errorf("Source = %q, want 'merge-base with origin/main'", res.Source.Metadata["baseline-selection"])
 	}
-	got, err := os.ReadFile(filepath.Join(res.TempDir, "a.yaml"))
+	got, err := fs.ReadFile(res.BaseInput.FS, "a.yaml")
 	if err != nil {
 		t.Fatalf("read materialized: %v", err)
 	}
@@ -497,6 +560,7 @@ func TestAutoResolve_LinkedWorktree(t *testing.T) {
 // common dir, so a worktree that exhausts the ladder must still get the
 // fetch-depth guidance rather than the "no upstream" advice.
 func TestAutoResolve_ShallowLinkedWorktree(t *testing.T) {
+	t.Parallel()
 	mainDir := t.TempDir()
 	commit := initRepoWithFile(t, mainDir, "a.yaml", "x")
 	repo := openHelper(t, mainDir)
@@ -506,7 +570,9 @@ func TestAutoResolve_ShallowLinkedWorktree(t *testing.T) {
 	}
 	wtDir := linkedWorktree(t, mainDir, "wt", plumbing.NewBranchReferenceName("feature"))
 
-	_, err := AutoResolve(wtDir, "", cacheroot.Layout{})
+	_, err := AutoResolve(t.Context(), wtDir, "", cachetest.New(t, "", sourcecache.New))
+	assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+	assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
 	if err == nil {
 		t.Fatal("expected shallow error")
 	}
@@ -515,49 +581,22 @@ func TestAutoResolve_ShallowLinkedWorktree(t *testing.T) {
 	}
 }
 
-// --- helpers --------------------------------------------------------
-
 func initRepoWithFile(t *testing.T, dir, path, content string) plumbing.Hash {
 	t.Helper()
-	r, err := git.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := testutil.GitInit(t, dir)
 	testutil.WriteFileAt(t, filepath.Join(dir, path), content)
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := wt.Add(path); err != nil {
-		t.Fatal(err)
-	}
-	hash, err := wt.Commit("init", &git.CommitOptions{
+	return testutil.GitCommitAll(t, r, "init", &git.CommitOptions{
 		Author: &object.Signature{Name: "t", Email: "t@example", When: time.Unix(0, 0)},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return hash
 }
 
 func writeAndCommit(t *testing.T, dir, path, content string) plumbing.Hash {
 	t.Helper()
 	testutil.WriteFileAt(t, filepath.Join(dir, path), content)
 	r := openHelper(t, dir)
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := wt.Add(path); err != nil {
-		t.Fatal(err)
-	}
-	hash, err := wt.Commit("update", &git.CommitOptions{
+	return testutil.GitCommitAll(t, r, "update", &git.CommitOptions{
 		Author: &object.Signature{Name: "t", Email: "t@example", When: time.Unix(0, 0)},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return hash
 }
 
 func openHelper(t *testing.T, dir string) *git.Repository {
@@ -583,7 +622,7 @@ func setSymRef(t *testing.T, repo *git.Repository, name, target plumbing.Referen
 	}
 }
 
-func configureBranch(t *testing.T, repo *git.Repository, branch, remote, merge string) {
+func configureBranch(t *testing.T, repo *git.Repository, branch *config.Branch) {
 	t.Helper()
 	cfg, err := repo.Config()
 	if err != nil {
@@ -592,11 +631,7 @@ func configureBranch(t *testing.T, repo *git.Repository, branch, remote, merge s
 	if cfg.Branches == nil {
 		cfg.Branches = map[string]*config.Branch{}
 	}
-	cfg.Branches[branch] = &config.Branch{
-		Name:   branch,
-		Remote: remote,
-		Merge:  plumbing.ReferenceName(merge),
-	}
+	cfg.Branches[branch.Name] = branch
 	if err := repo.SetConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -626,4 +661,133 @@ func linkedWorktree(t *testing.T, mainDir, name string, branch plumbing.Referenc
 		}
 	}
 	return wtDir
+}
+
+func TestResolve_RetainedConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, route := range []string{"upstream", "origin"} {
+		t.Run(route, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			base := initRepoWithFile(t, root, "a.yaml", "base")
+			repo := openHelper(t, root)
+			head, err := repo.Head()
+			assert.NoError(t, err)
+			var explicit string
+			if route == "upstream" {
+				setRef(t, repo, plumbing.NewRemoteReferenceName("upstream", "trunk"), base)
+				configureBranch(t, repo, &config.Branch{Name: head.Name().Short(), Remote: "upstream", Merge: plumbing.NewBranchReferenceName("trunk")})
+				writeAndCommit(t, root, "a.yaml", "head")
+			} else {
+				remote := t.TempDir()
+				base = initRepoWithFile(t, remote, "a.yaml", "remote")
+				setRef(t, openHelper(t, remote), plumbing.NewBranchReferenceName("trunk"), base)
+				addOrigin(t, root, filepath.Join(remote, ".git"))
+				explicit = "trunk"
+			}
+			input, _, err := AdmitDirectory(t.Context(), root, "")
+			assert.NoError(t, err)
+			location := input.FS.(*gittree.FS).Location()
+			assert.NoError(t, os.Remove(filepath.Join(root, ".git", "config")))
+			resolved, err := resolve(t.Context(), location, explicit, cachetest.New(t, "", sourcecache.New))
+			assert.NoError(t, err)
+			assert.Equal(t, resolved.Hash, base)
+			if route == "upstream" {
+				assert.Equal(t, resolved.Source, "merge-base with @{u}")
+			} else if !strings.Contains(resolved.Source, "fetched from origin") {
+				t.Fatalf("origin selection = %q", resolved.Source)
+			}
+		})
+	}
+}
+
+func TestAdmitDirectory_ExplicitRootRetainsRepository(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initRepoWithFile(t, root, "cluster/a.yaml", "body")
+	const url = "https://example.invalid/cluster.git"
+	addOrigin(t, root, url)
+	content := filepath.Join(root, "cluster")
+	input, scan, err := AdmitDirectory(t.Context(), content, content)
+	assert.NoError(t, err)
+	location := input.FS.(*gittree.FS).Location()
+	assert.Equal(t, scan, content)
+	assert.Equal(t, input.LocalRoot, content)
+	assert.Equal(t, location.ContentRoot, content)
+	assert.Equal(t, location.RepositoryRoot, root)
+	assert.NoError(t, os.Remove(filepath.Join(root, ".git", "config")))
+	got, ok := originURL(location.Config)
+	assert.Equal(t, ok, true)
+	assert.Equal(t, got, url)
+	body, err := fs.ReadFile(input.FS, "a.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, string(body), "body")
+	_, _, err = AdmitDirectory(t.Context(), root, content)
+	if err == nil || !strings.Contains(err.Error(), "outside the source root") {
+		t.Fatalf("escaped scan was admitted: %v", err)
+	}
+}
+
+func TestResolvePaths_ReusesRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initRepoWithFile(t, root, "current/a.yaml", "current")
+	testutil.WriteFile(t, root, "original/a.yaml", "original")
+	for _, sameScan := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same_scan_%t", sameScan), func(t *testing.T) {
+			t.Parallel()
+			current, original := filepath.Join(root, "current"), filepath.Join(root, "original")
+			if sameScan {
+				original = current
+			}
+			result, err := ResolvePaths(t.Context(), current, original)
+			assert.NoError(t, err)
+			assert.Equal(t, result.Source, result.BaseInput)
+			assert.Equal(t, result.ScanPath, current)
+			assert.Equal(t, result.BaseScanPath, original)
+			missing := filepath.Join(root, "missing")
+			_, err = ResolvePaths(t.Context(), missing, original)
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("missing same-root scan was admitted: %v", err)
+			}
+			assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+			assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
+			assert.Equal(t, strings.Contains(err.Error(), missing), true)
+		})
+	}
+}
+
+func TestResolve_InputErrors(t *testing.T) {
+	t.Parallel()
+	headCause := errors.New("read HEAD")
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "HEAD lookup", cause: headCause},
+		{name: "missing HEAD commit", cause: plumbing.ErrObjectNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var storer storage.Storer = memory.NewStorage()
+			if tc.name == "HEAD lookup" {
+				storer = &headErrorStorage{Storer: storer, err: tc.cause}
+			} else {
+				assert.NoError(t, storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash(strings.Repeat("a", 40)))))
+			}
+			_, err := resolve(t.Context(), &gitrepo.Location{Repository: &git.Repository{Storer: storer}}, "", nil)
+			assert.Equal(t, errors.Is(err, manifest.ErrInput), true)
+			assert.Equal(t, errors.Is(err, manifest.ErrFlux), true)
+			assert.Equal(t, errors.Is(err, tc.cause), true)
+		})
+	}
+}
+
+type headErrorStorage struct {
+	storage.Storer
+	err error
+}
+
+func (s *headErrorStorage) Reference(plumbing.ReferenceName) (*plumbing.Reference, error) {
+	return nil, s.err
 }

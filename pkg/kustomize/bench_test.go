@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	"github.com/home-operations/flate/internal/testutil"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 )
 
-// BenchmarkRenderFlux_SmallKS measures the end-to-end RenderFlux call
+// BenchmarkRender_SmallKS measures the end-to-end Render call
 // for a tiny single-resource kustomize tree. Reasonable upper bound on
 // the per-KS cost in a real run.
-func BenchmarkRenderFlux_SmallKS(b *testing.B) {
+func BenchmarkRender_SmallKS(b *testing.B) {
 	src := b.TempDir()
 	testutil.WriteFile(b, src, "kustomization.yaml", "resources:\n- cm.yaml\n")
 	testutil.WriteFile(b, src, "cm.yaml", `apiVersion: v1
@@ -24,22 +25,23 @@ data:
   k: v
 `)
 
-	cache := NewTreeCache()
+	cache := newTestTreeCache(b, "")
 
-	rawSpec := map[string]any{
+	rawSpec := parsedKS(b, map[string]any{
 		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
 		"kind":       "Kustomization",
 		"metadata":   map[string]any{"name": "small", "namespace": "ns"},
 		"spec":       map[string]any{"path": "./"},
-	}
+	})
+	input := localSource(b, src)
 	ctx := context.Background()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out, err := RenderFlux(ctx, cache, src, false, ".", rawSpec)
+		out, err := Render(ctx, cache, RenderRequest{Source: input, Label: src, ApplyIgnore: false, SubPath: ".", Spec: rawSpec}, sourcecache.RetryConfig{})
 		if err != nil {
-			b.Fatalf("RenderFlux: %v", err)
+			b.Fatalf("Render: %v", err)
 		}
 		if len(out) == 0 {
 			b.Fatalf("empty render")
@@ -47,11 +49,52 @@ data:
 	}
 }
 
-// BenchmarkRenderFlux_DeepComponentStack measures RenderFlux against a
+// BenchmarkRender_CacheHit measures read-set replay on a warm disk render cache.
+func BenchmarkRender_CacheHit(b *testing.B) {
+	src := b.TempDir()
+	resources := make([]string, 0, 20)
+	for i := range 20 {
+		name := fmt.Sprintf("cm-%d", i)
+		resources = append(resources, name+".yaml")
+		testutil.WriteFile(b, src, "app/"+name+".yaml", cmYAML(name))
+	}
+	testutil.WriteFile(b, src, "app/kustomization.yaml", existingKustomization(resources...))
+	cache := newTestTreeCache(b, b.TempDir())
+	if !renderPersistenceEligible(b) {
+		b.Skip("warm render benchmark requires eligible build metadata")
+	}
+	req := RenderRequest{
+		Source:  localSource(b, src),
+		Label:   src,
+		SubPath: "app",
+		Spec: parsedKS(b, map[string]any{
+			"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+			"kind":       "Kustomization",
+			"metadata":   map[string]any{"name": "cached", "namespace": "ns"},
+			"spec":       map[string]any{"path": "./app"},
+		}),
+	}
+	ctx := b.Context()
+	if _, err := Render(ctx, cache, req, sourcecache.RetryConfig{}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := Render(ctx, cache, req, sourcecache.RetryConfig{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(out) == 0 {
+			b.Fatal("empty render")
+		}
+	}
+}
+
+// BenchmarkRender_DeepComponentStack measures Render against a
 // KS whose kustomize tree pulls in 5 nested Components — the real cost
 // pattern when a flux-system overlay stacks multiple shared component
 // fragments.
-func BenchmarkRenderFlux_DeepComponentStack(b *testing.B) {
+func BenchmarkRender_DeepComponentStack(b *testing.B) {
 	src := b.TempDir()
 	const depth = 5
 
@@ -85,22 +128,23 @@ data:
 `, i))
 	}
 
-	cache := NewTreeCache()
+	cache := newTestTreeCache(b, "")
 
-	rawSpec := map[string]any{
+	rawSpec := parsedKS(b, map[string]any{
 		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
 		"kind":       "Kustomization",
 		"metadata":   map[string]any{"name": "deep", "namespace": "ns"},
 		"spec":       map[string]any{"path": "./"},
-	}
+	})
+	input := localSource(b, src)
 	ctx := context.Background()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		out, err := RenderFlux(ctx, cache, src, false, ".", rawSpec)
+		out, err := Render(ctx, cache, RenderRequest{Source: input, Label: src, ApplyIgnore: false, SubPath: ".", Spec: rawSpec}, sourcecache.RetryConfig{})
 		if err != nil {
-			b.Fatalf("RenderFlux: %v", err)
+			b.Fatalf("Render: %v", err)
 		}
 		if len(out) == 0 {
 			b.Fatalf("empty render")
@@ -108,11 +152,10 @@ data:
 	}
 }
 
-// BenchmarkRenderFlux_MultiKSPerRoot measures concurrent renders of distinct
+// BenchmarkRender_MultiKSPerRoot measures concurrent renders of distinct
 // subPaths under the SAME source root — the bulk of a single-cluster repo,
-// where the memory-over-disk overlay lets every render run in parallel against
-// the shared read-only source with no staging lock.
-func BenchmarkRenderFlux_MultiKSPerRoot(b *testing.B) {
+// with private construction overlays over a shared read-only source.
+func BenchmarkRender_MultiKSPerRoot(b *testing.B) {
 	src := b.TempDir()
 	const apps = 40
 	for i := range apps {
@@ -122,14 +165,15 @@ func BenchmarkRenderFlux_MultiKSPerRoot(b *testing.B) {
 			"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-%d\n  namespace: ns\ndata:\n  k: v\n", i))
 	}
 
-	cache := NewTreeCache()
+	cache := newTestTreeCache(b, "")
+	input := localSource(b, src)
 	ctx := context.Background()
-	rawSpec := map[string]any{
+	rawSpec := parsedKS(b, map[string]any{
 		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
 		"kind":       "Kustomization",
 		"metadata":   map[string]any{"name": "multi", "namespace": "ns"},
 		"spec":       map[string]any{},
-	}
+	})
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -137,13 +181,17 @@ func BenchmarkRenderFlux_MultiKSPerRoot(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			sub := fmt.Sprintf("apps/app-%d", int(ctr.Add(1))%apps)
-			out, err := RenderFlux(ctx, cache, src, false, sub, rawSpec)
+			out, err := Render(ctx, cache, RenderRequest{Source: input, Label: src, ApplyIgnore: false, SubPath: sub, Spec: rawSpec}, sourcecache.RetryConfig{})
 			if err != nil {
-				b.Fatalf("RenderFlux: %v", err)
+				b.Fatalf("Render: %v", err)
 			}
 			if len(out) == 0 {
 				b.Fatalf("empty render")
 			}
 		}
 	})
+}
+
+func BenchmarkRender_CacheHitConstructed(b *testing.B) {
+	BenchmarkRender_CacheHit(b)
 }

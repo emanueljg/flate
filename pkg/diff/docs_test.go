@@ -7,55 +7,46 @@ import (
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// TestDocsFromManifests_GroupsByParentDeterministically locks parent sort
-// order (so dyff/unified input is stable across the map's random
-// iteration), within-parent emission order, and the pathOf wiring.
-func TestDocsFromManifests_GroupsByParentDeterministically(t *testing.T) {
-	ksA := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "a"}
-	ksB := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "b"}
-	manifests := map[manifest.NamedResource][]map[string]any{
-		ksB: {{"kind": "ConfigMap", "metadata": map[string]any{"name": "b1"}}},
-		ksA: {
+func TestSelectedDocs_PreservesProducerAndEmissionOrder(t *testing.T) {
+	t.Parallel()
+	a := &manifest.Kustomization{Name: "a", Namespace: "ns"}
+	a.Path = "././apps/a"
+	b := &manifest.Kustomization{Name: "b", Namespace: "ns"}
+	hr := &manifest.HelmRelease{Name: "hr", Namespace: "ns"}
+	single := &manifest.Kustomization{Name: "single", Namespace: "ns", Path: "./apps/a"}
+	manifests := []manifest.DocumentBatch{
+		{Parent: a, Documents: []map[string]any{
 			{"kind": "ConfigMap", "metadata": map[string]any{"name": "a1"}},
 			{"kind": "ConfigMap", "metadata": map[string]any{"name": "a2"}},
-		},
+		}},
+		{Parent: b, Documents: []map[string]any{{"kind": "ConfigMap", "metadata": map[string]any{"name": "b1"}}}},
+		{Parent: hr, Documents: []map[string]any{{"kind": "Service"}}},
+		{Parent: single, Documents: []map[string]any{{"kind": "ConfigMap"}}},
+		{Documents: []map[string]any{{"kind": "Namespace", "metadata": map[string]any{"name": "root"}}}},
 	}
-	pathOf := func(id manifest.NamedResource) string {
-		if id.Name == "a" {
-			return "apps/a"
-		}
-		return ""
+	docs := selectedDocs(manifests)
+	if len(docs) != 6 {
+		t.Fatalf("want 6 docs, got %d", len(docs))
 	}
-
-	docs := DocsFromManifests(manifests, pathOf)
-	if len(docs) != 3 {
-		t.Fatalf("want 3 docs, got %d", len(docs))
+	if docs[0].Parent.NamedResource != a.Named() || docs[0].Parent.Path != "./apps/a" {
+		t.Errorf("doc[0] parent = %+v; want a / ./apps/a", docs[0].Parent)
 	}
-	// ksA sorts before ksB; a1 before a2 (slice order preserved).
-	if docs[0].Parent.Name != "a" || docs[0].Parent.Path != "apps/a" {
-		t.Errorf("doc[0] parent = %+v; want a / apps/a", docs[0].Parent)
-	}
-	if name, _ := docs[1].Manifest["metadata"].(map[string]any)["name"].(string); name != "a2" {
+	if name, _ := manifest.DocMetadata(docs[1].Manifest); name != "a2" {
 		t.Errorf("within-parent order not preserved; doc[1] = %v", docs[1].Manifest)
 	}
-	if docs[2].Parent.Name != "b" || docs[2].Parent.Path != "" {
+	if docs[2].Parent.NamedResource != b.Named() || docs[2].Parent.Path != "" {
 		t.Errorf("doc[2] parent = %+v; want b / empty path", docs[2].Parent)
 	}
-
-	if docs2 := DocsFromManifests(manifests, pathOf); !reflect.DeepEqual(docs, docs2) {
-		t.Errorf("DocsFromManifests must be deterministic across map iteration")
+	if docs[3].Parent.NamedResource != hr.Named() || docs[3].Parent.Path != "" {
+		t.Errorf("doc[3] parent = %+v; want HelmRelease.helm.toolkit.fluxcd.io / empty path", docs[3].Parent)
 	}
-}
-
-// TestDocsFromManifests_NilPathOf confirms a nil pathOf leaves Path empty
-// (the common consumer case — HelmRelease parents, or callers that don't
-// need overlay disambiguation).
-func TestDocsFromManifests_NilPathOf(t *testing.T) {
-	id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "ns", Name: "hr"}
-	docs := DocsFromManifests(map[manifest.NamedResource][]map[string]any{
-		id: {{"kind": "Service"}},
-	}, nil)
-	if len(docs) != 1 || docs[0].Parent.Path != "" {
-		t.Errorf("nil pathOf should leave Path empty; got %+v", docs)
+	if docs[4].Parent.NamedResource != single.Named() || docs[4].Parent.Path != "apps/a" {
+		t.Errorf("doc[4] parent = %+v; want single / apps/a", docs[4].Parent)
+	}
+	if docs[5].Parent != (Parent{}) || manifest.DocIdentity(docs[5].Manifest).Name != "root" {
+		t.Fatalf("ownerless identity or attribution lost: %+v", docs[5])
+	}
+	if got := selectedDocs(manifests); !reflect.DeepEqual(docs, got) {
+		t.Error("selectedDocs must preserve the completed selection order")
 	}
 }

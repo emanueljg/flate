@@ -1,54 +1,57 @@
 package kustomize
 
 import (
-	"os"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/home-operations/flate/internal/testutil"
+
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	fluxkustomize "github.com/fluxcd/pkg/kustomize"
-	fluxfilesys "github.com/fluxcd/pkg/kustomize/filesys"
+	"github.com/go-git/go-git/v5/plumbing"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 
-	"github.com/home-operations/flate/pkg/source/sourceignore"
+	"github.com/home-operations/flate/internal/assert"
+	kustomizestate "github.com/home-operations/flate/internal/kustomize"
+	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/gitrepo"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-// testOverlayFS builds the same memory-over-disk overlay RenderFlux uses:
-// source files are read from a secure on-disk FS rooted at root; writes go to
-// memory.
-func testOverlayFS(t *testing.T, root string) filesys.FileSystem {
-	t.Helper()
-	disk, err := fluxfilesys.MakeFsOnDiskSecure(root)
-	if err != nil {
-		t.Fatalf("secure fs: %v", err)
-	}
-	return newOverlayFS(disk, nil)
+func localSource(tb testing.TB, root string) *store.SourceArtifact {
+	tb.Helper()
+	location, err := gitrepo.Locate(tb.Context(), root, root)
+	assert.NoError(tb, err)
+	admitted, err := gittree.AdmitDirectory(tb.Context(), location)
+	assert.NoError(tb, err)
+	return &store.SourceArtifact{LocalPath: root, FS: admitted.FS}
 }
 
-// testIgnoreOverlayFS is testOverlayFS with the source-controller ignore
-// matcher loaded from root in front of the disk layer — the working-tree
-// (applyIgnore) view RenderFlux builds against.
-func testIgnoreOverlayFS(t *testing.T, root string) filesys.FileSystem {
+func testTreeFS(t *testing.T, root string) filesys.FileSystem {
 	t.Helper()
-	disk, err := fluxfilesys.MakeFsOnDiskSecure(root)
+	input, _, err := source.OperationView(t.Context(), localSource(t, root).FS)
 	if err != nil {
-		t.Fatalf("secure fs: %v", err)
+		t.Fatal(err)
 	}
-	matcher, err := sourceignore.New(root, nil, true)
-	if err != nil {
-		t.Fatalf("matcher: %v", err)
-	}
-	return newOverlayFS(newIgnoreFS(disk, root, matcher), nil)
+	return newTreeFS(input, root, nil)
 }
 
-// These tests pin flate's in-memory generateManifest to flux's real on-disk
-// Generator.GenerateManifest. The acceptance gate for the whole in-memory
-// redesign is byte-equivalence: for an identical source tree and Kustomization
-// spec, the kustomization.yaml flate synthesizes in RAM must be byte-for-byte
-// what flux writes to disk. If flux changes its merge, these tests fail and we
-// re-port — they are the contract.
+func testIgnoreTreeFS(t *testing.T, root string) filesys.FileSystem {
+	t.Helper()
+	input, _, err := gittree.New(t.Context(), nil, plumbing.ZeroHash, gittree.ViewOptions{Mode: gittree.Source, Current: localSource(t, root).FS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTreeFS(input, root, nil)
+}
 
 // cmYAML is a minimal manifest that kustomize's resource factory accepts, used
 // wherever scanManifests must see a valid Kubernetes YAML.
@@ -69,27 +72,6 @@ func existingKustomization(resources ...string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// writeTree materializes files (relative path -> contents) under a fresh temp
-// dir, returning the symlink-resolved root (macOS /var -> /private/var) so the
-// path flux's secure FS confirms matches what the test passes in.
-func writeTree(t *testing.T, files map[string]string) string {
-	t.Helper()
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatalf("evalsymlinks tempdir: %v", err)
-	}
-	for rel, body := range files {
-		p := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-			t.Fatalf("mkdir %s: %v", p, err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", p, err)
-		}
-	}
-	return root
-}
-
 // ksDoc wraps an inner spec in a full Flux Kustomization document.
 func ksDoc(spec map[string]any) map[string]any {
 	if spec == nil {
@@ -103,16 +85,37 @@ func ksDoc(spec map[string]any) map[string]any {
 	}
 }
 
-func deepCopyDoc(t *testing.T, doc map[string]any) map[string]any {
-	t.Helper()
-	out, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&unstructured.Unstructured{Object: doc})
+func parsedKS(tb testing.TB, doc map[string]any) *manifest.Kustomization {
+	tb.Helper()
+	obj, _, _, err := manifest.ParseDoc(doc, manifest.ParseDocOptions{})
 	if err != nil {
-		t.Fatalf("deep copy doc: %v", err)
+		tb.Fatal(err)
 	}
-	return runtime.DeepCopyJSON(out)
+	return obj.(*manifest.Kustomization)
+}
+
+func renderDoc(tb testing.TB, ks *manifest.Kustomization) map[string]any {
+	tb.Helper()
+	doc, err := ks.RenderDocument()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return doc
+}
+
+func typedFluxDoc(tb testing.TB, doc map[string]any) map[string]any {
+	tb.Helper()
+	raw, err := json.Marshal(doc)
+	assert.NoError(tb, err)
+	var cr kustomizev1.Kustomization
+	assert.NoError(tb, json.Unmarshal(raw, &cr))
+	typed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&cr)
+	assert.NoError(tb, err)
+	return typed
 }
 
 func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
+	t.Parallel()
 	patch := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 3\n"
 
 	cases := []struct {
@@ -179,7 +182,7 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 			subPath: ".",
 			spec: map[string]any{"patchesJson6902": []any{
 				map[string]any{
-					"patch":  []any{map[string]any{"op": "replace", "path": "/spec/replicas", "value": int64(5)}},
+					"patch":  []any{map[string]any{"op": "replace", "path": "/spec/replicas", "value": int64(9007199254740993)}},
 					"target": map[string]any{"group": "apps", "version": "v1", "kind": "Deployment", "name": "app"},
 				},
 			}},
@@ -195,6 +198,51 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 				map[string]any{"name": "nginx", "newTag": "2.0"},
 				map[string]any{"name": "redis", "newName": "ghcr.io/redis"},
 			}},
+		},
+		{
+			name: "image tag override preserves registry",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newName: mirror/nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "2.0"}}},
+		},
+		{
+			name: "image registry override preserves version",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newName: mirror/nginx\n  digest: sha256:old\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newName": "other/nginx"}}},
+		},
+		{
+			name: "image digest override clears tag",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "digest": "sha256:new"}}},
+		},
+		{
+			name: "image tag override clears digest",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  digest: sha256:old\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "2.0"}}},
+		},
+		{
+			name: "repeated spec image merges fields",
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deploy.yaml") + "images:\n- name: nginx\n  newTag: \"1.0\"\n",
+				"deploy.yaml":        cmYAML("deploy"),
+			},
+			subPath: ".",
+			spec:    map[string]any{"images": []any{map[string]any{"name": "nginx", "newName": "mirror/nginx"}, map[string]any{"name": "nginx", "newTag": "2.0"}}},
 		},
 		{
 			name: "components with ignoreMissing",
@@ -231,20 +279,92 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 		},
 	}
 
+	for _, field := range []string{"targetNamespace", "namePrefix", "nameSuffix"} {
+		for _, shape := range []string{"absent", "empty", "null"} {
+			spec := map[string]any{}
+			switch shape {
+			case "empty":
+				spec[field] = ""
+			case "null":
+				spec[field] = nil
+			}
+			cases = append(cases, struct {
+				name    string
+				files   map[string]string
+				subPath string
+				spec    map[string]any
+			}{field + "/" + shape, map[string]string{
+				"kustomization.yaml": existingKustomization("cm.yaml") + "namespace: original\nnamePrefix: before-\nnameSuffix: -after\n",
+				"cm.yaml":            cmYAML("config"),
+			}, ".", spec})
+		}
+	}
+	for _, field := range []string{"patches", "images", "components", "buildMetadata", "patchesStrategicMerge", "patchesJson6902"} {
+		for _, shape := range []string{"null", "null elements", "mixed null elements", "invalid field"} {
+			if shape == "invalid field" && field != "patchesStrategicMerge" && field != "patchesJson6902" {
+				continue
+			}
+			var value any
+			if shape == "invalid field" {
+				value = "not-a-list"
+			}
+			if shape == "null elements" {
+				value = []any{nil, nil}
+			}
+			if shape == "mixed null elements" {
+				var valid any = map[string]any{}
+				if field == "components" || field == "buildMetadata" {
+					valid = "keep"
+				}
+				value = []any{valid, nil, valid, nil}
+			}
+			cases = append(cases, struct {
+				name    string
+				files   map[string]string
+				subPath string
+				spec    map[string]any
+			}{field + "/" + shape, map[string]string{
+				"kustomization.yaml": existingKustomization("cm.yaml"), "cm.yaml": cmYAML("config"),
+			}, ".", map[string]any{field: value}})
+		}
+	}
+
+	for _, namespace := range []string{"", "apps"} {
+		cases = append(cases, struct {
+			name    string
+			files   map[string]string
+			subPath string
+			spec    map[string]any
+		}{
+			name: "namespace identity/" + namespace,
+			files: map[string]string{
+				"kustomization.yaml": existingKustomization("deployment.yaml", "role.yaml", "gateway.yaml"),
+				"deployment.yaml":    "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: deployment}\n",
+				"role.yaml":          "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: role}\n",
+				"gateway.yaml":       "apiVersion: gateway.networking.k8s.io/v1\nkind: GatewayClass\nmetadata: {name: gateway}\n",
+			},
+			subPath: ".", spec: map[string]any{"targetNamespace": namespace},
+		})
+	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := writeTree(t, tc.files)
+			t.Parallel()
+			root := testutil.WriteTree(t, tc.files)
 			doc := ksDoc(tc.spec)
 
-			gen := fluxkustomize.NewGenerator(root, unstructured.Unstructured{Object: deepCopyDoc(t, doc)})
-			want, _, _, err := gen.GenerateManifest(filepath.Join(root, tc.subPath))
-			if err != nil {
-				t.Fatalf("flux GenerateManifest: %v", err)
-			}
+			gen := fluxkustomize.NewGenerator(root, unstructured.Unstructured{Object: typedFluxDoc(t, doc)})
+			want, _, _, wantErr := gen.GenerateManifest(filepath.Join(root, tc.subPath))
 
-			got, _, err := generateManifest(testOverlayFS(t, root), filepath.Join(root, tc.subPath), deepCopyDoc(t, doc))
-			if err != nil {
-				t.Fatalf("generateManifest: %v", err)
+			borrowed := renderDoc(t, parsedKS(t, manifest.DeepCopyMap(doc)))
+			snapshot := manifest.DeepCopyMap(borrowed)
+			got, _, err := generateManifest(testTreeFS(t, root), filepath.Join(root, tc.subPath), borrowed)
+			assert.Diff(t, borrowed, snapshot)
+			if wantErr != nil || err != nil {
+				if fmt.Sprint(err) != fmt.Sprint(wantErr) {
+					t.Fatalf("generator error = %v, want %v", err, wantErr)
+				}
+				return
 			}
 
 			if string(got) != string(want) {
@@ -254,120 +374,77 @@ func TestGenerateManifest_ByteEquivalentToFlux(t *testing.T) {
 	}
 }
 
-// renderTree runs flate's full in-memory render of subPath against an in-memory
-// fs built from root: generate the merged kustomization.yaml, write it into the
-// fs, build. It returns the rendered resources as YAML.
-func renderInMemory(t *testing.T, root, subPath string, doc map[string]any) []byte {
-	t.Helper()
-	fsys := testOverlayFS(t, root)
-	absSub := filepath.Join(root, subPath)
-	data, kfile, err := generateManifest(fsys, absSub, doc)
-	if err != nil {
-		t.Fatalf("generateManifest: %v", err)
-	}
-	if err := fsys.WriteFile(kfile, data); err != nil {
-		t.Fatalf("write merged kustomization: %v", err)
-	}
-	rm, err := fluxkustomize.Build(fsys, absSub)
-	if err != nil {
-		t.Fatalf("in-memory build: %v", err)
-	}
-	out, err := rm.AsYaml()
-	if err != nil {
-		t.Fatalf("AsYaml: %v", err)
-	}
-	return out
-}
-
-// TestBuild_InMemoryMatchesSecureBuild proves the end-to-end render — generate
-// then build — is byte-identical between flate's in-memory fs and flux's
-// on-disk SecureBuild, the path real Flux uses.
-func TestBuild_InMemoryMatchesSecureBuild(t *testing.T) {
-	cases := []struct {
-		name    string
-		files   map[string]string
-		subPath string
-		spec    map[string]any
+func TestGenerateManifest_TypedOverrides(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                string
+		authored, effective map[string]any
 	}{
-		{
-			name:    "existing kustomization with prefix and namespace",
-			files:   map[string]string{"kustomization.yaml": existingKustomization("cm.yaml"), "cm.yaml": cmYAML("config")},
-			subPath: ".",
-			spec:    map[string]any{"namePrefix": "pre-", "targetNamespace": "team-a"},
-		},
-		{
-			name:    "generated from loose manifests",
-			files:   map[string]string{"a.yaml": cmYAML("alpha"), "b.yaml": cmYAML("beta")},
-			subPath: ".",
-		},
-		{
-			name: "relative parent base",
-			files: map[string]string{
-				"app/kustomization.yaml":  existingKustomization("../base"),
-				"base/kustomization.yaml": existingKustomization("cm.yaml"),
-				"base/cm.yaml":            cmYAML("shared"),
-			},
-			subPath: "app",
-			spec:    map[string]any{"namePrefix": "x-"},
-		},
-	}
-
-	for _, tc := range cases {
+		{name: "scalar nulls", authored: map[string]any{"targetNamespace": nil, "namePrefix": nil, "nameSuffix": nil}, effective: map[string]any{"targetNamespace": "apps", "namePrefix": "pre-", "nameSuffix": "-post"}},
+		{name: "scalar empties", authored: map[string]any{"targetNamespace": "", "namePrefix": "", "nameSuffix": ""}, effective: map[string]any{"targetNamespace": "apps", "namePrefix": "pre-", "nameSuffix": "-post"}},
+		{name: "patches null", authored: map[string]any{"patches": nil}, effective: map[string]any{"patches": []any{map[string]any{"patch": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config}\ndata: {value: typed}\n"}}}},
+		{name: "patch element null", authored: map[string]any{"patches": []any{nil}}, effective: map[string]any{"patches": []any{map[string]any{"patch": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config}\ndata: {value: typed}\n"}}}},
+		{name: "images null", authored: map[string]any{"images": nil}, effective: map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "typed"}}}},
+		{name: "image element null", authored: map[string]any{"images": []any{nil}}, effective: map[string]any{"images": []any{map[string]any{"name": "nginx", "newTag": "typed"}}}},
+		{name: "components null", authored: map[string]any{"components": nil}, effective: map[string]any{"components": []any{"./component"}}},
+		{name: "component element null", authored: map[string]any{"components": []any{nil}}, effective: map[string]any{"components": []any{"./component"}}},
+		{name: "buildMetadata null", authored: map[string]any{"buildMetadata": nil}, effective: map[string]any{"buildMetadata": []any{"originAnnotations"}}},
+		{name: "buildMetadata element null", authored: map[string]any{"buildMetadata": []any{nil}}, effective: map[string]any{"buildMetadata": []any{"originAnnotations"}}},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := writeTree(t, tc.files)
-			doc := ksDoc(tc.spec)
-
-			// flux on-disk pipeline: write the generated kustomization, SecureBuild.
-			absSub := filepath.Join(root, tc.subPath)
-			gen := fluxkustomize.NewGenerator(root, unstructured.Unstructured{Object: deepCopyDoc(t, doc)})
-			if _, err := gen.WriteFile(absSub); err != nil {
-				t.Fatalf("flux WriteFile: %v", err)
-			}
-			rm, err := fluxkustomize.SecureBuild(root, absSub, false)
-			if err != nil {
-				t.Fatalf("SecureBuild: %v", err)
-			}
-			want, err := rm.AsYaml()
-			if err != nil {
-				t.Fatalf("flux AsYaml: %v", err)
-			}
-
-			// flate in-memory pipeline (capture happens inside, before any disk
-			// mutation matters — the snapshot is independent bytes).
-			got := renderInMemory(t, root, tc.subPath, deepCopyDoc(t, doc))
-
-			if string(got) != string(want) {
-				t.Fatalf("rendered output mismatch\n--- SecureBuild (want) ---\n%s\n--- in-memory (got) ---\n%s", want, got)
-			}
+			t.Parallel()
+			root := testutil.WriteTree(t, map[string]string{"kustomization.yaml": existingKustomization("cm.yaml"), "cm.yaml": cmYAML("config")})
+			ks := parsedKS(t, ksDoc(tc.authored)).Clone()
+			plain := parsedKS(t, ksDoc(tc.effective))
+			ks.KustomizationSpec = plain.KustomizationSpec
+			got, _, err := generateManifest(testTreeFS(t, root), root, renderDoc(t, ks))
+			assert.NoError(t, err)
+			oracle := fluxkustomize.NewGenerator(root, unstructured.Unstructured{Object: typedFluxDoc(t, ksDoc(tc.effective))})
+			want, _, _, err := oracle.GenerateManifest(root)
+			assert.NoError(t, err)
+			assert.Equal(t, string(got), string(want))
+			assert.Equal(t, manifest.Fingerprint(ks.Content(nil)), manifest.Fingerprint(plain.Content(nil)))
 		})
 	}
 }
 
-// TestBuild_InMemorySandbox confirms the in-memory fs reproduces SecureBuild's
-// security posture by construction: a resource escaping the source root cannot
-// be loaded (the node does not exist in the fs), while a legal in-tree parent
-// reference still resolves.
-func TestBuild_InMemorySandbox(t *testing.T) {
-	t.Run("escaping resource fails", func(t *testing.T) {
-		root := writeTree(t, map[string]string{
-			"evil/kustomization.yaml": existingKustomization("../../../../../../../../etc/passwd"),
+func TestRender_NamespaceIdentity(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, namespace string
+		authored        any
+	}{
+		{name: "empty", authored: ""},
+		{name: "target", namespace: "apps", authored: "apps"},
+		{name: "typed over empty", namespace: "apps", authored: ""},
+		{name: "typed over null", namespace: "apps"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := testutil.WriteTree(t, map[string]string{
+				"kustomization.yaml": existingKustomization("deployment.yaml", "role.yaml", "gateway.yaml"),
+				"deployment.yaml":    "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: deployment}\n",
+				"role.yaml":          "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: role}\n",
+				"gateway.yaml":       "apiVersion: gateway.networking.k8s.io/v1\nkind: GatewayClass\nmetadata: {name: gateway}\n",
+			})
+			ks := parsedKS(t, ksDoc(map[string]any{"targetNamespace": tc.authored})).Clone()
+			ks.TargetNamespace = tc.namespace
+			out, err := Render(t.Context(), newTestTreeCache(t, ""), RenderRequest{
+				Source: localSource(t, root), SubPath: ".", Spec: ks,
+			}, sourcecache.RetryConfig{})
+			assert.NoError(t, err)
+			docs := out
+			assert.Equal(t, len(docs), 3)
+			namespaces := make(map[string]string, len(docs))
+			for _, doc := range docs {
+				_, ns := manifest.DocMetadata(doc)
+				namespaces[manifest.DocKind(doc)] = ns
+			}
+			assert.Diff(t, namespaces, map[string]string{
+				"Deployment": tc.namespace, "ClusterRole": "", "GatewayClass": tc.namespace,
+			})
 		})
-		if _, err := fluxkustomize.Build(testOverlayFS(t, root), filepath.Join(root, "evil")); err == nil {
-			t.Fatal("expected build to fail for an out-of-tree resource, got nil error")
-		}
-	})
-
-	t.Run("legal in-tree parent renders", func(t *testing.T) {
-		root := writeTree(t, map[string]string{
-			"app/kustomization.yaml":  existingKustomization("../base"),
-			"base/kustomization.yaml": existingKustomization("cm.yaml"),
-			"base/cm.yaml":            cmYAML("shared"),
-		})
-		out := renderInMemory(t, root, "app", ksDoc(nil))
-		if !strings.Contains(string(out), "name: shared") {
-			t.Fatalf("expected rendered ConfigMap 'shared', got:\n%s", out)
-		}
-	})
+	}
 }
 
 // TestGenerateManifest_SourceIgnoreFiltersScan is the bo0tzz fix: a working tree
@@ -377,22 +454,25 @@ func TestBuild_InMemorySandbox(t *testing.T) {
 // GitRepository fetch would produce. Without the filter the SOPS config is
 // scanned as a manifest and the build fails.
 func TestGenerateManifest_SourceIgnoreFiltersScan(t *testing.T) {
-	root := writeTree(t, map[string]string{
+	t.Parallel()
+	root := testutil.WriteTree(t, map[string]string{
 		".sops.yaml": "creation_rules:\n  - path_regex: .*\n    age: age1example\n",
 		"cm.yaml":    cmYAML("config"),
 	})
 
 	// Behind the ignore filesystem, scanManifests never sees .sops.yaml so a
 	// path:./ build over the working tree renders the ConfigMap.
-	fsys := testIgnoreOverlayFS(t, root)
-	data, kfile, err := generateManifest(fsys, root, ksDoc(nil))
+	fsys := testIgnoreTreeFS(t, root)
+	data, kfile, err := generateManifest(fsys, root, renderDoc(t, parsedKS(t, ksDoc(nil))))
 	if err != nil {
 		t.Fatalf("generateManifest(ignore): %v", err)
 	}
 	if err := fsys.WriteFile(kfile, data); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	kustomizestate.BuildMutex.Lock()
 	rm, err := fluxkustomize.Build(fsys, root)
+	kustomizestate.BuildMutex.Unlock()
 	if err != nil {
 		t.Fatalf("build over ignored tree: %v", err)
 	}
@@ -407,29 +487,23 @@ func TestGenerateManifest_SourceIgnoreFiltersScan(t *testing.T) {
 	// Without the filter (a fetched artifact, already filtered, would not hit
 	// this), scanManifests includes .sops.yaml and fails to decode it — the bug
 	// the filter fixes.
-	if _, _, err := generateManifest(testOverlayFS(t, root), root, ksDoc(nil)); err == nil {
+	if _, _, err := generateManifest(testTreeFS(t, root), root, renderDoc(t, parsedKS(t, ksDoc(nil)))); err == nil {
 		t.Fatal("expected generate/scan to fail on the unfiltered .sops.yaml, got nil")
 	}
 }
 
-// TestFindOrGenerate_MemoryPopulatedSubdirNotDescended is the zariel cnpg-system
-// regression. An auto-generated parent (no kustomization.yaml) over a subdir
-// that DOES carry a kustomization.yaml must list the subdir (./cnpg) as a
-// resource and never the subdir's kustomization.yaml file — even when preflight
-// has rewritten a remote resource under that subdir into the memory layer. That
-// memory write makes the subdir exist in both overlay layers; before the
-// overlayFS.Walk SkipDir fix, the disk walk re-descended the SkipDir'd subdir
-// and added ./cnpg/kustomization.yaml as a stray resource (which kustomize then
-// failed to decode: "missing metadata.name").
+// SkipDir must prune a subpackage from both layers after preflight writes into
+// it. The parent lists the subpackage once, never its kustomization.yaml.
 func TestFindOrGenerate_MemoryPopulatedSubdirNotDescended(t *testing.T) {
-	root := writeTree(t, map[string]string{
+	t.Parallel()
+	root := testutil.WriteTree(t, map[string]string{
 		// Parent dir intentionally has NO kustomization.yaml -> auto-generate.
 		"cnpg/kustomization.yaml":  existingKustomization("./app/cm.yaml"),
 		"cnpg/app/cm.yaml":         cmYAML("cnpg-cm"),
 		"other/kustomization.yaml": existingKustomization("./cm.yaml"),
 		"other/cm.yaml":            cmYAML("other-cm"),
 	})
-	fsys := testOverlayFS(t, root)
+	fsys := testTreeFS(t, root)
 	// Simulate preflightRemoteResources rewriting a remote resource under cnpg/
 	// into memory, so cnpg/ exists in BOTH the memory and disk layers.
 	seed := filepath.Join(root, "cnpg", "app", remoteResourcePrefix+"deadbeef.yaml")

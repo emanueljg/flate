@@ -4,49 +4,50 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/home-operations/flate/internal/assert"
 )
 
 func TestNewBounded_LimitsConcurrentBodies(t *testing.T) {
-	const workers = 3
-	s := NewBounded(workers)
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 3
+		s := NewBounded(workers)
 
-	var inFlight, peak atomic.Int64
-	gate := make(chan struct{})
+		var inFlight, peak atomic.Int64
+		gate := make(chan struct{})
 
-	const submits = 12
-	for range submits {
-		s.Go(context.Background(), "w", func(_ context.Context) {
-			n := inFlight.Add(1)
-			for {
-				p := peak.Load()
-				if n <= p || peak.CompareAndSwap(p, n) {
-					break
+		const submits = 12
+		for range submits {
+			s.Go(t.Context(), "w", func(_ context.Context) {
+				n := inFlight.Add(1)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
 				}
-			}
-			<-gate
-			inFlight.Add(-1)
-		})
-	}
+				<-gate
+				inFlight.Add(-1)
+			})
+		}
 
-	// Give the goroutines a moment to acquire / queue on the semaphore.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && inFlight.Load() < workers {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := inFlight.Load(); got != workers {
-		t.Errorf("expected exactly %d bodies active behind the semaphore, got %d", workers, got)
-	}
-	close(gate)
-	s.BlockTillDone()
-	if got := peak.Load(); got > workers {
-		t.Errorf("peak in-flight = %d, want <= %d", got, workers)
-	}
+		synctest.Wait()
+		if got := inFlight.Load(); got != workers {
+			t.Errorf("expected exactly %d bodies active behind the semaphore, got %d", workers, got)
+		}
+		close(gate)
+		s.BlockTillDone()
+		if got := peak.Load(); got > workers {
+			t.Errorf("peak in-flight = %d, want <= %d", got, workers)
+		}
+	})
 }
 
 func TestNewBounded_Unbounded(t *testing.T) {
+	t.Parallel()
 	// Workers <= 0 disables bounding (no semaphore allocated).
 	s := NewBounded(0)
 	if s.sem != nil {
@@ -59,6 +60,7 @@ func TestNewBounded_Unbounded(t *testing.T) {
 }
 
 func TestService_BlockTillDone(t *testing.T) {
+	t.Parallel()
 	s := NewBounded(0)
 	var n atomic.Int64
 	for range 50 {
@@ -72,6 +74,7 @@ func TestService_BlockTillDone(t *testing.T) {
 }
 
 func TestService_PanicCountedAndRecovered(t *testing.T) {
+	t.Parallel()
 	s := NewBounded(0)
 	s.Go(context.Background(), "boom", func(_ context.Context) {
 		panic("oops")
@@ -135,6 +138,7 @@ func TestYieldSlot_AllowsChildrenWhenParentsFillPool(t *testing.T) {
 // TestYieldSlot_UnboundedIsNoOp asserts the no-pool path runs fn
 // transparently.
 func TestYieldSlot_UnboundedIsNoOp(t *testing.T) {
+	t.Parallel()
 	s := NewBounded(0)
 	called := false
 	s.YieldSlot(func() { called = true })

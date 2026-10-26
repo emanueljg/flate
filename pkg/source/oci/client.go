@@ -1,125 +1,145 @@
 package oci
 
 import (
-	"crypto/tls"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
+	"net/url"
 	"os"
 
+	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
+	"github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/store"
 )
 
 // dockerConfigJSONKey is the Secret data key a kubernetes.io/dockerconfigjson
 // Secret stores its credentials under.
 const dockerConfigJSONKey = ".dockerconfigjson"
 
-// newRepoClient builds the oras registry client for repo: it parses the ref,
-// loads credentials from registryConfig, and wires a bounded HTTP transport
-// (TLS + proxy) plus docker-style auth.
-//
-// Retries are owned by the Fetch-level retry decorator (source.WithRetry) so
-// they happen once, uniformly, across every source kind — this client uses a
-// plain, NON-retrying transport. source.NewHTTPTransport always returns a
-// bounded transport (a http.DefaultTransport clone carrying
-// ResponseHeaderTimeout as a liveness backstop, plus any TLS/proxy), so oras
-// never falls back to its retry-enabled auth.DefaultClient and a black-holed
-// registry can't hang the fetch waiting on response headers.
-func newRepoClient(repo *manifest.OCIRepository, registryConfig string, tlsCfg *tls.Config, proxy *source.ProxyConfig) (*remote.Repository, error) {
-	// parseOCIRef strips any oci:// prefix itself, so pass repo.URL as-is.
+// newRepoClient binds one credential and transport snapshot before cache admission.
+func (f *operation) newRepoClient(ctx context.Context, repo *manifest.OCIRepository, credStore credentials.Store) (*remote.Repository, any, error) {
 	reference, err := parseOCIRef(repo.URL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	repoClient, err := remote.NewRepository(reference)
+	client, err := remote.NewRepository(reference)
 	if err != nil {
-		return nil, fmt.Errorf("oras: %w", err)
+		return nil, nil, fmt.Errorf("oras: %w", err)
 	}
-	credStore, err := loadCredentials(registryConfig)
-	if err != nil {
-		return nil, err
-	}
-	transport, err := source.NewHTTPTransport(tlsCfg, proxy)
-	if err != nil {
-		return nil, err
-	}
-	authClient := &auth.Client{Client: &http.Client{Transport: transport}}
+	cred := auth.EmptyCredential
 	if credStore != nil {
-		authClient.Credential = credentials.Credential(credStore)
+		cred, err = credentials.Credential(credStore)(ctx, client.Reference.Host())
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: resolve registry credentials: %w", manifest.ErrInput, err)
+		}
 	}
-	repoClient.Client = authClient
-	return repoClient, nil
-}
-
-// resolveTLS builds a *tls.Config from spec.certSecretRef (PEM-encoded
-// tls.crt + tls.key + ca.crt — any subset acceptable) and/or spec.insecure.
-// Returns nil when no TLS customization is needed.
-func (f *Fetcher) resolveTLS(repo *manifest.OCIRepository) (*tls.Config, error) {
-	if repo.CertSecretRef == nil && !repo.Insecure {
-		return nil, nil
-	}
-	cfg, err := source.ResolveCertSecret(f.Secrets, repo.Namespace, "OCIRepository",
-		repo.Namespace+"/"+repo.Name, repo.CertSecretRef)
+	owner := repo.Named()
+	owner.Name = repo.Namespace + "/" + repo.Name
+	resolved, err := source.ResolveTransport(f.secrets, owner, []source.TransportInput{
+		{Reference: repo.CertSecretRef, Use: source.TransportCert},
+		{Reference: repo.ProxySecretRef, Use: source.TransportProxy},
+	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if cfg == nil {
-		cfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	if _, err := resolved.ProxyURL(&url.URL{Scheme: "https", Host: client.Reference.Host()}); err != nil {
+		return nil, nil, fmt.Errorf("%w: resolve registry proxy: invalid proxy configuration", manifest.ErrInput)
 	}
-	if repo.Insecure {
-		cfg.InsecureSkipVerify = true //nolint:gosec // honoring user-declared spec.insecure
+	var credentials any
+	if cred != auth.EmptyCredential {
+		credentials = cred
 	}
-	return cfg, nil
+	material := resolved.Identity(credentials)
+	tr, err := f.Network.HTTPTransport(source.HTTPTransportConfig{Material: resolved, Insecure: repo.Insecure, Credentials: credentials})
+	if err != nil {
+		return nil, nil, err
+	}
+	client.Client = &auth.Client{Client: source.NewHTTPClient(tr, source.HTTPStream), Cache: tr.(auth.Cache), Credential: auth.StaticCredential(client.Reference.Registry, cred)}
+	return client, material, nil
 }
 
-// resolveRegistryConfig picks the credential source for a fetch.
-// Precedence:
-//  1. per-OCIRepository spec.secretRef (a kubernetes.io/dockerconfigjson
-//     Secret materialized to a temp file).
-//  2. global --registry-config path (f.RegistryConfig).
-//  3. docker's default lookup (~/.docker/config.json), handled inside
-//     loadCredentials when configPath is empty.
-//
-// The cleanup func removes any temp file the SecretRef path created;
-// safe to call when no temp file was made (no-op).
-func (f *Fetcher) resolveRegistryConfig(repo *manifest.OCIRepository) (string, func(), error) {
-	noCleanup := func() {}
+// resolveRegistryConfig keeps Secret credentials in memory. Explicit registry
+// config and Docker defaults retain their upstream stores. Global credentials
+// MUST wait for the source controller to exhaust rendered Secrets; eligible
+// retries are carried by MissingSecretError.
+func (f *operation) resolveRegistryConfig(ctx context.Context, repo *manifest.OCIRepository, policy cache.Policy) (credentials.Store, error) {
 	if repo.SecretRef == nil {
-		return f.RegistryConfig, noCleanup, nil
+		return loadCredentials(f.RegistryConfig)
 	}
-	if f.Secrets == nil {
-		return "", noCleanup, fmt.Errorf("%s references secretRef but no source.SecretGetter is wired", ociID(repo))
+	if f.secrets == nil {
+		return nil, fmt.Errorf("%s references secretRef but no source.SecretGetter is wired", source.QualifiedName(manifest.KindOCIRepository, repo.Namespace, repo.Name))
 	}
-	sec := f.Secrets(repo.Namespace, repo.SecretRef.Name)
+	sec := f.secrets(repo.Namespace, repo.SecretRef.Name)
 	if sec == nil {
-		return "", noCleanup, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "not found")
+		return f.registryFallback(ctx, repo, source.MissingSecretErr(repo.Named(), repo.SecretRef.Name, "not found"), policy)
 	}
-	configJSON := source.StringFromSecret(sec, dockerConfigJSONKey)
-	if configJSON == "" {
-		// Empty here covers both (a) the Secret has no .dockerconfigjson
-		// key at all and (b) the key exists but `--wipe-secrets` (always
-		// on) replaced its value with PLACEHOLDER, which StringFromSecret
-		// returns as "". The ExternalSecret case in #190 hits (b): the
-		// Secret manifest is in-tree but its data is materialized live.
-		// Same ErrMissingSecret sentinel so --allow-missing-secrets
-		// covers both — matching only the literal "secret not found"
-		// path would leave the actual reporter's case still failing.
-		return "", noCleanup, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "missing .dockerconfigjson (must be type kubernetes.io/dockerconfigjson)")
-	}
-	// System temp (dir ""): the docker credential store only needs the
-	// file to exist for the duration of the pull.
-	tf := source.NewTempFiles("")
-	path, err := tf.Write("flate-oci-creds-*.json", configJSON)
+	configJSON, _, err := sec.Value(dockerConfigJSONKey)
 	if err != nil {
-		return "", noCleanup, err
+		return nil, fmt.Errorf("%w: %s read .dockerconfigjson: %w", manifest.ErrInput, source.QualifiedName(manifest.KindOCIRepository, repo.Namespace, repo.Name), err)
 	}
-	return path, tf.Cleanup, nil
+	if configJSON == "" || manifest.HasValuePlaceholder(configJSON) {
+		return f.registryFallback(ctx, repo, source.MissingSecretErr(repo.Named(), repo.SecretRef.Name, "missing .dockerconfigjson (must be type kubernetes.io/dockerconfigjson)"), policy)
+	}
+	credStore, err := credentials.NewMemoryStoreFromDockerConfig([]byte(configJSON))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s parse .dockerconfigjson: %w", manifest.ErrInput, source.QualifiedName(manifest.KindOCIRepository, repo.Namespace, repo.Name), err)
+	}
+	// ORAS normalizes Docker Hub's credential key while its callback expects the
+	// canonical Docker server address. Reconcile these in the same memory store.
+	if cred, _ := credStore.Get(ctx, "index.docker.io"); cred != auth.EmptyCredential {
+		_ = credStore.Put(ctx, credentials.ServerAddressFromRegistry("docker.io"), cred)
+	}
+	return credStore, nil
+}
+
+// registryFallback preserves the missing Secret until renders are exhausted.
+// A pull retry requires a credential for this registry; unrelated credentials
+// MUST leave producer-backed sources skippable.
+func (f *operation) registryFallback(ctx context.Context, repo *manifest.OCIRepository, missing error, policy cache.Policy) (credentials.Store, error) {
+	parsed, err := parseOCIRef(repo.URL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", manifest.ErrInput, err)
+	}
+	// parseOCIRef validates URL syntax, not ORAS repository syntax.
+	ref, err := registry.ParseReference(parsed)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse registry reference: %w", manifest.ErrInput, err)
+	}
+	mse, _ := errors.AsType[*source.MissingSecretError](missing)
+	credStore, err := loadCredentials(f.RegistryConfig)
+	if err != nil {
+		// A corrupt global config MUST not preempt a later rendered Secret.
+		configErr := fmt.Errorf("%w: %w", manifest.ErrInput, err)
+		mse.RetryWithRegistryConfig = func(_ context.Context, _ string) (*store.SourceArtifact, error) {
+			return nil, configErr
+		}
+		return nil, mse
+	}
+	if credStore == nil {
+		return nil, missing
+	}
+	// A broken credential helper is treated as no credential, preserving skips.
+	if cred, err := credentials.Credential(credStore)(ctx, ref.Host()); err != nil || cred == auth.EmptyCredential {
+		return nil, missing
+	}
+	mse.RegistryConfig = f.RegistryConfig
+	mse.RetryWithRegistryConfig = func(ctx context.Context, configPath string) (*store.SourceArtifact, error) {
+		slog.Debug("oci: secretRef unresolvable, using registry config",
+			"id", source.QualifiedName(manifest.KindOCIRepository, repo.Namespace, repo.Name), "registry", ref.Registry)
+		credStore, err := loadCredentials(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", manifest.ErrInput, err)
+		}
+		return f.fetchWithCredentials(ctx, repo, credStore, policy)
+	}
+	return nil, mse
 }
 
 // loadCredentials returns a credentials.Store backed by the given config

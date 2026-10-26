@@ -1,8 +1,12 @@
 package manifest
 
-import "testing"
+import (
+	"encoding/base64"
+	"testing"
+)
 
-func TestIsEncryptedSecret(t *testing.T) {
+func TestEncryptedSecret_Classification(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		doc  map[string]any
@@ -56,14 +60,16 @@ func TestIsEncryptedSecret(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsEncryptedSecret(tc.doc); got != tc.want {
-				t.Errorf("IsEncryptedSecret = %v, want %v", got, tc.want)
+			t.Parallel()
+			if got := isEncryptedSecret(tc.doc); got != tc.want {
+				t.Errorf("isEncryptedSecret = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestIsSopsCiphertext(t *testing.T) {
+func TestWipeValue_Ciphertext(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string
@@ -71,22 +77,43 @@ func TestIsSopsCiphertext(t *testing.T) {
 	}{
 		{"encrypted str scalar", "ENC[AES256_GCM,data:abc=,iv:def=,tag:ghi=,type:str]", true},
 		{"encrypted comment scalar", "ENC[AES256_GCM,data:abc=,iv:def=,tag:ghi=,type:comment]", true},
+		{"encoded plaintext field", base64.StdEncoding.EncodeToString([]byte("ENC[AES256_GCM,data:abc]")), false},
 		{"cleartext value", "example.com", false},
 		{"empty", "", false},
-		{"prefix only, no close bracket", "ENC[AES256_GCM,data:abc", false},
+		{"prefix only, no close bracket", "ENC[AES256_GCM,data:abc", true},
 		{"different algorithm", "ENC[CHACHA20_POLY1305,data:abc]", false},
-		{"substring not at start", "host=ENC[AES256_GCM,data:abc]", false},
+		{"substring not at start", "host=ENC[AES256_GCM,data:abc]", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsSopsCiphertext(tc.in); got != tc.want {
-				t.Errorf("IsSopsCiphertext(%q) = %v, want %v", tc.in, got, tc.want)
+			t.Parallel()
+			if got := WipeValue("key", tc.in, nil, false) != tc.in; got != tc.want {
+				t.Errorf("WipeValue(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, value, want string
+		encoding          *base64.Encoding
+		encrypted         bool
+	}{
+		{"plaintext ciphertext", "ENC[AES256_GCM,data:abc]", "..PLACEHOLDER_key..", nil, false},
+		{"encoded ciphertext", "RU5DW0FFUzI1Nl9HQ00sZGF0YTphYmNd", "Li5QTEFDRUhPTERFUl9rZXkuLg==", base64.StdEncoding, false},
+		{"encoded malformed", "malformed!", "malformed!", base64.StdEncoding, false},
+		{"marked plaintext", "short", "..PLACEHOLDER_key..", nil, true},
+		{"marked encoded", "short", "Li5QTEFDRUhPTERFUl9rZXkuLg==", base64.StdEncoding, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := WipeValue("key", tc.value, tc.encoding, tc.encrypted); got != tc.want {
+				t.Fatalf("wiped = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
 func TestHasSubstituteDisabled(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		doc  map[string]any
@@ -140,6 +167,7 @@ func TestHasSubstituteDisabled(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if got := HasSubstituteDisabled(tc.doc); got != tc.want {
 				t.Errorf("HasSubstituteDisabled = %v, want %v", got, tc.want)
 			}

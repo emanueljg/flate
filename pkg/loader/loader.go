@@ -1,25 +1,4 @@
-// Package loader hydrates a Store from on-disk Flux manifests.
-//
-// The loader's discovery model mirrors `kustomize build` (and
-// flux-local): the kustomize resource graph is the source of truth.
-// A directory with a kustomization.yaml defines a kustomize package
-// — the loader follows its `resources:` entries (files load,
-// directories recurse) and ignores everything else in the directory.
-// Files outside the resource graph are invisible by construction;
-// there is no "tree walk + filter" post-pass, no orphan-skip rule,
-// no reachability set computed up front.
-//
-// Entry points without a kustomization.yaml use a fall-back tree
-// walk that loads every YAML it finds and switches into graph-walk
-// mode when it encounters a subdirectory that IS a kustomize
-// package. This keeps the bootstrap-style "bare directory of CRs"
-// shape working without forcing every user to wrap their entry
-// point in a kustomization.yaml.
-//
-// Each loader.Load call is one independent graph root. The
-// orchestrator's iterative discovery — a Flux KS's spec.path
-// triggers another Load — composes naturally: each spec.path is its
-// own graph root with its own resource graph.
+// Package loader hydrates a Store from Flux source filesystems.
 package loader
 
 import (
@@ -28,64 +7,52 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"iter"
 	"log/slog"
-	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"sync"
 
+	"github.com/home-operations/flate/internal/kustomizeinput"
+	"github.com/home-operations/flate/internal/kustpath"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source"
+	"github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/source/gitrepo"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/source/sourceignore"
 	"github.com/home-operations/flate/pkg/store"
 )
 
 // Options tunes the Loader.
 type Options struct {
 	// WipeSecrets controls Secret cleartext replacement. Default true.
-	WipeSecrets bool
-
-	// DiscoveryOnly restricts file-loaded kinds that reach the Store
-	// to the discovery-meta set: Kustomization, ResourceSet, and
-	// ResourceSetInputProvider. Every other Flux CR (HelmRelease,
-	// sources, ConfigMap, Secret) is recorded in Existence instead of
-	// AddObject'd, matching real Flux's render-driven discovery
-	// model where only the bootstrap KS is static and the rest of
-	// the cluster materializes through KS reconciles. depwait
-	// consults the existence index on missing deps; orchestrator
-	// orphan-promotes any index entry not under a KS's spec.path
-	// before reconcile starts.
-	//
-	// Why RS + RSIP stay in-scope: the discovery loop renders
-	// ResourceSets to discover further KSes (RSIPs feed selectors,
-	// RSes produce KSes/RSIPs). There is no ResourceSet controller
-	// yet, so render-emitted RSes would never be processed; keeping
-	// them file-loaded preserves the meta-discovery fixed point.
-	DiscoveryOnly bool
+	WipeSecrets  bool
+	RemoteInputs *source.HTTPInputs
+	RemoteRetry  cache.RetryConfig
 }
 
-// Loader walks a directory tree and adds Flux objects to a Store.
+// Loader collects source-qualified discovery evidence before admitting roots.
+// Source membership MUST remain stable across sequential Load calls. The first
+// Load classifies the entry for all subsequent loads; independent entry policies
+// require separate loaders.
 type Loader struct {
 	Store   *store.Store
 	Options Options
-
-	// SourceRoot, when non-empty, is the directory used as the
-	// reference point for SourceFiles. Paths recorded there are
-	// slash-separated and relative to this root, which matches the
-	// shape change.Detect produces.
+	// SourceRoot anchors slash-separated discovery coordinates and bounds
+	// standalone input admission. Source artifacts supply their own FS.
 	SourceRoot string
 
-	// SourceFiles is populated as each manifest is added. Keyed by
-	// the parsed resource's NamedResource. Nil disables tracking.
-	SourceFiles map[manifest.NamedResource]string
-
-	// SourceRefs maps each loaded consumer (HelmRelease / Kustomization)
-	// to the source resources it references — an HR's chart source, a
-	// KS's spec.sourceRef. Captured at parse time because under
-	// DiscoveryOnly an HR never reaches the Store, yet the change
-	// filter's reverse edge needs to know which HelmReleases a changed
-	// source feeds (so bumping a centralized OCIRepository's tag
-	// re-renders its consumers). Nil disables tracking. Keyed by the
-	// consumer's NamedResource; mirrors SourceFiles' lifecycle.
-	SourceRefs map[manifest.NamedResource][]manifest.NamedResource
+	// Index records static discovery facts and is initialized by New. Caller
+	// replacements MUST initialize Records before Load. Mutable until FinalizeIndex returns.
+	Index      *manifest.DiscoveryIndex
+	documents  documentReader
+	scopes     *scopeConstruction
+	entry      entryKind
+	entryPath  string
+	candidates map[manifest.NamedResource]store.Child
+	admitted   map[manifest.NamedResource]manifest.BaseManifest
+	roots      map[manifest.NamedResource]bool
 
 	// IgnoreFile, when non-empty, is the gitignore-grammar file Load
 	// reads in place of <root>/.krmignore, with its patterns anchored
@@ -96,43 +63,194 @@ type Loader struct {
 	IgnoreFile string
 
 	// PreferExisting suppresses overwrites of resources already in
-	// the store (and their SourceFiles entries). Used by the
+	// the store and their discovery records. Used by the
 	// orchestrator's recursive spec.path discovery so the initial
 	// --path scan's data wins over downstream paths that may point
 	// into a different tree.
 	PreferExisting bool
-
-	// Existence captures every file-loaded object that DiscoveryOnly
-	// keeps out of the Store. Nil disables the bookkeeping (the
-	// default for non-DiscoveryOnly callers).
-	Existence *ExistenceIndex
-
-	// ComponentCache, when non-nil, is the shared component-file
-	// cache used by FinalizeGenerators' KSPathPrefixes call. Wired
-	// by the orchestrator at Bootstrap so the loader, discovery's
-	// parent-index passes, the orphan-promotion pass, the orchestrator's
-	// finalize detectOrphans, and change.buildOwnership all read each
-	// kustomization.yaml's `components:` field at most once per
-	// Bootstrap. nil falls back to per-call caches with no cross-call
-	// sharing.
-	ComponentCache *manifest.ComponentCache
-
-	// generators accumulates configMapGenerator/secretGenerator
-	// entries observed during the walk. After Load returns, the
-	// orchestrator finalizes them via FinalizeGenerators — the
-	// effective namespace depends on which Flux Kustomization
-	// encloses each kustomization.yaml, and that's only known once
-	// the full walk completes.
-	generatorsMu sync.Mutex
-	generators   []generatorRecord
 }
 
-// New returns a Loader configured to wipe secrets.
+type entryKind uint8
+
+const (
+	entryUnset entryKind = iota
+	entryPlain
+	entryKustomize
+)
+
+// New initializes discovery state and configures the Loader to wipe secrets.
 func New(s *store.Store) *Loader {
-	return &Loader{Store: s, Options: Options{WipeSecrets: true}}
+	return &Loader{
+		Store: s, Options: Options{WipeSecrets: true},
+		Index:     &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}},
+		documents: documentReader{cache: map[string]document{}, views: map[string]fs.FS{}},
+	}
 }
 
-// Load discovers Flux objects under root by walking the kustomize
+// Sources yields eligible immutable source-artifact evidence in unspecified order.
+func (l *Loader) Sources() iter.Seq[store.Child] {
+	return func(yield func(store.Child) bool) {
+		for id, r := range l.Index.Files() {
+			if !id.KindInfo().SourceArtifact {
+				continue
+			}
+			if l.documents.cache[r.Path].eligible == fileInactive {
+				continue
+			}
+			obj := l.indexedObject(id, r)
+			if obj.Obj != nil && !yield(obj) {
+				return
+			}
+		}
+	}
+}
+
+// AdmitsRoot applies the source-qualified scope boundary to every indexed document.
+func (l *Loader) AdmitsRoot(id manifest.NamedResource, file string) bool {
+	r, ok := l.Index.Lookup(id)
+	if !ok || r.Path != file || file != "" && l.terminalInput(file) {
+		return false
+	}
+	if r.Path == "" {
+		return r.Authored == (manifest.NamedResource{}) && r.Parent == (manifest.NamedResource{}) &&
+			l.candidates[id].Obj != nil
+	}
+	if admitted, known := l.roots[id]; known {
+		return admitted
+	}
+	if doc := l.documents.cache[file]; !id.KindInfo().Discovery && doc.rootKnown {
+		return doc.rootAdmitted
+	}
+	return l.rootAdmission(file, r.File, id.KindInfo().Structural).admits(l, id, r)
+}
+
+type fileEligibility uint8
+
+const (
+	fileUnknown fileEligibility = iota
+	fileInactive
+	fileEligible
+	fileIndependent
+)
+
+type rootAdmission struct {
+	denied bool
+	owners []manifest.NamedResource
+	peers  [][]manifest.NamedResource
+}
+
+func (l *Loader) rootAdmission(file, coordinate string, structural bool) rootAdmission {
+	eligible := l.documents.cache[file].eligible
+	scope := rootAdmission{denied: eligible == fileInactive}
+	if scope.denied {
+		return scope
+	}
+	if l.scopes != nil {
+		for _, v := range l.scopes.visits[file] {
+			if v.owner != (manifest.NamedResource{}) && v.role == kustomizeinput.Resource {
+				scope.owners = appendUniqueProducer(scope.owners, v.owner)
+			}
+		}
+	}
+	if origin := l.documents.localPath(file); origin != file {
+		coordinate = l.fileCoordinate(origin)
+	}
+	if eligible != fileIndependent {
+		owners, ancestors := l.Index.OwnersOfFile(coordinate)
+		for _, owner := range append(owners, ancestors...) {
+			scope.owners = appendUniqueProducer(scope.owners, owner)
+		}
+	}
+	if !structural {
+		return scope
+	}
+	for _, group := range l.Index.Claims {
+		if !l.documents.cache[file].bootstrap || slices.ContainsFunc(group, func(owner manifest.NamedResource) bool {
+			record, _ := l.Index.Lookup(owner)
+			return record.Path == file
+		}) {
+			scope.peers = append(scope.peers, group)
+		}
+	}
+	return scope
+}
+
+func (a rootAdmission) admits(l *Loader, id manifest.NamedResource, record manifest.DiscoveryRecord) bool {
+	if a.denied {
+		return false
+	}
+	var peers [][]manifest.NamedResource
+	if id.KindInfo().Structural {
+		for _, group := range a.peers {
+			if slices.ContainsFunc(group, func(peer manifest.NamedResource) bool { return l.selfClaim(peer, record.Authored) }) {
+				peers = append(peers, group)
+			}
+		}
+	}
+	for _, owner := range a.owners {
+		if owner == id || l.selfClaim(owner, record.Authored) {
+			continue
+		}
+		peer, _ := l.Index.Lookup(owner)
+		if l.documents.cache[record.Path].bootstrap && peer.Path != record.Path {
+			return false
+		}
+		if !slices.ContainsFunc(peers, func(group []manifest.NamedResource) bool { return slices.Contains(group, owner) }) {
+			return false
+		}
+	}
+	return true
+}
+
+// Kustomizations returns eligible source-qualified owner evidence.
+func (l *Loader) Kustomizations() []store.Child {
+	return l.eligibleKustomizations(l.kustomizations())
+}
+
+func (l *Loader) eligibleKustomizations(kss []store.Child) []store.Child {
+	if len(l.Index.Records) == 0 {
+		return kss
+	}
+	return slices.DeleteFunc(kss, func(child store.Child) bool {
+		ks := child.Obj.(*manifest.Kustomization)
+		r, indexed := l.Index.Lookup(ks.Named())
+		return indexed && l.documents.cache[r.Path].eligible == fileInactive
+	})
+}
+
+func (l *Loader) kustomizations() []store.Child {
+	objects := l.Store.ListObjects(manifest.FluxKustomizeDomain, manifest.KindKustomization)
+	out := make([]store.Child, 0, len(objects))
+	for _, obj := range objects {
+		_, doc, emission := l.Store.GetEmission(obj.Named())
+		emission.Finish()
+		out = append(out, store.Child{Obj: obj, Doc: doc})
+	}
+	for id, r := range l.Index.Files() {
+		if id.Group != manifest.FluxKustomizeDomain || id.Kind != manifest.KindKustomization || l.Store.GetObject(id) != nil {
+			continue
+		}
+		child := l.indexedObject(id, r)
+		if _, ok := child.Obj.(*manifest.Kustomization); ok {
+			out = append(out, child)
+		}
+	}
+	slices.SortFunc(out, func(a, b store.Child) int { return a.Obj.Named().Compare(b.Obj.Named()) })
+	return out
+}
+
+func (l *Loader) indexedObject(id manifest.NamedResource, r manifest.DiscoveryRecord) store.Child {
+	if child := l.candidates[id]; child.Obj != nil {
+		return child
+	}
+	child := l.authoredObject(r.Path, r.Authored)
+	if child.Obj != nil && child.Obj.Named().Namespace != id.Namespace {
+		child.Obj = child.Obj.WithNamespace(id.Namespace)
+	}
+	return child
+}
+
+// Load records Flux objects under root by walking the kustomize
 // resource graph. When root has a kustomization.yaml it's treated as
 // a kustomize package and only files reachable through `resources:`
 // are loaded; when it has none, a recursive walk finds and enters
@@ -143,15 +261,56 @@ func (l *Loader) Load(ctx context.Context, root string) (int, error) {
 	if l.Store == nil {
 		return 0, errors.New("loader: Store is nil")
 	}
+	l.mountSources()
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return 0, err
 	}
+	inputRoot, err := filepath.Abs(cmp.Or(l.SourceRoot, abs))
+	if err != nil {
+		return 0, err
+	}
+	if l.documents.mountedRoot(abs) == "" && (l.SourceRoot == "" || l.documents.mountedRoot(inputRoot) == "") {
+		location, err := gitrepo.Locate(ctx, inputRoot, inputRoot)
+		if err != nil {
+			return 0, err
+		}
+		input, err := gittree.AdmitDirectory(ctx, location)
+		if err != nil {
+			if l.IgnoreFile != "" && errors.Is(err, fs.ErrNotExist) {
+				return 0, nil
+			}
+			return 0, err
+		}
+		l.documents.views[inputRoot] = input.FS.(*gittree.FS).OperationView()
+	}
+	l.ensureScopes()
+	_, builder := l.documents.read(abs)
+	if l.entry == entryUnset {
+		l.entryPath = abs
+		l.entry = entryPlain
+		if builder != "" {
+			l.entry = entryKustomize
+		}
+	}
+	if _, scanned := l.scopes.scanned[abs]; scanned {
+		return 0, nil
+	}
+	l.scopes.complete = false
 	var ignore *ignoreSet
 	if l.IgnoreFile != "" {
-		ignore, err = loadIgnoreFile(l.IgnoreFile, abs)
+		input, name := l.documents.input(abs)
+		info, statErr := fs.Stat(input, name)
+		l.documents.rememberStat(abs, info, statErr)
+		if errors.Is(statErr, fs.ErrNotExist) || statErr == nil && !info.IsDir() {
+			return 0, nil
+		}
+		if statErr != nil {
+			return 0, statErr
+		}
+		ignore, err = l.documents.loadIgnoreFile(ctx, l.IgnoreFile, abs)
 	} else {
-		ignore, err = loadIgnore(abs)
+		ignore, err = l.documents.loadIgnore(abs)
 	}
 	if err != nil {
 		return 0, err
@@ -161,9 +320,14 @@ func (l *Loader) Load(ctx context.Context, root string) (int, error) {
 		ignore:      ignore,
 		visited:     map[string]struct{}{},
 		scanRoot:    abs,
+		build:       builder != "",
 		ignoreCache: map[ignoreKey]bool{},
 	}
-	return w.descend(ctx, abs)
+	n, err := w.descend(ctx, abs)
+	if err == nil {
+		l.scopes.scanned[abs] = struct{}{}
+	}
+	return n, err
 }
 
 // walker carries the per-Load state — ignore matcher, visited-dir
@@ -179,6 +343,7 @@ type walker struct {
 	// descended sub-package — the rel path would be sub-tree-relative
 	// instead of scan-root-relative.
 	scanRoot string
+	build    bool
 	visited  map[string]struct{}
 
 	// ignoreCache memoizes ignore.matches results for the duration of
@@ -245,94 +410,55 @@ func (w *walker) descend(ctx context.Context, dir string) (int, error) {
 	}
 	w.visited[dir] = struct{}{}
 
-	// readKustomizationAt returns the resolved file path alongside the
-	// parsed body so descend can hand both to recordGenerators and
-	// walkKustomize without re-opening the same kustomization.yaml.
-	k, kpath := readKustomizationAt(dir)
+	k, kpath := w.loader.documents.read(dir)
+	if kpath != "" && k == nil {
+		cached := w.loader.documents.cache[dir]
+		cached.traversed = true
+		w.loader.documents.cache[dir] = cached
+		return 0, nil
+	}
 	if k != nil {
-		// Harvest configMapGenerator/secretGenerator entries
-		// regardless of whether this is a Kustomization or Component
-		// — both can declare generators, and downstream depwait
-		// lookups for substituteFrom CMs need the synthesized
-		// records either way.
-		if kpath != "" {
-			w.loader.recordGenerators(collectGeneratorRecords(k, kpath))
-		}
-		if k.isKustomizeComponent() {
+		if isKustomizeComponent(k) {
 			slog.Debug("loader: skipping kustomize Component directory", "dir", dir)
-			// DiscoveryOnly callers still need the change filter's
-			// producer index to see ConfigMap/Secret data files that
-			// happen to live inside a Component subtree — a sibling
-			// KS's substituteFrom dep can't resolve to its producing
-			// KS otherwise. walkComponentData records those files
-			// without publishing Component-housed Flux CRs (which are
-			// frequently `${VAR}`-templated and not renderable
-			// standalone).
-			if w.loader.Options.DiscoveryOnly {
-				return w.walkComponentData(ctx, dir, k)
-			}
-			return 0, nil
+			// Component data must retain producer evidence without admitting
+			// templated Flux resources before their parent's render.
+			return w.walkComponentData(ctx, dir)
 		}
-		return w.walkKustomize(ctx, dir, k, kpath)
+		return w.walkKustomize(ctx, dir, kpath)
 	}
 	return w.walkAdHoc(ctx, dir)
 }
 
-// walkKustomize traverses the kustomize resource graph rooted at dir.
-// File resources load via loadFile; directory resources recurse via
-// descend. configMapGenerator / secretGenerator data files are
-// excluded since they're consumed at render time, not loaded as
-// Flux manifests.
-//
-// kustomization.yaml itself is loadFile'd so parseFile can decide
-// whether it's a Flux Kustomization CR (different apiVersion than
-// kustomize's own Kustomization). If not, parseFile returns no
-// objects and the count is unchanged.
-//
-// patches / replacements / transformers / generators (the rest of
-// kustomize's directive fields) reference YAMLs that are kustomize
-// directives, NOT Flux manifests — they're not in `resources:` so
-// they don't load. Matches `kustomize build` precisely.
-func (w *walker) walkKustomize(ctx context.Context, dir string, k *kustomization, kpath string) (int, error) {
-	dataFiles := dataFilesFor(dir, k)
+func (w *walker) walkKustomize(ctx context.Context, dir, kpath string) (int, error) {
+	cached := w.loader.documents.cache[dir]
+	cached.traversed = true
+	w.loader.documents.cache[dir] = cached
 	count := 0
-
-	// Load the kustomization.yaml itself — preserves source-file
-	// visibility for any consumer that inspects on-disk shape, and
-	// lets parseFile recognize a Flux Kustomization that happens to
-	// be authored at the `kustomization.yaml` filename (rare but
-	// permitted). kpath comes from the descend-side readKustomizationAt
-	// (or the walkAdHoc fallback) so we don't re-stat the same file
-	// the caller already opened.
 	if kpath != "" && !w.ignoreMatches(kpath, false) {
 		n, err := w.loader.loadFile(kpath)
 		if err != nil {
-			slog.Warn("loader: kustomization file failed to parse", "path", kpath, "err", err)
+			w.loader.Store.AddWarning(manifest.NamedResource{}, manifest.Warning{
+				Category: manifest.WarnInputParseFailed, Message: "kustomization file failed to parse", Detail: []string{kpath, err.Error()},
+			})
 		}
 		count += n
 	}
-
-	for _, r := range k.Resources {
-		if cerr := ctx.Err(); cerr != nil {
-			return count, cerr
-		}
-		// Resolve with the escape-permitting resolver so directory
-		// includes that point outside the package (overlays' ../base,
-		// Flux repos' ../../../deploy/...) are followed — kustomize
-		// follows them too. The file branch below re-imposes
-		// resolveDataPath's stricter opened-path policy.
-		abs, ok := resolveResourcePath(dir, r)
-		if !ok {
-			// URLs, absolute paths, malformed entries — kustomize
-			// handles these at render time; the loader's job is to
-			// ignore them at discovery time.
+	spec, _ := w.loader.documents.read(dir)
+	for ref := range kustomizeinput.Kustomization(spec) {
+		if ref.Role != kustomizeinput.Resource && ref.Role != kustomizeinput.Component {
 			continue
 		}
-		info, err := os.Stat(abs)
+		if err := ctx.Err(); err != nil {
+			return count, err
+		}
+		abs, ok := kustpath.Resolve(dir, ref.Path, kustpath.Directory)
+		if !ok {
+			continue
+		}
+		input, name := w.loader.documents.input(abs)
+		info, err := fs.Stat(input, name)
+		w.loader.documents.rememberStat(abs, info, err)
 		if err != nil {
-			// Resource pointer that doesn't exist on disk. Don't
-			// surface here; kustomize.RenderFlux will produce a
-			// clearer error with the right context at render time.
 			continue
 		}
 		if info.IsDir() {
@@ -341,98 +467,43 @@ func (w *walker) walkKustomize(ctx context.Context, dir string, k *kustomization
 				return count, err
 			}
 			count += n
-			continue
+		} else if ref.Role == kustomizeinput.Resource {
+			if _, ok := kustpath.Resolve(dir, ref.Path, kustpath.File); !ok {
+				continue
+			}
+			if !isManifestFile(abs) || w.ignoreMatches(abs, false) {
+				continue
+			}
+			n, err := w.loader.loadFile(abs)
+			if err != nil {
+				return count, fmt.Errorf("loader: %w", err)
+			}
+			count += n
 		}
-		// File resource: re-impose the in-base constraint, since a
-		// file gets opened (resolveResourcePath only guards descent).
-		if _, ok := resolveDataPath(dir, r); !ok {
-			continue
-		}
-		if !isManifestFile(abs) {
-			continue
-		}
-		if _, isData := dataFiles[abs]; isData {
-			continue
-		}
-		if w.ignoreMatches(abs, false) {
-			continue
-		}
-		n, err := w.loader.loadFile(abs)
-		if err != nil {
-			// A file kustomize would read that isn't valid YAML fails
-			// `kustomize build` for whichever Kustomization renders
-			// this package. That parent may sit outside the scan
-			// root, so fail here rather than let the file's Flux CRs
-			// silently drop out of the run.
-			return count, fmt.Errorf("loader: %w", err)
-		}
-		count += n
 	}
-
-	// Walk `components:` entries too. A kustomize Component contributes
-	// resources (and patches) to its parent's render, and any Flux CRs
-	// inside a component's subtree must be discoverable by flate.
-	// parent.go already reads `components:` for ownership-prefix
-	// claiming; without walking them here, the loader's discovery and
-	// parent.go's claim graph disagree.
-	for _, comp := range k.Components {
-		if cerr := ctx.Err(); cerr != nil {
-			return count, cerr
-		}
-		abs, ok := resolveComponentPath(dir, comp)
-		if !ok {
-			continue
-		}
-		info, err := os.Stat(abs)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		n, err := w.descend(ctx, abs)
-		if err != nil {
-			return count, err
-		}
-		count += n
-	}
-
-	if w.loader.Options.DiscoveryOnly {
-		count += w.scanBootstrapFluxKS(dir, k, kpath)
+	if !w.build {
+		count += w.scanBootstrapFluxKS(dir, kpath)
 	}
 	return count, nil
 }
 
-// scanBootstrapFluxKS surfaces Flux Kustomization CRs authored as
-// sibling YAML files of dir's kustomization.yaml but not listed in its
-// `resources:`. Real Flux pattern: the entry KS is kubectl-applied
-// outside any kustomize tree while its spec.path points at the
-// kustomize package beside it; without this scan the KS — and the
-// change-attribution it provides for files under spec.path — stay
-// invisible. Scope is intentionally narrow to *Flux Kustomization*
-// kinds; broadening here would silently undo the "kustomize package
-// = resources only" rule the loader otherwise enforces for HRs /
-// sources / data files. Gated on DiscoveryOnly so non-DiscoveryOnly
-// callers keep that strict semantic.
-func (w *walker) scanBootstrapFluxKS(dir string, k *kustomization, kpath string) int {
-	// A genuine bootstrap *entry* KS is a root — no other Kustomization's
-	// spec.path covers its directory. A KS commented-out of (excluded from)
-	// a kustomization.yaml lives inside a tree another KS already renders
-	// (e.g. cluster-apps' spec.path covers apps/<cluster>/<ns>/); real Flux
-	// renders that dir solely from its kustomization.yaml `resources:`, so a
-	// sibling KS left out of them is a disabled app, not a bootstrap entry.
-	// Surfacing it here is a false positive. Skip the scan when dir is already
-	// claimed by another loaded KS's spec.path — the same coverage predicate
-	// promoteOrphans applies via LongestParent.
-	if w.loader.dirCoveredByOtherKS(dir) {
-		return 0
-	}
+func (w *walker) scanBootstrapFluxKS(dir, kpath string) int {
 	seen := map[string]struct{}{kpath: {}}
-	for _, r := range k.Resources {
-		if abs, ok := resolveDataPath(dir, r); ok {
+	spec, _ := w.loader.documents.read(dir)
+	for ref := range kustomizeinput.Kustomization(spec) {
+		if ref.Inline {
+			continue
+		}
+		if abs, ok := kustpath.Resolve(dir, ref.Path, kustpath.Dependency); ok {
 			seen[abs] = struct{}{}
 		}
 	}
-	entries, err := os.ReadDir(dir)
+	input, name := w.loader.documents.input(dir)
+	entries, err := fs.ReadDir(input, name)
 	if err != nil {
-		slog.Warn("loader: bootstrap-sibling readdir failed", "dir", dir, "err", err)
+		w.loader.Store.AddWarning(manifest.NamedResource{}, manifest.Warning{
+			Category: manifest.WarnInputReadFailed, Message: "bootstrap-sibling readdir failed", Detail: []string{dir, err.Error()},
+		})
 		return 0
 	}
 	count := 0
@@ -447,131 +518,87 @@ func (w *walker) scanBootstrapFluxKS(dir string, k *kustomization, kpath string)
 		if _, ok := seen[abs]; ok {
 			continue
 		}
-		objs, err := parseFile(abs, manifest.ParseDocOptions{WipeSecrets: w.loader.Options.WipeSecrets})
+		reader := w.loader.documents
+		reader.regular = e.Type().IsRegular()
+		objs, err := reader.parseFile(abs, manifest.ParseDocOptions{WipeSecrets: w.loader.Options.WipeSecrets, DefaultNamespace: ""})
 		if err != nil {
-			slog.Warn("loader: bootstrap-sibling parse failed", "path", abs, "err", err)
+			w.loader.Store.AddWarning(manifest.NamedResource{}, manifest.Warning{
+				Category: manifest.WarnInputParseFailed, Message: "bootstrap-sibling parse failed", Detail: []string{abs, err.Error()},
+			})
 			continue
 		}
-		for _, obj := range objs {
+		for _, child := range objs {
+			obj := child.Obj
 			ks, ok := obj.(*manifest.Kustomization)
 			if !ok {
 				continue
 			}
-			// A genuine bootstrap entry KS always carries a spec.path (and a
-			// sourceRef). A kind: Kustomization with neither is a kustomize
-			// patch fragment — a patch.yaml referenced via `patches:` whose
-			// body happens to use the Flux Kustomization GVK as the patch
-			// target — never a reconcilable Flux Kustomization. Skipping it
-			// is order-independent (it reads only the parsed object), unlike
-			// the dir-coverage guard above.
-			if ks.Path == "" && ks.SourceKind == "" && ks.SourceName == "" {
+			// A Flux-GVK patch fragment with neither spec.path nor sourceRef
+			// must never become a reconcilable Kustomization. A sourceRef alone
+			// is sufficient for a bootstrap entry that renders the source root.
+			if ks.IsFragment() {
 				continue
 			}
-			if w.loader.skipExisting(obj.Named()) {
+			if !w.loader.acceptObject(obj.Named()) {
 				continue
 			}
-			w.loader.addObject(obj, abs)
+			w.loader.recordObject(obj, abs)
+			cached := w.loader.documents.cache[abs]
+			cached.bootstrap = true
+			w.loader.documents.cache[abs] = cached
 			count++
 		}
 	}
 	return count
 }
 
-// dirCoveredByOtherKS reports whether dir (an absolute kustomize-package
-// directory) sits under some loaded Flux Kustomization's spec.path — i.e. it
-// is part of a tree another KS renders, where a sibling KS excluded from the
-// local kustomization.yaml is a disabled app rather than a bootstrap entry.
-// No-ops (returns false) when SourceRoot is unset, so SDK / unit-test callers
-// that set DiscoveryOnly without a repo root keep the legacy scan behavior.
-//
-// A KS being surfaced by scanBootstrapFluxKS is not yet in the Store at its
-// own dir's first scan, so a true entry KS reads as uncovered and is still
-// surfaced; only a strictly-enclosing (or equal) prefix from an already-loaded
-// KS marks the dir covered.
-func (l *Loader) dirCoveredByOtherKS(dir string) bool {
-	if l.SourceRoot == "" {
-		return false
-	}
-	rel, err := filepath.Rel(l.SourceRoot, dir)
-	if err != nil {
-		return false
-	}
-	dirRel := filepath.ToSlash(rel) + "/"
-	for _, ks := range l.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
-		if ks.Path == "" {
+// Component resources retain data evidence without admitting templated Flux objects.
+func (w *walker) walkComponentData(ctx context.Context, dir string) (int, error) {
+	cached := w.loader.documents.cache[dir]
+	cached.traversed = true
+	w.loader.documents.cache[dir] = cached
+	spec, _ := w.loader.documents.read(dir)
+	for ref := range kustomizeinput.Kustomization(spec) {
+		if ref.Role != kustomizeinput.Resource && ref.Role != kustomizeinput.Component {
 			continue
 		}
-		if strings.HasPrefix(dirRel, NormalizePrefix(ks.Path)) {
-			return true
+		if err := ctx.Err(); err != nil {
+			return 0, err
 		}
-	}
-	return false
-}
-
-// walkComponentData records direct ConfigMap/Secret resources from
-// kustomize Components during DiscoveryOnly loads without publishing
-// templated Flux CRs as standalone objects. The change filter's
-// producer index needs the data files source-recorded so a downstream
-// substituteFrom consumer can resolve its producing KS, but a
-// Component's own `${VAR}`-templated Flux CRs are NOT renderable
-// standalone — publishing them would corrupt discovery.
-//
-// Component-of-Component graphs recurse via k.Components; w.visited
-// terminates Component cycles (same primitive descend uses for the
-// non-Component graph). We deliberately do NOT call descend() for
-// nested Components — that would re-enter the regular walk and load
-// any non-Component YAMLs from the Component subtree, defeating the
-// whole point of the skip. Stay limited to CM/Secret data-file
-// recording.
-func (w *walker) walkComponentData(ctx context.Context, dir string, k *kustomization) (int, error) {
-	for _, r := range k.Resources {
-		if cerr := ctx.Err(); cerr != nil {
-			return 0, cerr
-		}
-		abs, ok := resolveDataPath(dir, r)
-		if !ok || w.ignoreMatches(abs, false) || !isManifestFile(abs) {
-			continue
-		}
-		info, err := os.Stat(abs)
-		if err != nil || info.IsDir() {
-			// Directories under a Component's `resources:` are sibling
-			// kustomize packages, not bare data files; the producer
-			// index is fed by files, so skip rather than recurse. A
-			// nested kustomize package authored inside a Component is
-			// vanishingly rare and would be loaded via its enclosing
-			// Flux KS spec.path instead.
-			continue
-		}
-		if err := w.loader.recordDataFile(abs); err != nil {
-			slog.Warn("loader: component data file failed to parse", "path", abs, "err", err)
-		}
-	}
-	for _, comp := range k.Components {
-		if cerr := ctx.Err(); cerr != nil {
-			return 0, cerr
-		}
-		abs, ok := resolveComponentPath(dir, comp)
+		abs, ok := kustpath.Resolve(dir, ref.Path, kustpath.Directory)
 		if !ok {
 			continue
 		}
-		info, err := os.Stat(abs)
-		if err != nil || !info.IsDir() {
+		input, name := w.loader.documents.input(abs)
+		info, err := fs.Stat(input, name)
+		w.loader.documents.rememberStat(abs, info, err)
+		if err != nil {
 			continue
 		}
-		if _, seen := w.visited[abs]; seen {
-			continue
-		}
-		w.visited[abs] = struct{}{}
-		nested, _ := readKustomizationAt(abs)
-		if nested == nil || !nested.isKustomizeComponent() {
-			// A Component that points at a non-Component dir is
-			// malformed for kustomize purposes; skip rather than
-			// descend into walkKustomize, which would publish Flux
-			// CRs we deliberately keep hidden under Component subtrees.
-			continue
-		}
-		if _, err := w.walkComponentData(ctx, abs, nested); err != nil {
-			return 0, err
+		if ref.Role == kustomizeinput.Component {
+			if !info.IsDir() {
+				continue
+			}
+			if _, seen := w.visited[abs]; seen {
+				continue
+			}
+			w.visited[abs] = struct{}{}
+			nested, _ := w.loader.documents.read(abs)
+			if !isKustomizeComponent(nested) {
+				continue
+			}
+			if _, err := w.walkComponentData(ctx, abs); err != nil {
+				return 0, err
+			}
+		} else {
+			if _, ok := kustpath.Resolve(dir, ref.Path, kustpath.File); !ok || info.IsDir() || w.ignoreMatches(abs, false) || !isManifestFile(abs) {
+				continue
+			}
+			if err := w.loader.recordDataFile(abs); err != nil {
+				w.loader.Store.AddWarning(manifest.NamedResource{}, manifest.Warning{
+					Category: manifest.WarnInputParseFailed, Message: "component data file failed to parse", Detail: []string{abs, err.Error()},
+				})
+			}
 		}
 	}
 	return 0, nil
@@ -588,7 +615,11 @@ func (w *walker) walkComponentData(ctx context.Context, dir string, k *kustomiza
 // kustomization.yaml at its root.
 func (w *walker) walkAdHoc(ctx context.Context, root string) (int, error) {
 	count := 0
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+	input, name := w.loader.documents.input(root)
+	walkRoot := filepath.FromSlash(name)
+	err := fs.WalkDir(input, name, func(name string, d fs.DirEntry, walkErr error) error {
+		rel, _ := filepath.Rel(walkRoot, filepath.FromSlash(name))
+		path := filepath.Join(root, rel)
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
@@ -602,26 +633,8 @@ func (w *walker) walkAdHoc(ctx context.Context, root string) (int, error) {
 			if path == root {
 				return nil
 			}
-			// Subdirectory: if it's a kustomize package, switch to
-			// graph walk and SkipDir to keep filepath.WalkDir from
-			// descending again. Pull the file path out of the same
-			// read so walkKustomize doesn't open kustomization.yaml a
-			// second time.
-			if k, kpath := readKustomizationAt(path); k != nil {
-				if k.isKustomizeComponent() {
-					// Mirror descend's DiscoveryOnly gate: harvest
-					// CM/Secret data files from Component subtrees so
-					// the producer index can resolve substituteFrom
-					// deps even when the entry was the ad-hoc walk.
-					if w.loader.Options.DiscoveryOnly {
-						if _, err := w.walkComponentData(ctx, path, k); err != nil {
-							return err
-						}
-					}
-					return filepath.SkipDir
-				}
-				w.visited[path] = struct{}{}
-				n, err := w.walkKustomize(ctx, path, k, kpath)
+			if _, kpath := w.loader.documents.read(path); kpath != "" {
+				n, err := w.descend(ctx, path)
 				if err != nil {
 					return err
 				}
@@ -646,257 +659,149 @@ func (w *walker) walkAdHoc(ctx context.Context, root string) (int, error) {
 	return count, err
 }
 
-// skipExisting reports whether id should be left untouched because
-// PreferExisting is set and the Store already holds it — the
-// orchestrator's recursive spec.path discovery wants the initial scan's
-// data to win over downstream paths that may point into a different tree.
-func (l *Loader) skipExisting(id manifest.NamedResource) bool {
-	return l.PreferExisting && l.Store.GetObject(id) != nil
+// Authored input replaces synthetic aliases and their ready artifacts.
+func (l *Loader) acceptObject(id manifest.NamedResource) bool {
+	if !l.PreferExisting {
+		return true
+	}
+	if l.Index.Records[id].Path != "" {
+		return false
+	}
+	if l.Store.GetObject(id) == nil {
+		return true
+	}
+	artifact, _ := l.Store.GetArtifact(id).(*store.SourceArtifact)
+	if artifact == nil || !artifact.InputAlias {
+		return false
+	}
+	l.Store.DeleteObject(id)
+	return true
 }
 
+// Decode errors retain their file coordinate until scope attribution.
 func (l *Loader) loadFile(path string) (int, error) {
-	objs, err := parseFile(path, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets})
+	if l.documents.cache[path].loaded || l.documents.cache[path].selected {
+		return 0, nil
+	}
+	reader := l.documents
+	reader.regular = true
+	objs := []store.Child{}
+	collect := func(child store.Child) {
+		obj := child.Obj
+		if raw, ok := obj.(*manifest.RawObject); ok && !manifest.KindOf(raw).Tracked && len(manifest.ProducerTargets(raw)) == 0 {
+			return
+		}
+		objs = append(objs, child)
+	}
+	var err error
+	if cached := l.documents.cache[path].objects; cached != nil {
+		for _, obj := range cached {
+			collect(obj)
+		}
+	} else {
+		err = reader.decodeFileObjects(path, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets, DefaultNamespace: ""}, true, collect)
+	}
 	if err != nil {
-		return 0, err
+		if !errors.Is(err, manifest.ErrInput) {
+			return 0, err
+		}
+		if l.Index.Errors == nil {
+			l.Index.Errors = make(map[string]error)
+		}
+		file := l.fileCoordinate(path)
+		if _, seen := l.Index.Errors[file]; !seen {
+			l.Index.Errors[file] = fmt.Errorf("loader: %w", err)
+		}
+		return 0, nil
 	}
 	count := 0
-	for _, obj := range objs {
+	for _, child := range objs {
+		obj := child.Obj
+		info := manifest.KindOf(obj)
+		if !info.Tracked {
+			l.recordObject(obj, path)
+			continue
+		}
 		id := obj.Named()
-		if l.skipExisting(id) {
+		if !l.acceptObject(id) {
 			continue
 		}
-		if l.Options.DiscoveryOnly && !isDiscoveryKind(obj) {
-			// Under render-driven discovery, HRs / ConfigMaps /
-			// Secrets / raw manifests stay out of the Store at file-
-			// load time. They reach the Store via KS render
-			// emission (emitRenderedChildren), depwait's lazy-
-			// promotion fallback, or the orchestrator's orphan
-			// sweep. The Existence index records the {id, path}
-			// pair so the depwait fallback can re-parse the file
-			// on demand without deadlocking the producing KS.
-			l.Existence.Record(id, path)
-			l.recordSource(id, path)
-			l.recordSourceRefs(obj)
-			continue
+		l.recordObject(obj, path)
+		if info.Discovery {
+			count++
 		}
-		l.addObject(obj, path)
-		count++
 	}
+	l.documents.cache[path] = document{objects: objs, loaded: true}
 	return count, nil
 }
 
-// addObject commits obj to the Store and records its source-file and
-// source-ref bookkeeping. Keeps the AddObject/recordSource/recordSourceRefs
-// triplet in one place — shared by the file-load and bootstrap-sibling paths.
-func (l *Loader) addObject(obj manifest.BaseManifest, path string) {
-	l.Store.AddObject(obj)
-	l.recordSource(obj.Named(), path)
-	l.recordSourceRefs(obj)
-}
-
-// recordDataFile parses absPath and records any ConfigMap/Secret
-// objects into the Existence index and SourceFiles map without
-// adding them to the Store. Used by walkComponentData so the change
-// filter's producer index can resolve substituteFrom data deps to
-// their renderer KS without publishing untemplated Component-subtree
-// resources. Mirrors loadFile's PreferExisting + Existence + source
-// bookkeeping but skips AddObject and skips non-data kinds.
+// recordDataFile keeps Component data available for lazy promotion without
+// publishing untemplated Component resources into the Store.
 func (l *Loader) recordDataFile(absPath string) error {
-	objs, err := parseFile(absPath, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets})
+	if l.documents.cache[absPath].selected {
+		return nil
+	}
+	objs, err := l.documents.parseFile(absPath, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets, DefaultNamespace: ""})
 	if err != nil {
 		return err
 	}
-	for _, obj := range objs {
+	for _, child := range objs {
+		obj := child.Obj
 		id := obj.Named()
-		if id.Kind != manifest.KindConfigMap && id.Kind != manifest.KindSecret {
+		if !manifest.KindOf(obj).Data {
 			// Non-data kinds (most commonly templated Flux CRs in a
 			// Component subtree) intentionally stay invisible — the
 			// producer-index use case is data-only.
 			continue
 		}
-		if l.skipExisting(id) {
+		if !l.acceptObject(id) {
 			continue
 		}
-		if l.Existence != nil {
-			l.Existence.Record(id, absPath)
-		}
-		l.recordSource(id, absPath)
+		l.recordObject(obj, absPath)
 	}
 	return nil
 }
 
-// recordGenerators appends generator records observed during a walk.
-// The orchestrator's Bootstrap calls FinalizeGenerators after Load
-// returns to resolve effective namespaces and inject the synthesized
-// CMs/Secrets into the store.
-func (l *Loader) recordGenerators(records []generatorRecord) {
-	if len(records) == 0 {
-		return
-	}
-	l.generatorsMu.Lock()
-	defer l.generatorsMu.Unlock()
-	l.generators = append(l.generators, records...)
-}
-
-// FinalizeGenerators materializes every harvested configMapGenerator/
-// secretGenerator entry into the store. Effective namespace is
-// resolved per kustomize precedence: the entry's own namespace wins,
-// then the kustomization.yaml's namespace, then the enclosing Flux
-// Kustomization's namespace (looked up via KSPathPrefixes against
-// the source file).
-//
-// Synthesized objects honor PreferExisting: if an explicit CM/Secret
-// with the same id already came from a real on-disk YAML, we don't
-// overwrite it with the generated placeholder.
-//
-// repoRoot is the filesystem root used to compute slash-relative
-// paths for the parent lookup; pass the same root the change filter
-// is keyed against (the Flux KS spec.path prefixes are
-// repoRoot-relative).
-func (l *Loader) FinalizeGenerators(repoRoot string) {
-	l.generatorsMu.Lock()
-	records := l.generators
-	l.generators = nil
-	l.generatorsMu.Unlock()
-	if len(records) == 0 {
-		return
-	}
-	// Build the prefix list once for the entire generator loop.
-	// parentNamespaceFor needs it for each record's LongestParent
-	// lookup; building it per record would walk every Kustomization
-	// and re-read every kustomization.yaml's `components:` once per
-	// record — O(M×K) where M is records and K is KSes. The shared
-	// ComponentCache (when present) drops the per-KS cost too, so a
-	// repeat finalize pass within the same Bootstrap doesn't re-stat
-	// disk.
-	prefixes := KSPathPrefixesWithCache(l.Store, repoRoot, l.ComponentCache)
-	seen := make(map[manifest.NamedResource]struct{}, len(records))
-	for _, r := range records {
-		parentNS := parentNamespaceFor(prefixes, l.Store, r.file, repoRoot)
-		obj := r.materialize(parentNS)
-		id := obj.Named()
-		if _, dup := seen[id]; dup {
-			// Iterative discovery re-walks the same kustomization.yaml
-			// across passes; the second occurrence is a duplicate.
-			continue
-		}
-		seen[id] = struct{}{}
-		if l.Store.GetObject(id) != nil {
-			// Real CM/Secret YAML already won; don't overwrite.
-			continue
-		}
-		l.Store.AddObject(obj)
-		l.recordSource(id, r.file)
-		if l.Existence != nil {
-			l.Existence.Record(id, r.file)
+// recordObject retains raw locations and authored source references for deferred admission.
+func (l *Loader) recordObject(obj manifest.BaseManifest, absPath string) {
+	id := obj.Named()
+	if l.candidates[id].Obj != nil {
+		if record, exists := l.Index.Lookup(id); exists && record.Path == "" {
+			return
 		}
 	}
+	delete(l.candidates, id)
+	r := manifest.DiscoveryRecord{Authored: id, Path: absPath, File: l.fileCoordinate(absPath)}
+	r.Refs = discoveryReferences(obj)
+	l.Index.Records[id] = r
 }
 
-// parentNamespaceFor resolves the enclosing Flux Kustomization's
-// namespace for the file at absPath. Falls back to "" when the file
-// sits outside any KS spec.path / component — depwait's name-only
-// fallback may still match in that case.
-func parentNamespaceFor(prefixes []KSPathPrefix, s *store.Store, absPath, repoRoot string) string {
-	rel, err := filepath.Rel(repoRoot, absPath)
-	if err != nil {
-		return ""
+func discoveryReferences(obj manifest.BaseManifest) []manifest.NamedResource {
+	var buf [16]manifest.NamedResource
+	refs := buf[:0]
+	for ref := range manifest.References(obj, manifest.ReferenceRelations) {
+		if discoveryReference(ref) {
+			refs = append(refs, ref.NamedResource)
+		}
 	}
-	owner, ok := LongestParent(prefixes, rel, manifest.NamedResource{})
-	if !ok {
-		return ""
+	if len(refs) != 0 {
+		return slices.Clone(refs)
 	}
-	ks, _ := s.GetByName[*manifest.Kustomization](manifest.KindKustomization, owner.Namespace, owner.Name)
-	if ks == nil {
-		return ""
-	}
-	// Flux's render-time namespace precedence: spec.targetNamespace
-	// (the resource's effective namespace post-render) wins over the
-	// KS's own namespace (where the KS CR lives). For generated CMs
-	// we want the post-render namespace because that's what
-	// substituteFrom in downstream KSes references.
-	return cmp.Or(ks.TargetNamespace, ks.Namespace)
+	return nil
 }
 
-// recordSource maps a resource id back to the on-disk file it was
-// loaded from, with the path made relative to SourceRoot and
-// slash-normalized to match change.Detect's keys.
-func (l *Loader) recordSource(id manifest.NamedResource, absPath string) {
-	if l.SourceFiles == nil {
-		return
-	}
-	rel := absPath
+func discoveryReference(ref manifest.Reference) bool {
+	return ref.Use == "valuesFrom" || ref.Use == "substituteFrom" && ref.Content && ref.Group == "" && ref.Kind == manifest.KindConfigMap ||
+		(ref.Use == "source" || ref.Use == "chart" || ref.Use == "artifact") && ref.Kind != "" && ref.Name != ""
+}
+
+func (l *Loader) fileCoordinate(absPath string) string {
 	if l.SourceRoot != "" {
-		if r, err := filepath.Rel(l.SourceRoot, absPath); err == nil {
-			rel = r
+		if rel, err := filepath.Rel(l.SourceRoot, absPath); err == nil {
+			return filepath.ToSlash(rel)
 		}
 	}
-	l.SourceFiles[id] = filepath.ToSlash(rel)
-}
-
-// recordSourceRefs captures the source resources obj references — a
-// HelmRelease's chart source, a Kustomization's spec.sourceRef — so the
-// change filter can resolve the reverse edge from a changed source back
-// to its consumers. No-op for non-consumer kinds or when tracking is
-// disabled. The chart ref is read from the parse-time projection
-// (chartFromHelmRelease), which is populated whether or not the HR
-// reaches the Store.
-func (l *Loader) recordSourceRefs(obj manifest.BaseManifest) {
-	if l.SourceRefs == nil {
-		return
-	}
-	var refs []manifest.NamedResource
-	switch o := obj.(type) {
-	case *manifest.HelmRelease:
-		if o.Chart.RepoKind != "" && o.Chart.RepoName != "" {
-			refs = append(refs, manifest.NamedResource{
-				Kind: o.Chart.RepoKind, Namespace: o.Chart.RepoNamespace, Name: o.Chart.RepoName,
-			})
-		}
-	case *manifest.Kustomization:
-		if o.SourceKind != "" && o.SourceName != "" {
-			refs = append(refs, manifest.NamedResource{
-				Kind: o.SourceKind, Namespace: o.SourceNamespace, Name: o.SourceName,
-			})
-		}
-	}
-	if len(refs) > 0 {
-		l.SourceRefs[obj.Named()] = refs
-	}
-}
-
-// isDiscoveryKind reports whether obj belongs to the discovery-meta
-// kind set the loader keeps in the Store under DiscoveryOnly:
-//
-//   - Kustomization, ResourceSet, ResourceSetInputProvider — the
-//     reconcile driver and its meta-discovery hooks (RS renders to
-//     more KSes; RSIPs feed RS selectors).
-//   - Sources (GitRepository, OCIRepository, HelmRepository,
-//     HelmChartSource, Bucket, ExternalArtifact) — sources are
-//     rarely patched at render time and need to be visible at
-//     discovery for the bootstrap-alias pass to recognize them as
-//     already-known (otherwise every GitRepository gets aliased to
-//     the working tree, which silently redirects every KS's render
-//     to the wrong source root).
-//
-// HelmReleases, ConfigMaps, Secrets, and other reconcilables flow
-// from KS render output via emitRenderedChildren — or, when no KS
-// would render them, through the orchestrator's post-discovery
-// orphan-promotion sweep.
-func isDiscoveryKind(obj manifest.BaseManifest) bool {
-	switch obj.(type) {
-	case *manifest.Kustomization,
-		*manifest.ResourceSet,
-		*manifest.ResourceSetInputProvider,
-		*manifest.GitRepository,
-		*manifest.OCIRepository,
-		*manifest.HelmRepository,
-		*manifest.HelmChartSource,
-		*manifest.Bucket,
-		*manifest.ExternalArtifact:
-		return true
-	}
-	return false
+	return filepath.ToSlash(absPath)
 }
 
 func isManifestFile(path string) bool {
@@ -907,28 +812,11 @@ func isManifestFile(path string) bool {
 	return false
 }
 
-// shouldSkipDir applies the ad-hoc walk's directory-prune rules.
-// Not used by walkKustomize — that path follows explicit resource
-// entries and trusts the user's kustomize manifests.
-//
-// Lives on walker so the final ignore check routes through the
-// per-Load matches cache — without it, every directory in the tree
-// re-runs filepath.Rel + gitignore.Match for the same path.
+// Explicit resources bypass scan pruning; negated descendants MUST remain reachable.
 func (w *walker) shouldSkipDir(name, full string) bool {
-	switch name {
-	case ".git", "node_modules", ".cache":
-		return true
-	case "templates", "crds":
-		// These directories typically contain Helm template fragments
-		// with Go-template syntax that isn't valid YAML.
+	if sourceignore.PruneDir(name, true) {
 		return true
 	}
-	if strings.HasPrefix(name, ".") && name != "." {
-		return true
-	}
-	// With `!` re-includes in play, an ignored directory can still hold
-	// re-included files, so descend and let the per-file checks filter —
-	// matching sourceignore's per-file evaluation of spec.ignore.
 	if w.ignore != nil && w.ignore.hasNegation {
 		return false
 	}

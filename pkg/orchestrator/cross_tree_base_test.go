@@ -35,24 +35,12 @@ func TestOrchestrator_CrossTreeBaseSubstitution(t *testing.T) {
 	// Entry KSes: cluster-settings (provides the substitution ConfigMap) and
 	// cluster-apps (fans out ./apps/test with postBuild substitution + a patch
 	// injecting substituteFrom into every emitted child Kustomization).
-	testutil.WriteFile(t, dir, "cluster/flux-system.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: cluster-settings
-  namespace: flux-system
-spec:
-  path: ./settings
+	testutil.WriteFile(t, dir, "cluster/flux-system.yaml", testutil.KustomizationYAML("cluster-settings", "flux-system", `  path: ./settings
   sourceRef:
     kind: GitRepository
     name: flux-system
----
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: cluster-apps
-  namespace: flux-system
-spec:
-  path: ./apps/test
+`)+"---\n"+
+		testutil.KustomizationYAML("cluster-apps", "flux-system", `  path: ./apps/test
   dependsOn:
     - name: cluster-settings
   sourceRef:
@@ -76,7 +64,7 @@ spec:
       target:
         group: kustomize.toolkit.fluxcd.io
         kind: Kustomization
-`)
+`))
 
 	testutil.WriteFile(t, dir, "settings/kustomization.yaml", "resources:\n  - ./cluster-settings.yaml\n")
 	testutil.WriteFile(t, dir, "settings/cluster-settings.yaml", `apiVersion: v1
@@ -99,17 +87,7 @@ data:
 	testutil.WriteFile(t, dir, "apps/base/app-a/kustomization.yaml", "resources:\n  - ks.yaml\n  - cm.yaml\n")
 	// app-a is a ROOT — no dependsOn — so it fires as soon as its source is
 	// ready, the case that consistently lost the race pre-fix.
-	testutil.WriteFile(t, dir, "apps/base/app-a/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: app-a
-  namespace: flux-system
-spec:
-  path: ./apps/${CLUSTER_ENV}/app-a
-  sourceRef:
-    kind: GitRepository
-    name: flux-system
-`)
+	testutil.WriteFile(t, dir, "apps/base/app-a/ks.yaml", testutil.KustomizationYAML("app-a", "flux-system", "  path: ./apps/${CLUSTER_ENV}/app-a\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n"))
 	testutil.WriteFile(t, dir, "apps/base/app-a/cm.yaml", `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -118,19 +96,7 @@ metadata:
 `)
 
 	testutil.WriteFile(t, dir, "apps/base/app-b/kustomization.yaml", "resources:\n  - ks.yaml\n  - cm.yaml\n")
-	testutil.WriteFile(t, dir, "apps/base/app-b/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: app-b
-  namespace: flux-system
-spec:
-  path: ./apps/${CLUSTER_ENV}/app-b
-  dependsOn:
-    - name: app-a
-  sourceRef:
-    kind: GitRepository
-    name: flux-system
-`)
+	testutil.WriteFile(t, dir, "apps/base/app-b/ks.yaml", testutil.KustomizationYAML("app-b", "flux-system", "  path: ./apps/${CLUSTER_ENV}/app-b\n  dependsOn:\n    - name: app-a\n  sourceRef:\n    kind: GitRepository\n    name: flux-system\n"))
 	testutil.WriteFile(t, dir, "apps/base/app-b/cm.yaml", `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -138,7 +104,7 @@ metadata:
   namespace: flux-system
 `)
 
-	o, err := New(Config{Path: dir, WipeSecrets: true})
+	o, err := New(t.Context(), Config{Path: dir, WipeSecrets: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -148,7 +114,7 @@ metadata:
 	}
 
 	for _, name := range []string{"app-a", "app-b"} {
-		id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: name}
+		id := testutil.KustomizationID("flux-system", name)
 		ks, ok := o.store.GetObject(id).(*manifest.Kustomization)
 		if !ok {
 			t.Fatalf("%s missing from store", name)
@@ -157,7 +123,7 @@ metadata:
 			t.Errorf("%s spec.path = %q, want %q (${CLUSTER_ENV} should resolve to test)", name, ks.Path, want)
 		}
 		if info, failed := res.Failed[id]; failed {
-			t.Errorf("%s failed: %s", name, info.Message)
+			t.Errorf("%s failed: %s", name, info.String())
 		}
 	}
 }

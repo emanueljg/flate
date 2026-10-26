@@ -3,7 +3,15 @@ package helm
 import (
 	"slices"
 	"testing"
+	"testing/fstest"
 
+	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/internal/testutil/cachetest"
+	"github.com/home-operations/flate/pkg/manifest"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
+	"github.com/home-operations/flate/pkg/store"
+
+	chartcommon "helm.sh/helm/v4/pkg/chart/common"
 	chart "helm.sh/helm/v4/pkg/chart/v2"
 )
 
@@ -25,6 +33,7 @@ func vals(keys ...string) map[string]any {
 }
 
 func TestUnreferencedValuePaths(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		src    string
@@ -114,11 +123,18 @@ func TestUnreferencedValuePaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			al := tc.allow
 			if al == nil {
 				al = allow()
 			}
-			got := unreferencedValuePaths(tc.src, tc.values, al)
+			ch := &chart.Chart{}
+			if tc.src != "" {
+				ch.Templates = []*chartcommon.File{{Data: []byte(tc.src)}}
+			}
+			analysis := (chartDescription{chart: ch}).analyze()
+			analysis.Allowed = al
+			got := analysis.unreferencedValuePaths(tc.values)
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("unreferencedValuePaths = %v, want %v", got, tc.want)
 			}
@@ -127,6 +143,7 @@ func TestUnreferencedValuePaths(t *testing.T) {
 }
 
 func TestOpaqueValuesAccess(t *testing.T) {
+	t.Parallel()
 	cases := map[string]bool{
 		"{{ .Values.foo }}":              false, // field selector
 		`{{ index .Values "foo" }}`:      false, // literal index
@@ -141,13 +158,14 @@ func TestOpaqueValuesAccess(t *testing.T) {
 		"{{ .Values.a }}{{ .Values.b }}": false,
 	}
 	for src, want := range cases {
-		if got := opaqueValuesAccess(src); got != want {
+		if got := opaqueValuesAccess([]byte(src)); got != want {
 			t.Errorf("opaqueValuesAccess(%q) = %v, want %v", src, got, want)
 		}
 	}
 }
 
 func TestValuesKeyReferenced(t *testing.T) {
+	t.Parallel()
 	src := `{{ .Values.greeting }} {{ index .Values "weird-key" }} {{ .Values.image.tag }}`
 	cases := map[string]bool{
 		"greeting":  true,  // dotted
@@ -164,6 +182,7 @@ func TestValuesKeyReferenced(t *testing.T) {
 }
 
 func TestKnownTopLevelKeys(t *testing.T) {
+	t.Parallel()
 	sub := &chart.Chart{
 		Metadata: &chart.Metadata{
 			Name: "operator",
@@ -181,13 +200,33 @@ func TestKnownTopLevelKeys(t *testing.T) {
 			},
 		},
 	})
+	tagsOnlyNested.AddDependency(&chart.Chart{Metadata: &chart.Metadata{Name: "later"}})
+	deep := &chart.Chart{Metadata: &chart.Metadata{
+		Name:         "child",
+		Dependencies: []*chart.Dependency{{Condition: "innerCrds.enabled"}},
+	}}
+	deep.AddDependency(&chart.Chart{Metadata: &chart.Metadata{
+		Name:         "deeper",
+		Dependencies: []*chart.Dependency{{Name: "grand", Condition: "deep.enabled", Tags: []string{"group"}}},
+	}})
+	missingMetadata := &chart.Chart{}
+	missingMetadata.AddDependency(deep, &chart.Chart{})
+	noTags := &chart.Chart{Metadata: &chart.Metadata{
+		Name: "parent",
+		Dependencies: []*chart.Dependency{
+			{Name: "database", Alias: "db", Condition: " , crds.enabled, , .ignored, metricsEnabled, extra.enabled, "},
+			{},
+			nil,
+		},
+	}}
+	noTags.AddDependency(sub)
 	ch := &chart.Chart{
 		Metadata: &chart.Metadata{
 			Name: "parent",
 			Dependencies: []*chart.Dependency{
-				{Name: "alloy-crd", Condition: "crds.deployAlloyCRD"},
+				{Name: "alloy-crd", Condition: "crds.deployAlloyCRD", Tags: []string{"observability"}},
 				{Name: "podlogs-crd", Alias: "podlogs", Condition: "crds.deployPodLogsCRD, extra.enabled"},
-				{Name: "metrics", Condition: "metricsEnabled", Tags: []string{"observability"}},
+				{Name: "metrics", Condition: "metricsEnabled"},
 				nil,
 			},
 		},
@@ -219,11 +258,22 @@ func TestKnownTopLevelKeys(t *testing.T) {
 		{
 			name: "tags on a nested dependency still allowlist the shared tags block",
 			ch:   tagsOnlyNested,
+			want: []string{"child", "global", "later", "tags"},
+		},
+		{
+			name: "missing root metadata with deep tags",
+			ch:   missingMetadata,
 			want: []string{"child", "global", "tags"},
+		},
+		{
+			name: "no tags with empty condition segments",
+			ch:   noTags,
+			want: []string{"crds", "database", "db", "extra", "global", "metricsEnabled", "operator"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := knownTopLevelKeys(tc.ch)
 			keys := make([]string, 0, len(got))
 			for k := range got {
@@ -235,4 +285,22 @@ func TestKnownTopLevelKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStaleValuePaths_MutableCapture(t *testing.T) {
+	t.Parallel()
+	input := fstest.MapFS{
+		"Chart.yaml":        {Data: []byte("apiVersion: v2\nname: chart\nversion: 1.0.0\n")},
+		"templates/cm.yaml": {Data: []byte("{{ .Values.first }}")},
+	}
+	cli := NewClient(cachetest.New(t, "", sourcecache.New))
+	st := store.New()
+	hr := &manifest.HelmRelease{Chart: manifest.HelmChart{Name: ".", Source: manifest.NamedResource{Group: manifest.SourceDomain, Kind: manifest.KindGitRepository, Name: "repo"}}}
+	st.SetArtifact(hr.ChartSource(), &store.SourceArtifact{FS: input, Key: "misleading"})
+
+	assert.Diff(t, cli.StaleValuePaths(t.Context(), hr, vals("first", "second"), NewSources(st)), []string{"second"})
+	input["templates/cm.yaml"].Data = []byte("{{ .Values.second }}")
+	assert.Diff(t, cli.StaleValuePaths(t.Context(), hr, vals("first", "second"), NewSources(st)), []string{"first"})
+	input["Chart.yaml"].Data = []byte("invalid")
+	assert.Equal(t, len(cli.StaleValuePaths(t.Context(), hr, vals("first", "second"), NewSources(st))), 0)
 }

@@ -4,9 +4,13 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
@@ -17,22 +21,19 @@ var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // codes are zero-width and must not count against the terminal budget.
 func visibleLen(s string) int { return len([]rune(ansiRE.ReplaceAllString(s, ""))) }
 
-func barID(name string) manifest.NamedResource {
-	return manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: name}
-}
-
-// inflightModel builds a model with names tracked as in-flight (Pending).
 func inflightModel(color bool, names ...string) barModel {
 	m := newBarModel(color)
 	for _, n := range names {
-		m.track(barID(n), store.StatusInfo{Status: store.StatusPending})
+		m.events.publish(testutil.KustomizationID("ns", n), store.StatusPending, time.Now())
 	}
+	m.drainEvents()
 	return m
 }
 
 // TestView_FitsWidth: the frame never exceeds the terminal width at any size, so
 // Bubble Tea's inline renderer never wraps (a wrap would break the sticky line).
 func TestView_FitsWidth(t *testing.T) {
+	t.Parallel()
 	for _, width := range []int{1, 3, 8, 20, 40, 80, 200} {
 		for _, color := range []bool{false, true} {
 			m := inflightModel(color, "alpha", "bravo", "charlie", "delta", "echo")
@@ -48,6 +49,7 @@ func TestView_FitsWidth(t *testing.T) {
 // TestView_PlainNoColor: with color off the frame carries no escape codes and
 // shows the counts + in-flight names.
 func TestView_PlainNoColor(t *testing.T) {
+	t.Parallel()
 	m := inflightModel(false, "plex")
 	m.done, m.total, m.width = 3, 10, 80
 	got := m.View().Content
@@ -64,6 +66,7 @@ func TestView_PlainNoColor(t *testing.T) {
 // TestView_ColorInvisibleToWidth: the same content fits the same width whether
 // colorized or not — codes don't consume columns.
 func TestView_ColorInvisibleToWidth(t *testing.T) {
+	t.Parallel()
 	plain := inflightModel(false, "plex")
 	plain.done, plain.total, plain.width = 3, 10, 40
 	color := inflightModel(true, "plex")
@@ -81,6 +84,7 @@ func TestView_ColorInvisibleToWidth(t *testing.T) {
 // TestModel_FinishVanishes: finishMsg sets the bar to render an empty frame
 // (clearing the line so it vanishes) and returns the quit command.
 func TestModel_FinishVanishes(t *testing.T) {
+	t.Parallel()
 	m := inflightModel(false, "a")
 	m.done, m.total = 1, 1
 	updated, cmd := m.Update(finishMsg{})
@@ -97,6 +101,7 @@ func TestModel_FinishVanishes(t *testing.T) {
 
 // TestModel_InitTicks: Init kicks off the spinner animation.
 func TestModel_InitTicks(t *testing.T) {
+	t.Parallel()
 	if newBarModel(false).Init() == nil {
 		t.Error("Init should return the spinner tick command")
 	}
@@ -104,6 +109,7 @@ func TestModel_InitTicks(t *testing.T) {
 
 // TestModel_WindowSize: a resize updates the width used for truncation.
 func TestModel_WindowSize(t *testing.T) {
+	t.Parallel()
 	m := newBarModel(false)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120})
 	if w := updated.(barModel).width; w != 120 {
@@ -112,6 +118,7 @@ func TestModel_WindowSize(t *testing.T) {
 }
 
 func TestSummarizeInflight(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		names []string
 		max   int
@@ -130,70 +137,121 @@ func TestSummarizeInflight(t *testing.T) {
 	}
 }
 
-// TestModel_Counts drives track through realistic events: counters track unique
-// terminal ids; Ready, Failed, and skipped all count as "done loading".
 func TestModel_Counts(t *testing.T) {
+	t.Parallel()
 	m := newBarModel(false)
-	a, b, s := barID("a"), barID("b"), barID("suspended")
-	m.track(a, store.StatusInfo{Status: store.StatusPending})
-	m.track(b, store.StatusInfo{Status: store.StatusPending})
-	m.track(a, store.StatusInfo{Status: store.StatusReady})
-	m.track(b, store.StatusInfo{Status: store.StatusFailed, Message: "boom: chart not found"})
-	m.track(s, store.StatusInfo{Status: store.StatusReady, Message: store.MsgSuspended})
+	a, b, s := testutil.KustomizationID("ns", "a"), testutil.KustomizationID("ns", "b"), testutil.KustomizationID("ns", "suspended")
+	m.events.publish(a, store.StatusPending, time.Now())
+	m.events.publish(b, store.StatusPending, time.Now())
+	m.events.publish(a, store.StatusReady, time.Now())
+	m.events.publish(b, store.StatusFailed, time.Now())
+	m.events.publish(s, store.StatusReady, time.Now())
 
+	m.drainEvents()
 	if m.done != 3 || m.total != 3 {
 		t.Errorf("counts: done=%d total=%d; want 3/3", m.done, m.total)
 	}
+	m.drainEvents()
 	if got := m.inflightLabels(); len(got) != 0 {
 		t.Errorf("all resources terminal but still in-flight: %v", got)
 	}
 }
 
-// TestModel_DedupAndInflight: an idempotent terminal re-write doesn't
-// double-count, and a resource drops out of the in-flight set the moment it
-// reaches a terminal status.
 func TestModel_DedupAndInflight(t *testing.T) {
+	t.Parallel()
 	m := newBarModel(false)
-	a := barID("a")
-	m.track(a, store.StatusInfo{Status: store.StatusPending})
-	if got := m.inflightLabels(); len(got) != 1 || got[0] != "a" {
-		t.Fatalf("in-flight after Pending = %v, want [a]", got)
-	}
-	m.track(a, store.StatusInfo{Status: store.StatusReady})
-	m.track(a, store.StatusInfo{Status: store.StatusReady}) // duplicate
-	if m.done != 1 {
-		t.Errorf("duplicate Ready double-counted: done=%d, want 1", m.done)
-	}
-	if got := m.inflightLabels(); len(got) != 0 {
-		t.Errorf("terminal resource still in-flight: %v", got)
+	a := testutil.KustomizationID("ns", "a")
+	first := time.Unix(10, 0)
+	m.events.publish(a, store.StatusPending, first)
+	updated, _ := m.Update(m.spinner.Tick())
+	m = updated.(barModel)
+	assert.Diff(t, m.inflightLabels(), []string{"a"})
+	m.events.publish(a, store.StatusPending, first.Add(-time.Second))
+	m.events.publish(a, store.StatusReady, first.Add(time.Second))
+	m.events.publish(a, store.StatusReady, first.Add(2*time.Second))
+	updated, _ = m.Update(m.spinner.Tick())
+	m = updated.(barModel)
+	assert.Equal(t, m.first[a], first.Add(-time.Second))
+	assert.Equal(t, m.total, 1)
+	assert.Equal(t, m.done, 1)
+	assert.Equal(t, len(m.inflight), 0)
+	if m.events.head.Load() != nil {
+		t.Fatal("spinner left pending statuses")
 	}
 }
 
-// TestModel_ExcludesSyntheticIDs: the synthetic bootstrap GitRepository and
-// internally-synthesized HelmCharts appear in no `flate test`/`build` report, so
-// the bar must neither count them nor list them in-flight — otherwise its
-// [done/total] overshoots every report (the 175-vs-174 gap).
+func TestModel_InflightLabelsFirstSeenOrder(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		names []string
+	}{
+		{"later first", []string{"alpha", "charlie", "bravo"}},
+		{"later last", []string{"bravo", "charlie", "alpha"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := newBarModel(false)
+			first := time.Unix(1, 0)
+			for _, name := range tc.names {
+				observedAt := first
+				if name == "alpha" {
+					observedAt = first.Add(time.Second)
+				}
+				m.events.publish(testutil.KustomizationID("ns", name), store.StatusPending, observedAt)
+			}
+			m.drainEvents()
+			assert.Diff(t, m.inflightLabels(), []string{"bravo", "charlie", "alpha"})
+		})
+	}
+}
+
 func TestModel_ExcludesSyntheticIDs(t *testing.T) {
+	t.Parallel()
 	m := newBarModel(false)
 	boot := manifest.BootstrapSourceID
-	chart := manifest.NamedResource{Kind: manifest.KindHelmChart, Namespace: "ns", Name: "repo-app-abc1234"}
-	declared := barID("declared")
+	chart := manifest.NamedResource{Group: "source.toolkit.fluxcd.io", Kind: manifest.KindHelmChart, Namespace: "ns", Name: "repo-app-abc1234"}
+	declared := []manifest.NamedResource{
+		testutil.KustomizationID("ns", "declared"),
+		{Group: "foreign.example", Kind: chart.Kind, Namespace: chart.Namespace, Name: chart.Name},
+		{Group: manifest.SourceDomain, Kind: manifest.KindGitRepository, Namespace: "ns", Name: "ordinary"},
+		{Group: boot.Group, Kind: boot.Kind, Namespace: "other", Name: boot.Name},
+	}
+	ids := append([]manifest.NamedResource{boot, chart}, declared...)
 
-	for _, id := range []manifest.NamedResource{boot, chart, declared} {
-		m.track(id, store.StatusInfo{Status: store.StatusPending})
+	for _, id := range ids {
+		m.events.publish(id, store.StatusPending, time.Now())
 	}
-	for _, id := range []manifest.NamedResource{boot, chart, declared} {
-		m.track(id, store.StatusInfo{Status: store.StatusReady})
+	m.drainEvents()
+	if got := m.inflightLabels(); len(got) != len(declared) {
+		t.Fatalf("in-flight labels = %v, want %d declared resources", got, len(declared))
 	}
-	if m.done != 1 || m.total != 1 {
-		t.Errorf("synthetic ids leaked into counts: done=%d total=%d; want 1/1", m.done, m.total)
+	for _, id := range ids {
+		m.events.publish(id, store.StatusReady, time.Now())
+	}
+	m.drainEvents()
+	if m.done != len(declared) || m.total != len(declared) {
+		t.Errorf("live counts: done=%d total=%d; want %d/%d", m.done, m.total, len(declared), len(declared))
 	}
 
-	// Excluded ids never enter the in-flight set, even while Pending.
 	m2 := newBarModel(false)
-	m2.track(boot, store.StatusInfo{Status: store.StatusPending})
-	m2.track(chart, store.StatusInfo{Status: store.StatusPending})
+	m2.events.publish(boot, store.StatusPending, time.Now())
+	m2.events.publish(chart, store.StatusPending, time.Now())
+	m2.drainEvents()
 	if got := m2.inflightLabels(); len(got) != 0 {
 		t.Errorf("synthetic ids listed in-flight: %v", got)
 	}
+}
+
+func TestModel_DelayedElapsed(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		m := newBarModel(false)
+		time.Sleep(progressDelay)
+		m.drainEvents()
+		time.Sleep(250 * time.Millisecond)
+		if got := m.View().Content; !strings.Contains(got, "0.5s") {
+			t.Fatalf("elapsed excludes delay: %q", got)
+		}
+	})
 }

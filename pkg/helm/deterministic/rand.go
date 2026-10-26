@@ -2,8 +2,10 @@ package deterministic
 
 import (
 	"encoding/base64"
+	"encoding/binary"
+	"fmt"
 	"io"
-	"math/rand/v2"
+	"strings"
 	"text/template"
 
 	"github.com/google/uuid"
@@ -25,21 +27,27 @@ var charsASCII = func() string {
 	return string(b)
 }()
 
-// randFuncs returns deterministic overrides for sprig's crypto/rand- and
+// randFuncs registers deterministic overrides for sprig's crypto/rand- and
 // math/rand-backed string/byte/int/uuid functions, all drawing from the
 // per-render stream. Output is not byte-identical to sprig — it only needs to be
 // deterministic and structurally valid (right length, right character class).
-func randFuncs(s *stream) template.FuncMap {
-	return template.FuncMap{
-		"randAlphaNum": func(n int) string { return randString(s, n, charsAlphaNum) },
-		"randAlpha":    func(n int) string { return randString(s, n, charsAlpha) },
-		"randNumeric":  func(n int) string { return randString(s, n, charsNumeric) },
-		"randAscii":    func(n int) string { return randString(s, n, charsASCII) },
-		"randBytes":    func(n int) (string, error) { return randBytes(s, n) },
-		"randInt":      func(minN, maxN int) int { return randInt(s, minN, maxN) },
-		"uuidv4":       func() string { return uuidv4(s) },
-		"shuffle":      func(in string) string { return shuffle(s, in) },
+func randFuncs(s *stream, fm template.FuncMap) {
+	fm["randAlphaNum"] = func(n int) string { return randString(s, n, charsAlphaNum) }
+	fm["randAlpha"] = func(n int) string { return randString(s, n, charsAlpha) }
+	fm["randNumeric"] = func(n int) string { return randString(s, n, charsNumeric) }
+	fm["randAscii"] = func(n int) string { return randString(s, n, charsASCII) }
+	fm["randBytes"] = func(n int) (string, error) { return randBytes(s, n) }
+	fm["randInt"] = func(minN, maxN int) int { return randInt(s, minN, maxN) }
+	fm["uuidv4"] = func() string { return uuidv4(s) }
+	fm["shuffle"] = func(in string) string { return shuffle(s, in) }
+	fm["bcrypt"] = func(input string) string { return bcrypt(s, input) }
+	fm["htpasswd"] = func(username, password string) string {
+		if strings.Contains(username, ":") {
+			return fmt.Sprintf("invalid username: %s", username)
+		}
+		return username + ":" + bcrypt(s, password)
 	}
+	fm["encryptAES"] = func(password, plaintext string) (string, error) { return encryptAES(s, password, plaintext) }
 }
 
 // shuffle returns a deterministic permutation of in's runes, drawn from the
@@ -52,8 +60,10 @@ func randFuncs(s *stream) template.FuncMap {
 // valid permutation, not byte-identical to sprig.
 func shuffle(s *stream, in string) string {
 	r := []rune(in)
-	//nolint:gosec // G404: deterministic rendering deliberately draws from the seeded ChaCha8, not crypto/rand.
-	rand.New(s.c).Shuffle(len(r), func(i, j int) { r[i], r[j] = r[j], r[i] })
+	for i := len(r) - 1; i > 0; i-- {
+		j := randInt(s, 0, i+1)
+		r[i], r[j] = r[j], r[i]
+	}
 	return string(r)
 }
 
@@ -91,8 +101,9 @@ func randInt(s *stream, minN, maxN int) int {
 	if span <= 0 {
 		return minN
 	}
-	//nolint:gosec // G404: deterministic rendering deliberately draws from the seeded ChaCha8, not crypto/rand.
-	return minN + rand.New(s.c).IntN(span)
+	var buf [8]byte
+	_, _ = s.Read(buf[:])
+	return minN + int(binary.LittleEndian.Uint64(buf[:])%uint64(span)) //nolint:gosec // G115: the remainder is less than the positive int span.
 }
 
 func uuidv4(s *stream) string {

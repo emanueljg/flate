@@ -2,106 +2,72 @@ package source
 
 import (
 	"errors"
-	"strings"
+	"net/url"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-func TestResolveProxy_NilRef(t *testing.T) {
-	p, err := ResolveProxy(nil, "ns", "GitRepository", "ns/r", nil)
-	if err != nil {
-		t.Fatalf("ResolveProxy: %v", err)
-	}
-	if p != nil {
-		t.Errorf("expected nil ProxyConfig for nil ref")
-	}
-}
-
-func TestResolveProxy_NoGetter(t *testing.T) {
-	_, err := ResolveProxy(nil, "ns", "GitRepository", "ns/r",
-		&manifest.LocalObjectReference{Name: "px"})
-	if err == nil || !strings.Contains(err.Error(), "source.SecretGetter") {
-		t.Errorf("expected SecretGetter error; got %v", err)
-	}
-}
-
-func TestResolveProxy_SecretNotFound(t *testing.T) {
-	_, err := ResolveProxy(
-		func(_, _ string) *manifest.Secret { return nil },
-		"ns", "OCIRepository", "ns/r",
-		&manifest.LocalObjectReference{Name: "px"})
-	if err == nil {
-		t.Fatal("expected not-found error; got nil")
-	}
-	if !errors.Is(err, manifest.ErrMissingSecret) {
-		t.Errorf("expected error wrapped with manifest.ErrMissingSecret so --allow-missing-secrets soft-skips; got %v", err)
-	}
-	if !strings.Contains(err.Error(), "px") {
-		t.Errorf("error should name the secret; got %v", err)
-	}
-}
-
-func TestResolveProxy_MissingAddress(t *testing.T) {
-	getter := func(_, _ string) *manifest.Secret {
-		return &manifest.Secret{StringData: map[string]any{"username": "alice"}}
-	}
-	_, err := ResolveProxy(getter, "ns", "Bucket", "ns/b",
-		&manifest.LocalObjectReference{Name: "px"})
-	if err == nil || !strings.Contains(err.Error(), "missing required 'address' key") {
-		t.Errorf("expected missing-address error; got %v", err)
-	}
-}
-
-func TestResolveProxy_FullSecret(t *testing.T) {
-	getter := func(_, _ string) *manifest.Secret {
-		return &manifest.Secret{StringData: map[string]any{
-			"address":  "http://proxy.example.com:8080",
-			"username": "alice",
-			"password": "hunter2",
-		}}
-	}
-	p, err := ResolveProxy(getter, "ns", "GitRepository", "ns/r",
-		&manifest.LocalObjectReference{Name: "px"})
-	if err != nil {
-		t.Fatalf("ResolveProxy: %v", err)
-	}
-	if p.Address != "http://proxy.example.com:8080" {
-		t.Errorf("Address = %q", p.Address)
-	}
-	if p.Username != "alice" || p.Password != "hunter2" { //nolint:gosec // test fixture
-		t.Errorf("creds = %q/%q", p.Username, p.Password)
-	}
-}
-
-func TestProxyConfig_URL_BasicAuth(t *testing.T) {
-	p := &ProxyConfig{
-		Address:  "http://proxy.example.com:8080",
-		Username: "alice",
-		Password: "hunter2", //nolint:gosec // test fixture
-	}
-	u, err := p.URL()
-	if err != nil {
-		t.Fatalf("URL: %v", err)
-	}
-	if u.User == nil {
-		t.Fatalf("expected userinfo in URL")
-	}
-	if u.User.Username() != "alice" {
-		t.Errorf("Username = %q", u.User.Username())
-	}
-	if pw, _ := u.User.Password(); pw != "hunter2" {
-		t.Errorf("Password = %q", pw)
-	}
-	if u.Host != "proxy.example.com:8080" {
-		t.Errorf("Host = %q", u.Host)
-	}
-}
-
-func TestProxyConfig_URL_InvalidAddress(t *testing.T) {
-	p := &ProxyConfig{Address: "://broken"}
-	_, err := p.URL()
-	if err == nil {
-		t.Errorf("expected parse error")
+func TestResolveProxy(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, kind, owner, wantError string
+		secret                       *manifest.Secret
+		unwired                      bool
+	}{
+		{name: "unwired Git", kind: manifest.KindGitRepository, owner: "ns/r", unwired: true,
+			wantError: "GitRepository ns/r references proxySecretRef but no source.SecretGetter is wired"},
+		{name: "unwired Helm", kind: manifest.KindHelmRepository, owner: "HelmRepository ns/r", unwired: true,
+			wantError: "HelmRepository HelmRepository ns/r references proxySecretRef but no source.SecretGetter is wired"},
+		{name: "absent", kind: manifest.KindOCIRepository, owner: "ns/r",
+			wantError: "flux error: missing secret: OCIRepository ns/ns/r: secret ns/px not found"},
+		{name: "missing address", kind: manifest.KindBucket, owner: "ns/b",
+			secret:    &manifest.Secret{StringData: map[string]any{"username": "alice"}},
+			wantError: "flux error: input error: proxy secret ns/px missing required 'address' key"},
+		{name: "malformed address wiped password", kind: manifest.KindGitRepository, owner: "ns/r",
+			secret:    &manifest.Secret{StringData: map[string]any{"address": "http://proxy-credential-marker@proxy.invalid/%", "password": "..PLACEHOLDER_password.."}},
+			wantError: "flux error: input error: GitRepository ns/r: proxySecretRef ns/px: invalid proxy address"},
+		{name: "full secret", kind: manifest.KindGitRepository, owner: "ns/r",
+			secret: &manifest.Secret{StringData: map[string]any{"address": "http://proxy.example.com:8080", "username": "alice", "password": "hunter2"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var lookup [2]string
+			calls := 0
+			var getter SecretGetter
+			if !tc.unwired {
+				getter = func(ns, name string) *manifest.Secret {
+					lookup = [2]string{ns, name}
+					calls++
+					return tc.secret
+				}
+			}
+			owner := manifest.NamedResource{Group: manifest.SourceDomain, Kind: tc.kind, Namespace: "ns", Name: tc.owner}
+			material, err := ResolveTransport(getter, owner, []TransportInput{{Reference: &manifest.LocalObjectReference{Name: "px"}, Use: TransportProxy}})
+			if !tc.unwired {
+				assert.Equal(t, lookup, [2]string{"ns", "px"})
+				assert.Equal(t, calls, 1)
+			}
+			if tc.wantError != "" {
+				if err == nil || err.Error() != tc.wantError {
+					t.Fatalf("ResolveProxy: %v, want %q", err, tc.wantError)
+				}
+				if !tc.unwired && tc.secret == nil {
+					missing, ok := errors.AsType[*MissingSecretError](err)
+					if !ok || !errors.Is(err, manifest.ErrMissingSecret) {
+						t.Fatalf("expected missing-secret error: %v", err)
+					}
+					assert.Equal(t, missing.Owner, owner)
+					assert.Equal(t, missing.Secret, manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "ns", Name: "px"})
+				}
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, material.ProxyComponents(), [3]string{"http://proxy.example.com:8080", "alice", "hunter2"})
+			selected, err := material.ProxyURL(&url.URL{Scheme: "http", Host: "target.invalid"})
+			assert.NoError(t, err)
+			assert.Equal(t, selected.User.String(), "alice:hunter2")
+		})
 	}
 }

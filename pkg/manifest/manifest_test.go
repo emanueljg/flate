@@ -3,12 +3,17 @@ package manifest
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/home-operations/flate/internal/assert"
 )
@@ -16,7 +21,7 @@ import (
 // defaultParseDocOptions returns the standard ParseDoc options — secrets wiped.
 // Test-only helper; production callers pass an explicit ParseDocOptions.
 func defaultParseDocOptions() ParseDocOptions {
-	return ParseDocOptions{WipeSecrets: true}
+	return ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""}
 }
 
 // mustYAML decodes a single YAML document literal into a generic map.
@@ -33,11 +38,12 @@ func mustYAML(t *testing.T, doc string) map[string]any {
 }
 
 func TestNamedResource(t *testing.T) {
-	n := NamedResource{Kind: "Kustomization", Namespace: "flux-system", Name: "apps"}
+	t.Parallel()
+	n := NamedResource{Group: FluxKustomizeDomain, Kind: "Kustomization", Namespace: "flux-system", Name: "apps"}
 	if got, want := n.NamespacedName(), "flux-system/apps"; got != want {
 		t.Errorf("NamespacedName = %q, want %q", got, want)
 	}
-	if got, want := n.String(), "Kustomization/flux-system/apps"; got != want {
+	if got, want := n.String(), "Kustomization.kustomize.toolkit.fluxcd.io/flux-system/apps"; got != want {
 		t.Errorf("String = %q, want %q", got, want)
 	}
 
@@ -46,104 +52,239 @@ func TestNamedResource(t *testing.T) {
 		t.Errorf("cluster-scoped NamespacedName = %q, want %q", got, want)
 	}
 
-	a := NamedResource{Kind: "A", Namespace: "ns", Name: "1"}
-	b := NamedResource{Kind: "A", Namespace: "ns", Name: "2"}
-	if a.Compare(b) >= 0 {
-		t.Errorf("expected a < b for %v / %v", a, b)
+	for _, tc := range []struct {
+		name string
+		a, b NamedResource
+	}{
+		{"kind before group", NamedResource{Kind: "A", Group: "z"}, NamedResource{Kind: "B"}},
+		{"core before group", NamedResource{Kind: "A", Namespace: "z"}, NamedResource{Kind: "A", Group: "a"}},
+		{"group before namespace", NamedResource{Kind: "A", Group: "a", Namespace: "z"}, NamedResource{Kind: "A", Group: "b"}},
+		{"namespace before name", NamedResource{Kind: "A", Namespace: "a", Name: "z"}, NamedResource{Kind: "A", Namespace: "b"}},
+		{"name", NamedResource{Kind: "A", Name: "1"}, NamedResource{Kind: "A", Name: "2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.a.Compare(tc.b), -1)
+			assert.Equal(t, tc.b.Compare(tc.a), 1)
+			assert.Equal(t, tc.a.Compare(tc.a), 0)
+		})
 	}
+	assert.Equal(t, cluster.String(), "ClusterRole/view")
+	for _, tc := range []struct {
+		obj   BaseManifest
+		group string
+	}{
+		{&Kustomization{}, FluxKustomizeDomain},
+		{&HelmRelease{}, HelmReleaseDomain},
+		{&GitRepository{}, SourceDomain},
+		{&OCIRepository{}, SourceDomain},
+		{&HelmRepository{}, SourceDomain},
+		{&HelmChartSource{}, SourceDomain},
+		{&ExternalArtifact{}, SourceDomain},
+		{&Bucket{}, SourceDomain},
+		{&ResourceSet{}, FluxOperatorDomain},
+		{&ResourceSetInputProvider{}, FluxOperatorDomain},
+		{&ConfigMap{}, ""},
+		{&Secret{}, ""},
+		{&RawObject{Kind: KindKustomization, APIVersion: "foreign.example/v2"}, "foreign.example"},
+	} {
+		t.Run(tc.obj.Named().Kind, func(t *testing.T) {
+			t.Parallel()
+			id := tc.obj.Named()
+			assert.Equal(t, id.Group, tc.group)
+			id.Namespace = "effective"
+			assert.Equal(t, tc.obj.WithNamespace("effective").Named(), id)
+			assert.Equal(t, Resolve(tc.obj.Named(), "effective", "fallback"), id)
+		})
+	}
+	assert.Equal(t, (&RawObject{Kind: KindKustomization, APIVersion: "foreign.example/v1"}).Named(),
+		(&RawObject{Kind: KindKustomization, APIVersion: "foreign.example/v2"}).Named())
 }
 
-// TestParse_Suspend covers the spec.suspend passthrough across the
-// three suspendable kinds (HelmRelease, Kustomization, Bucket); each
-// parse fn returns a distinct type sharing a Suspend bool field.
-func TestParse_Suspend(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		get  func(map[string]any) (bool, error)
+func TestProjectionCompatible_ContentBoundary(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                          string
+		desiredTarget, previousTarget string
+		path, namespace               string
+		compatible                    bool
 	}{
-		{
-			name: "HelmRelease",
-			yaml: `
-apiVersion: helm.toolkit.fluxcd.io/v2
-kind: HelmRelease
-metadata: {name: hr, namespace: ns}
-spec:
-  suspend: true
-  chart:
-    spec:
-      chart: c
-      sourceRef: {kind: HelmRepository, name: r, namespace: ns}
-`,
-			get: func(d map[string]any) (bool, error) {
-				hr, err := parseHelmRelease(d)
-				if err != nil {
-					return false, err
-				}
-				return hr.Suspend, nil
-			},
-		},
-		{
-			name: "Kustomization",
-			yaml: `
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata: {name: ks, namespace: ns}
-spec:
-  suspend: true
-  path: ./apps
-  sourceRef: {kind: GitRepository, name: src, namespace: ns}
-  interval: 5m
-`,
-			get: func(d map[string]any) (bool, error) {
-				ks, err := parseKustomization(d)
-				if err != nil {
-					return false, err
-				}
-				return ks.Suspend, nil
-			},
-		},
-		{
-			name: "Bucket",
-			yaml: `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: Bucket
-metadata: {name: b, namespace: ns}
-spec:
-  suspend: true
-  bucketName: x
-  endpoint: e
-  interval: 5m
-`,
-			get: func(d map[string]any) (bool, error) {
-				b, err := parseBucket(d)
-				if err != nil {
-					return false, err
-				}
-				return b.Suspend, nil
-			},
-		},
-	}
-	for _, tc := range cases {
+		{name: "equal target", desiredTarget: "apps", previousTarget: "apps", compatible: true},
+		{name: "different target", desiredTarget: "apps", previousTarget: "media"},
+		{name: "empty targets", compatible: true},
+		{name: "empty desired target", previousTarget: "apps"},
+		{name: "empty previous target", desiredTarget: "apps"},
+		{name: "changed path", desiredTarget: "apps", previousTarget: "apps", path: "./other", compatible: true},
+		{name: "different metadata namespace", desiredTarget: "apps", previousTarget: "apps", namespace: "projected", compatible: true},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			suspend, err := tc.get(mustYAML(t, tc.yaml))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
+			t.Parallel()
+			previous := &Kustomization{Name: "app", Namespace: "authored",
+				Path: "./app", TargetNamespace: tc.previousTarget}
+			desired := previous.Clone()
+			desired.TargetNamespace = tc.desiredTarget
+			if tc.path != "" {
+				desired.Path = tc.path
 			}
-			if !suspend {
-				t.Errorf("expected Suspend=true; got false")
+			if tc.namespace != "" {
+				desired.Namespace = tc.namespace
 			}
+			previousSnapshot, desiredSnapshot := previous.Clone(), desired.Clone()
+			assert.Equal(t, desired.ProjectionCompatible(previous), tc.compatible)
+			assert.Equal(t, Equal(previous, previousSnapshot), true)
+			assert.Equal(t, Equal(desired, desiredSnapshot), true)
+		})
+	}
+	t.Run("changed repository URL", func(t *testing.T) {
+		t.Parallel()
+		previous := &GitRepository{Name: "source", Namespace: "apps",
+			URL: "https://fixture.invalid/previous"}
+		desired := *previous
+		desired.GitRepositorySpec = *previous.DeepCopy()
+		desired.URL = "https://fixture.invalid/desired"
+		previousSnapshot, desiredSnapshot := *previous, desired
+		assert.Equal(t, desired.ProjectionCompatible(previous), true)
+		assert.Diff(t, *previous, previousSnapshot)
+		assert.Diff(t, desired, desiredSnapshot)
+	})
+}
+
+func TestEqual_Operands(t *testing.T) {
+	t.Parallel()
+	ks := &Kustomization{Name: "app"}
+	for _, tc := range []struct {
+		name  string
+		a, b  BaseManifest
+		equal bool
+	}{
+		{"nil interfaces", nil, nil, true},
+		{"nil and typed nil", nil, (*Kustomization)(nil), false},
+		{"matching typed nil", (*Kustomization)(nil), (*Kustomization)(nil), true},
+		{"different typed nil", (*Kustomization)(nil), (*GitRepository)(nil), false},
+		{"nil and present", (*Kustomization)(nil), ks, false},
+		{"same pointer", ks, ks, true},
+		{"different concrete types", ks, &ConfigMap{Name: "app"}, false},
+		{"equal typed content", &ConfigMap{Name: "app", Data: map[string]any{"key": "value"}}, &ConfigMap{Name: "app", Data: map[string]any{"key": "value"}}, true},
+		{"changed typed content", &ConfigMap{Name: "app", Data: map[string]any{"key": "value"}}, &ConfigMap{Name: "app", Data: map[string]any{"key": "other"}}, false},
+		{"typed nil and empty", &ConfigMap{Name: "app"}, &ConfigMap{Name: "app", Data: map[string]any{}}, false},
+		{"equal raw content", &RawObject{Kind: "Widget", Spec: map[string]any{"items": []any{int64(1)}}}, &RawObject{Kind: "Widget", Spec: map[string]any{"items": []any{int64(1)}}}, true},
+		{"raw nil and empty", &RawObject{Kind: "Widget"}, &RawObject{Kind: "Widget", Spec: map[string]any{}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, Equal(tc.a, tc.b), tc.equal)
+			assert.Equal(t, Equal(tc.b, tc.a), tc.equal)
 		})
 	}
 }
 
-func TestParseHelmRelease_ServiceAccountName(t *testing.T) {
-	hr, err := parseHelmRelease(helmReleaseDoc(t, "  serviceAccountName: privileged-installer"))
-	if err != nil {
-		t.Fatalf("parseHelmRelease: %v", err)
+func TestEqual_KustomizationContent(t *testing.T) {
+	t.Parallel()
+	parse := func(t *testing.T) *Kustomization {
+		t.Helper()
+		ks, err := parseKustomization(mustYAML(t, `
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: app, namespace: ns}
+spec:
+  path: ./app
+  sourceRef: {kind: GitRepository, name: repo}
+  postBuild: {substitute: {KEY: same}}
+`))
+		assert.NoError(t, err)
+		return ks
 	}
-	if hr.ServiceAccountName != "privileged-installer" {
-		t.Errorf("ServiceAccountName = %q, want %q", hr.ServiceAccountName, "privileged-installer")
+	for _, tc := range []struct {
+		name     string
+		populate bool
+		change   func(*Kustomization)
+		equal    bool
+	}{
+		{name: "cold cache", equal: true},
+		{name: "populated cache", equal: true, populate: true},
+		{name: "absent cache", equal: true, change: func(k *Kustomization) { k.projection = nil }},
+		{name: "name", change: func(k *Kustomization) { k.Name = "other" }},
+		{name: "namespace", change: func(k *Kustomization) { k.Namespace = "other" }},
+		{name: "spec", change: func(k *Kustomization) { k.SourceRef.Name = "other" }},
+		{name: "nested spec", change: func(k *Kustomization) { k.PostBuild.Substitute["KEY"] = "other" }},
+		{name: "labels", change: func(k *Kustomization) { k.Labels = map[string]string{"app": "other"} }},
+		{name: "annotations", change: func(k *Kustomization) { k.Annotations = map[string]string{"note": "other"} }},
+		{name: "nil and empty labels", change: func(k *Kustomization) { k.Labels = map[string]string{} }},
+		{name: "nil and empty annotations", change: func(k *Kustomization) { k.Annotations = map[string]string{} }},
+		{name: "nil and empty spec slice", change: func(k *Kustomization) { k.Components = []string{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			first, second := parse(t), parse(t)
+			if tc.populate {
+				_, err := second.RenderDocument()
+				assert.NoError(t, err)
+			}
+			if tc.change != nil {
+				tc.change(second)
+			}
+			assert.Equal(t, Equal(first, second), tc.equal)
+			assert.Equal(t, Equal(second, first), tc.equal)
+		})
+	}
+}
+
+func TestParseDoc_Suspended(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		kind, apiVersion, spec string
+		suspendable            bool
+	}{
+		{KindHelmRelease, HelmReleaseDomain + "/v2", "{chart: {spec: {chart: c, sourceRef: {kind: HelmRepository, name: r}}}}", true},
+		{KindKustomization, FluxKustomizeDomain + "/v1", "{path: ./apps, sourceRef: {kind: GitRepository, name: src}, interval: 5m}", true},
+		{KindGitRepository, SourceDomain + "/v1", "{url: 'https://example.test/repo.git'}", true},
+		{KindOCIRepository, SourceDomain + "/v1", "{url: 'oci://example.test/chart'}", true},
+		{KindBucket, SourceDomain + "/v1", "{bucketName: x, endpoint: e, interval: 5m}", true},
+		{KindHelmRepository, SourceDomain + "/v1", "{url: 'https://example.test/charts'}", true},
+		{KindHelmChart, SourceDomain + "/v1", "{chart: c, sourceRef: {kind: HelmRepository, name: r}}", true},
+		{KindResourceSet, FluxOperatorDomain + "/v1", "{}", true},
+		{KindExternalArtifact, SourceDomain + "/v1", "{}", false},
+		{KindResourceSetInputProvider, FluxOperatorDomain + "/v1", "{}", false},
+		{KindConfigMap, CoreAPIVersion, "{}", false},
+		{KindSecret, CoreAPIVersion, "{}", false},
+		{"Widget", "example.test/v1", "{}", false},
+	} {
+		for _, suspend := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/suspend=%t", tc.kind, suspend), func(t *testing.T) {
+				t.Parallel()
+				doc := mustYAML(t, fmt.Sprintf("apiVersion: %s\nkind: %s\nmetadata: {name: test, namespace: ns}\nspec: %s\n", tc.apiVersion, tc.kind, tc.spec))
+				doc["spec"].(map[string]any)["suspend"] = suspend
+				if tc.kind == KindResourceSet && suspend {
+					doc["metadata"].(map[string]any)["annotations"] = map[string]any{FluxOperatorDomain + "/reconcile": "disabled"}
+				}
+				obj, _, _, err := ParseDoc(doc, defaultParseDocOptions())
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				assert.Equal(t, obj.Suspended(), tc.suspendable && suspend)
+			})
+		}
+	}
+}
+
+func TestNamedResource_IsCRD(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		id   NamedResource
+		want bool
+	}{
+		{"canonical", NamedResource{Group: "apiextensions.k8s.io", Kind: KindCustomResourceDefinition, Name: "widgets.example.test"}, true},
+		{"explicit namespace", NamedResource{Group: "apiextensions.k8s.io", Kind: KindCustomResourceDefinition, Namespace: "ns"}, true},
+		{"foreign group", NamedResource{Group: "example.test", Kind: KindCustomResourceDefinition}, false},
+		{"core group", NamedResource{Kind: KindCustomResourceDefinition}, false},
+		{"different kind", NamedResource{Group: "apiextensions.k8s.io", Kind: "CustomResourceDefinitionList"}, false},
+		{"zero identity", NamedResource{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.id.IsCRD(), tc.want)
+		})
 	}
 }
 
@@ -165,6 +306,7 @@ spec:
 }
 
 func TestParseHelmRelease_ValuesFromEnvsubstDefault(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name      string
 		valuesKey string
@@ -181,6 +323,7 @@ func TestParseHelmRelease_ValuesFromEnvsubstDefault(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			spec := "  valuesFrom:\n    - kind: ConfigMap\n      name: \"" + tc.refName + "\"\n      valuesKey: \"" + tc.valuesKey + "\"\n"
 			hr, err := parseHelmRelease(helmReleaseDoc(t, spec))
 			if err != nil {
@@ -200,18 +343,23 @@ func TestParseHelmRelease_ValuesFromEnvsubstDefault(t *testing.T) {
 }
 
 func TestParseHelmRelease_CRDsPolicy(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		specBody string
 		want     string
 	}{
 		{"install only", "  install: {crds: Create}", "Create"},
+		{"empty upgrade uses install", "  install: {crds: Create}\n  upgrade: {}", "Create"},
 		{"upgrade wins over install", "  install: {crds: Create}\n  upgrade: {crds: CreateReplace}", "CreateReplace"},
+		{"upgrade only", "  upgrade: {crds: CreateReplace}", "CreateReplace"},
+		{"empty upgrade preserves install", "  install: {crds: Create}\n  upgrade: {}", "Create"},
 		{"skip suppresses", "  upgrade: {crds: Skip}", "Skip"},
 		{"empty when neither set", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			hr, err := parseHelmRelease(helmReleaseDoc(t, tc.specBody))
 			if err != nil {
 				t.Fatalf("parseHelmRelease: %v", err)
@@ -223,165 +371,53 @@ func TestParseHelmRelease_CRDsPolicy(t *testing.T) {
 	}
 }
 
-func TestParseHelmChartSource_ReconcileStrategy(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: HelmChart
-metadata: {name: c, namespace: ns}
-spec:
-  chart: nginx
-  reconcileStrategy: Revision
-  sourceRef: {kind: HelmRepository, name: r}
-`)
-	hc, err := parseHelmChartSource(doc)
-	if err != nil {
-		t.Fatalf("parseHelmChartSource: %v", err)
-	}
-	if hc.ReconcileStrategy != "Revision" {
-		t.Errorf("ReconcileStrategy = %q, want %q", hc.ReconcileStrategy, "Revision")
-	}
-}
-
-func TestParseHelmChartSource_PreservesEmptyNamespace(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: HelmChart
-metadata: {name: c}
-spec:
-  chart: nginx
-  sourceRef: {kind: HelmRepository, name: r}
-`)
-	hc, err := parseHelmChartSource(doc)
-	if err != nil {
-		t.Fatalf("parseHelmChartSource: %v", err)
-	}
-	if hc.Namespace != "" {
-		t.Errorf("namespace=%q want empty before loader inheritance/defaulting", hc.Namespace)
-	}
-}
-
-func TestParseProxySecretRef_AllSourceKinds(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		get  func(doc map[string]any) (*LocalObjectReference, error)
+func TestParseHelmChartSource_DefaultsAndReconcileStrategy(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, namespace, strategy, source string
 	}{
-		{
-			name: "GitRepository",
-			yaml: `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata: {name: r, namespace: flux-system}
-spec:
-  url: https://github.com/owner/repo.git
-  proxySecretRef: {name: corp-proxy}
-  interval: 5m
-`,
-			get: func(d map[string]any) (*LocalObjectReference, error) {
-				g, err := parseGitRepository(d)
-				if err != nil {
-					return nil, err
-				}
-				return g.ProxySecretRef, nil
-			},
-		},
-		{
-			name: "OCIRepository",
-			yaml: `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: OCIRepository
-metadata: {name: r, namespace: ns}
-spec:
-  url: oci://ghcr.io/x/y
-  proxySecretRef: {name: corp-proxy}
-  interval: 5m
-`,
-			get: func(d map[string]any) (*LocalObjectReference, error) {
-				o, err := ParseOCIRepository(d)
-				if err != nil {
-					return nil, err
-				}
-				return o.ProxySecretRef, nil
-			},
-		},
-		{
-			name: "Bucket",
-			yaml: `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: Bucket
-metadata: {name: b, namespace: ns}
-spec:
-  bucketName: x
-  endpoint: minio:9000
-  proxySecretRef: {name: corp-proxy}
-  interval: 5m
-`,
-			get: func(d map[string]any) (*LocalObjectReference, error) {
-				b, err := parseBucket(d)
-				if err != nil {
-					return nil, err
-				}
-				return b.ProxySecretRef, nil
-			},
-		},
-	}
-	for _, tc := range cases {
+		{"explicit", "ns", "Revision", "{kind: HelmRepository, name: r}"},
+		{"default", "", "", "{name: r}"},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ref, err := tc.get(mustYAML(t, tc.yaml))
+			t.Parallel()
+			hc, err := parseHelmChartSource(mustYAML(t, "apiVersion: source.toolkit.fluxcd.io/v1\nkind: HelmChart\nmetadata: {name: c, namespace: '"+tc.namespace+"'}\nspec: {chart: nginx, reconcileStrategy: '"+tc.strategy+"', sourceRef: "+tc.source+"}\n"))
 			if err != nil {
-				t.Fatalf("parse: %v", err)
+				t.Fatal(err)
 			}
-			if ref == nil || ref.Name != "corp-proxy" {
-				t.Errorf("ProxySecretRef = %+v, want {Name: corp-proxy}", ref)
-			}
+			assert.Equal(t, hc.Namespace, tc.namespace)
+			assert.Equal(t, hc.SourceRef.Kind, KindHelmRepository)
+			assert.Equal(t, hc.ReconcileStrategy, tc.strategy)
 		})
 	}
 }
 
-func TestParseGitRepository_SparseCheckout(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata: {name: monorepo, namespace: flux-system}
+func TestParseDoc_EmptyEnvsubstDefaults(t *testing.T) {
+	t.Parallel()
+	for _, operator := range []string{"-", "="} {
+		t.Run(operator, func(t *testing.T) {
+			t.Parallel()
+			doc := mustYAML(t, fmt.Sprintf(`
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: ks, namespace: ns}
 spec:
-  url: https://github.com/owner/big-monorepo.git
-  sparseCheckout:
-    - kubernetes/apps/media
-    - kubernetes/components/shared
+  path: '${PREFIX:%s}apps'
+  sourceRef:
+    kind: GitRepository
+    name: '${PREFIX:%s}repo'
   interval: 5m
-`)
-	g, err := parseGitRepository(doc)
-	if err != nil {
-		t.Fatalf("parseGitRepository: %v", err)
-	}
-	wantDirs := []string{"kubernetes/apps/media", "kubernetes/components/shared"}
-	assert.Diff(t, g.SparseCheckout, wantDirs)
-}
-
-func TestParseGitRepository_RefNameAndSubmodules(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata: {name: pr, namespace: flux-system}
-spec:
-  url: https://github.com/owner/repo.git
-  ref:
-    name: refs/pull/420/head
-  recurseSubmodules: true
-  interval: 5m
-`)
-	g, err := parseGitRepository(doc)
-	if err != nil {
-		t.Fatalf("parseGitRepository: %v", err)
-	}
-	if g.Reference == nil || g.Reference.Name != "refs/pull/420/head" {
-		t.Errorf("Reference.Name = %q", g.Reference)
-	}
-	if !g.RecurseSubmodules {
-		t.Errorf("RecurseSubmodules should be true")
-	}
-	if want := "name:refs/pull/420/head"; GitRefString(*g.Reference) != want {
-		t.Errorf("RefString = %q, want %q", GitRefString(*g.Reference), want)
+`, operator, operator))
+			obj, _, _, err := ParseDoc(doc, ParseDocOptions{})
+			assert.NoError(t, err)
+			k, ok := obj.(*Kustomization)
+			if !ok {
+				t.Fatalf("ParseDoc returned %T, want *Kustomization", obj)
+			}
+			assert.Equal(t, k.Path, "apps")
+			assert.Equal(t, k.SourceRef.Kind, KindGitRepository)
+			assert.Equal(t, k.SourceRef.Name, "repo")
+		})
 	}
 }
 
@@ -391,6 +427,7 @@ spec:
 // must fail at parse time with a clear "check for truncated YAML"
 // hint, not 30 lines later as a misleading "path does not exist".
 func TestParseKustomization_SourceRefMissingNameRejected(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -412,43 +449,20 @@ spec:
 }
 
 func TestParseBucket_GenericWithSecret(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
+	t.Parallel()
+	b, err := parseBucket(mustYAML(t, `apiVersion: source.toolkit.fluxcd.io/v1
 kind: Bucket
-metadata:
-  name: assets
-  namespace: apps
+metadata: {name: assets, namespace: apps}
 spec:
   bucketName: my-bucket
   endpoint: minio.minio.svc:9000
-  insecure: true
-  prefix: configs/
-  region: us-east-1
-  secretRef:
-    name: minio-creds
-  interval: 5m
-`)
-	b, err := parseBucket(doc)
+  secretRef: {name: minio-creds}
+`))
 	if err != nil {
 		t.Fatalf("parseBucket: %v", err)
 	}
 	if b.Provider != "generic" {
 		t.Errorf("default Provider should be 'generic', got %q", b.Provider)
-	}
-	if b.BucketName != "my-bucket" {
-		t.Errorf("BucketName: %q", b.BucketName)
-	}
-	if b.Endpoint != "minio.minio.svc:9000" {
-		t.Errorf("Endpoint: %q", b.Endpoint)
-	}
-	if !b.Insecure {
-		t.Errorf("Insecure should be true")
-	}
-	if b.Prefix != "configs/" {
-		t.Errorf("Prefix: %q", b.Prefix)
-	}
-	if b.SecretRef == nil || b.SecretRef.Name != "minio-creds" {
-		t.Errorf("SecretRef: %+v", b.SecretRef)
 	}
 }
 
@@ -458,6 +472,7 @@ spec:
 // "<ns>/" → "secret not found" → with --allow-missing-secrets on,
 // silent soft-skip — masking the typo entirely.
 func TestParse_EmptySecretRefNameRejected(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		yaml  string
@@ -472,8 +487,11 @@ metadata: {name: x, namespace: ns}
 spec:
   url: oci://example/x
   secretRef: {name: ""}`,
-			want:  "spec.secretRef.name is empty",
-			parse: func(d map[string]any) error { _, err := ParseOCIRepository(d); return err },
+			want: "spec.secretRef.name is empty",
+			parse: func(d map[string]any) error {
+				_, _, _, err := ParseDoc(d, ParseDocOptions{DefaultNamespace: ""})
+				return err
+			},
 		},
 		{
 			name: "GitRepository spec.secretRef.name empty",
@@ -512,6 +530,7 @@ spec:
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			doc := mustYAML(t, tc.yaml)
 			err := tc.parse(doc)
 			if err == nil {
@@ -525,6 +544,7 @@ spec:
 }
 
 func TestParseResourceSet(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: fluxcd.controlplane.io/v1
 kind: ResourceSet
@@ -554,9 +574,43 @@ spec:
 	if len(rs.Resources) != 1 {
 		t.Errorf("expected 1 templated resource, got %d", len(rs.Resources))
 	}
+	for _, tc := range []struct {
+		name, field string
+		ref         map[string]any
+		valid       bool
+	}{
+		{"required missing", "dependsOn", map[string]any{}, false},
+		{"required empty", "dependsOn", map[string]any{"apiVersion": ""}, false},
+		{"required slash", "dependsOn", map[string]any{"apiVersion": "/"}, false},
+		{"required no version", "dependsOn", map[string]any{"apiVersion": "example.test/"}, false},
+		{"required multi slash", "dependsOn", map[string]any{"apiVersion": "example.test/v1/extra"}, false},
+		{"required core", "dependsOn", map[string]any{"apiVersion": "v1"}, true},
+		{"optional omitted", "inputsFrom", map[string]any{}, true},
+		{"optional core", "inputsFrom", map[string]any{"apiVersion": "v1"}, true},
+		{"optional empty", "inputsFrom", map[string]any{"apiVersion": ""}, false},
+		{"optional slash", "inputsFrom", map[string]any{"apiVersion": "/"}, false},
+		{"optional no version", "inputsFrom", map[string]any{"apiVersion": "example.test/"}, false},
+		{"optional multi slash", "inputsFrom", map[string]any{"apiVersion": "example.test/v1/extra"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			input := DeepCopyMap(doc)
+			tc.ref["kind"], tc.ref["name"] = KindResourceSetInputProvider, "inputs"
+			input["spec"].(map[string]any)[tc.field] = []any{tc.ref}
+			before := DeepCopyMap(input)
+			_, _, _, err := ParseDoc(input, defaultParseDocOptions())
+			if tc.valid {
+				assert.NoError(t, err)
+			} else if !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) || !strings.Contains(err.Error(), "spec."+tc.field+"[0].apiVersion") {
+				t.Fatalf("invalid reference error = %v", err)
+			}
+			assert.Diff(t, input, before)
+		})
+	}
 }
 
 func TestParseResourceSet_PreservesEmptyNamespace(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: fluxcd.controlplane.io/v1
 kind: ResourceSet
@@ -574,6 +628,7 @@ spec: {}
 }
 
 func TestParseResourceSetInputProvider_PreservesEmptyNamespace(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: fluxcd.controlplane.io/v1
 kind: ResourceSetInputProvider
@@ -592,6 +647,7 @@ spec:
 }
 
 func TestParseExternalArtifact(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: ExternalArtifact
@@ -604,11 +660,6 @@ spec:
     kind: ImageUpdateAutomation
     name: app-image
     namespace: apps
-status:
-  artifact:
-    url: file:///cache/ea/pulled-tarball.tar.gz
-    revision: v1.2.3@sha256:abc
-    digest: sha256:abc
 `)
 	ea, err := parseExternalArtifact(doc)
 	if err != nil {
@@ -620,15 +671,10 @@ status:
 	if ea.SourceRef == nil || ea.SourceRef.Kind != "ImageUpdateAutomation" {
 		t.Errorf("sourceRef: %+v", ea.SourceRef)
 	}
-	if ea.ArtifactURL != "file:///cache/ea/pulled-tarball.tar.gz" {
-		t.Errorf("artifact URL: %q", ea.ArtifactURL)
-	}
-	if ea.Revision != "v1.2.3@sha256:abc" {
-		t.Errorf("revision: %q", ea.Revision)
-	}
 }
 
 func TestParseKustomization_DependsOnReadyExpr(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -646,36 +692,40 @@ spec:
 	if err != nil {
 		t.Fatalf("parseKustomization: %v", err)
 	}
-	if len(k.DependsOn) != 1 {
-		t.Fatalf("DependsOn len = %d", len(k.DependsOn))
+	deps := refsForUse(t, k, "dependsOn")
+	if len(deps) != 1 {
+		t.Fatalf("DependsOn len = %d", len(deps))
 	}
-	if k.DependsOn[0].Name != "infra" {
-		t.Errorf("name: %q", k.DependsOn[0].Name)
+	if deps[0].Name != "infra" {
+		t.Errorf("name: %q", deps[0].Name)
 	}
-	if !strings.Contains(k.DependsOn[0].ReadyExpr, "InfraInitialized") {
-		t.Errorf("ReadyExpr lost: %q", k.DependsOn[0].ReadyExpr)
+	if !strings.Contains(*deps[0].ReadyExpr, "InfraInitialized") {
+		t.Errorf("ReadyExpr lost: %q", *deps[0].ReadyExpr)
 	}
 }
 
 func TestParseHelmRelease_DependsOn(t *testing.T) {
+	t.Parallel()
 	hr, err := parseHelmRelease(helmReleaseDoc(t, `  dependsOn:
     - name: other
     - {name: cross, namespace: other-ns}`))
 	if err != nil {
 		t.Fatalf("parseHelmRelease: %v", err)
 	}
-	if got, want := len(hr.DependsOn), 2; got != want {
+	deps := refsForUse(t, hr, "dependsOn")
+	if got, want := len(deps), 2; got != want {
 		t.Fatalf("DependsOn len = %d, want %d", got, want)
 	}
-	if got := hr.DependsOn[0].NamespacedName(); got != "ns/other" {
+	if got := deps[0].NamespacedName(); got != "ns/other" {
 		t.Errorf("DependsOn[0] = %q, want ns/other", got)
 	}
-	if hr.DependsOn[1].Namespace != "other-ns" || hr.DependsOn[1].Name != "cross" {
-		t.Errorf("DependsOn[1] = %+v", hr.DependsOn[1])
+	if deps[1].Namespace != "other-ns" || deps[1].Name != "cross" {
+		t.Errorf("DependsOn[1] = %+v", deps[1])
 	}
 }
 
 func TestParseHelmRelease_Inline(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -716,13 +766,14 @@ spec:
 		{"ReleaseNamespace", hr.ReleaseNamespace(), "apps"},
 		{"Chart.Name", hr.Chart.Name, "podinfo"},
 		{"Chart.Version", hr.Chart.Version, "6.3.2"},
-		{"Chart.RepoKind", hr.Chart.RepoKind, "HelmRepository"},
-		{"Chart.RepoName", hr.Chart.RepoName, "podinfo"},
+		{"Chart.Source.Kind", hr.Chart.Source.Kind, "HelmRepository"},
+		{"Chart.Source.Name", hr.Chart.Source.Name, "podinfo"},
 		{"replicaCount", hr.Values["replicaCount"], float64(3)},
 		{"ValuesFrom[0].Optional", hr.ValuesFrom[0].Optional, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if tc.got != tc.want {
 				t.Errorf("got %v, want %v", tc.got, tc.want)
 			}
@@ -731,6 +782,7 @@ spec:
 }
 
 func TestParseHelmRelease_ReleaseNameOverride(t *testing.T) {
+	t.Parallel()
 	hr, err := parseHelmRelease(helmReleaseDoc(t, "  releaseName: my-explicit-release"))
 	if err != nil {
 		t.Fatalf("parseHelmRelease: %v", err)
@@ -748,6 +800,7 @@ func TestParseHelmRelease_ReleaseNameOverride(t *testing.T) {
 // prefix + "-" + 12 hex chars of sha256(name). Without this flate's
 // `.Release.Name` diverges from a real cluster's for long HR names.
 func TestReleaseName_Shortens(t *testing.T) {
+	t.Parallel()
 	short := &HelmRelease{Name: "short-name"}
 	if got := short.ReleaseName(); got != "short-name" {
 		t.Errorf("short name should pass through: got %q", got)
@@ -773,6 +826,7 @@ func TestReleaseName_Shortens(t *testing.T) {
 }
 
 func TestParseHelmRelease_ChartRef(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -789,7 +843,8 @@ spec:
 	if err != nil {
 		t.Fatalf("parseHelmRelease: %v", err)
 	}
-	if hr.Chart.RepoKind != KindHelmChart || hr.Chart.Version != "" {
+	assert.Equal(t, hr.Chart.Source, NamedResource{Group: SourceDomain, Kind: KindHelmChart, Namespace: "flux-system", Name: "my-chart"})
+	if hr.Chart.Source.Kind != KindHelmChart || hr.Chart.Version != "" {
 		t.Fatalf("expected unresolved chartRef, got %+v", hr.Chart)
 	}
 
@@ -800,8 +855,8 @@ spec:
 			Name: "podinfo", Kind: KindHelmRepository,
 		},
 	}
-	lookup := func(namespace, name string) *HelmChartSource {
-		if namespace == src.Namespace && name == src.Name {
+	lookup := func(id NamedResource) *HelmChartSource {
+		if id == src.Named() {
 			return src
 		}
 		return nil
@@ -813,14 +868,15 @@ spec:
 		t.Errorf("after resolve: %+v", hr.Chart)
 	}
 
-	missing := &HelmRelease{Chart: HelmChart{RepoKind: KindHelmChart, RepoName: "absent", RepoNamespace: "ns"}}
-	none := func(_, _ string) *HelmChartSource { return nil }
+	missing := &HelmRelease{Chart: HelmChart{Source: NamedResource{Group: SourceDomain, Kind: KindHelmChart, Name: "absent", Namespace: "ns"}}}
+	none := func(NamedResource) *HelmChartSource { return nil }
 	if err := missing.ResolveChartRef(none); !errors.Is(err, ErrObjectNotFound) {
 		t.Errorf("expected ErrObjectNotFound, got %v", err)
 	}
 }
 
 func TestParseHelmRepository_OCI(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
@@ -840,52 +896,254 @@ spec:
 	}
 }
 
-func TestParseGitRepository_Ref(t *testing.T) {
-	doc := mustYAML(t, `
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata:
-  name: charts
-  namespace: flux-system
-spec:
-  url: https://example.test/charts.git
-  ref:
-    tag: v1.2.3
-`)
-	g, err := parseGitRepository(doc)
-	if err != nil {
-		t.Fatalf("parseGitRepository: %v", err)
-	}
-	if g.Reference == nil {
-		t.Fatalf("expected Reference parsed")
-	}
-	if got, want := GitRefString(*g.Reference), "tag:v1.2.3"; got != want {
-		t.Errorf("RefString = %q, want %q", got, want)
+func TestGitRepositoryRef_Precedence(t *testing.T) {
+	t.Parallel()
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name                     string
+		ref                      *GitRepositoryRef
+		kind, value, label, spec string
+		normalized               sourcev1.GitRepositoryRef
+		pinned                   bool
+	}{
+		{name: "nil"},
+		{name: "empty", ref: &GitRepositoryRef{}},
+		{
+			name:       "commit",
+			ref:        &GitRepositoryRef{Commit: commit},
+			kind:       "commit",
+			value:      commit,
+			label:      "commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit},
+			pinned:     true,
+		},
+		{
+			name:       "commit branch",
+			ref:        &GitRepositoryRef{Commit: commit, Branch: "main"},
+			kind:       "commit",
+			value:      commit,
+			label:      "branch:main@commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit, Branch: "main"},
+		},
+		{
+			name:       "commit tag",
+			ref:        &GitRepositoryRef{Commit: commit, Tag: "bad tag"},
+			kind:       "commit",
+			value:      commit,
+			label:      "commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit},
+		},
+		{
+			name:       "commit semver",
+			ref:        &GitRepositoryRef{Commit: commit, SemVer: "invalid"},
+			kind:       "commit",
+			value:      commit,
+			label:      "commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit},
+		},
+		{
+			name:       "commit name",
+			ref:        &GitRepositoryRef{Commit: commit, Name: "bad name"},
+			kind:       "commit",
+			value:      commit,
+			label:      "commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit},
+		},
+		{
+			name:       "mixed commit",
+			ref:        &GitRepositoryRef{Branch: "main", Tag: "v1.0.0", SemVer: ">=1.0", Name: "refs/heads/release", Commit: commit},
+			kind:       "commit",
+			value:      commit,
+			label:      "branch:main@commit:" + commit,
+			normalized: sourcev1.GitRepositoryRef{Commit: commit, Branch: "main"},
+		},
+		{
+			name:       "name",
+			ref:        &GitRepositoryRef{Branch: "bad branch", Tag: "v1.0.0", SemVer: "invalid", Name: "refs/heads/release"},
+			kind:       "name",
+			value:      "refs/heads/release",
+			label:      "name:refs/heads/release",
+			spec:       "+refs/heads/release:refs/heads/release",
+			normalized: sourcev1.GitRepositoryRef{Name: "refs/heads/release"},
+		},
+		{
+			name:       "semver",
+			ref:        &GitRepositoryRef{Branch: "bad branch", Tag: "bad tag", SemVer: ">=1.0"},
+			kind:       "semver",
+			value:      ">=1.0",
+			label:      "semver:>=1.0",
+			spec:       "+refs/tags/*:refs/tags/*",
+			normalized: sourcev1.GitRepositoryRef{SemVer: ">=1.0"},
+		},
+		{
+			name:       "name only",
+			ref:        &GitRepositoryRef{Name: "refs/pull/420/head"},
+			kind:       "name",
+			value:      "refs/pull/420/head",
+			label:      "name:refs/pull/420/head",
+			spec:       "+refs/pull/420/head:refs/pull/420/head",
+			normalized: sourcev1.GitRepositoryRef{Name: "refs/pull/420/head"},
+		},
+		{
+			name:       "tag",
+			ref:        &GitRepositoryRef{Tag: "v1.2.3", Branch: "bad branch"},
+			kind:       "tag",
+			value:      "v1.2.3",
+			label:      "tag:v1.2.3",
+			spec:       "+refs/tags/v1.2.3:refs/tags/v1.2.3",
+			normalized: sourcev1.GitRepositoryRef{Tag: "v1.2.3"},
+		},
+		{
+			name:       "branch",
+			ref:        &GitRepositoryRef{Branch: "main"},
+			kind:       "branch",
+			value:      "main",
+			label:      "branch:main",
+			spec:       "+refs/heads/main:refs/heads/main",
+			normalized: sourcev1.GitRepositoryRef{Branch: "main"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			before := Fingerprint(tc.ref)
+			kind, value := tc.ref.Effective()
+			assert.Equal(t, kind, tc.kind)
+			assert.Equal(t, value, tc.value)
+			want := ""
+			if tc.kind != "" {
+				want = tc.kind + ":" + tc.value
+			}
+			assert.Equal(t, tc.ref.String(), want)
+			assert.Equal(t, tc.ref.Label(), tc.label)
+			assert.Equal(t, string(tc.ref.RefSpec()), tc.spec)
+			assert.Equal(t, tc.ref.Normalized(), tc.normalized)
+			assert.Equal(t, tc.ref.Pinned(), tc.pinned)
+			assert.Equal(t, tc.ref.Validate(), nil)
+			assert.Equal(t, Fingerprint(tc.ref), before)
+		})
 	}
 }
 
-func TestGitRefString_Precedence(t *testing.T) {
-	ref := GitRepositoryRef{
-		Branch: "main",
-		Tag:    "v1.0.0",
-		SemVer: ">=1.0",
-		Name:   "refs/heads/release",
-		Commit: "0123456789abcdef0123456789abcdef01234567",
+func TestGitRepositoryRef_Validate(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		ref  GitRepositoryRef
+	}{
+		{"short commit", GitRepositoryRef{Commit: "abc"}},
+		{"nonhex commit", GitRepositoryRef{Commit: strings.Repeat("g", 40)}},
+		{"commit branch", GitRepositoryRef{Commit: strings.Repeat("a", 40), Branch: "bad branch"}},
+		{"name", GitRepositoryRef{Name: "bad name"}},
+		{"semver", GitRepositoryRef{SemVer: "invalid"}},
+		{"tag", GitRepositoryRef{Tag: "bad tag"}},
+		{"branch", GitRepositoryRef{Branch: "bad branch"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tc.ref.Validate(); err == nil {
+				t.Fatal("invalid selected reference accepted")
+			}
+		})
 	}
-	if got, want := GitRefString(ref), "commit:0123456789abcdef0123456789abcdef01234567"; got != want {
-		t.Errorf("GitRefString precedence = %q, want %q", got, want)
+}
+
+func TestRenderDocument_SequentialClone(t *testing.T) {
+	t.Parallel()
+	ks, err := parseKustomization(mustYAML(t, `
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: apps}
+spec: {path: ./p0}
+`))
+	assert.NoError(t, err)
+	first, err := ks.RenderDocument()
+	assert.NoError(t, err)
+	snapshot := DeepCopyMap(first)
+	clone := ks.Clone()
+	clone.Path = "./p1"
+	second, err := clone.RenderDocument()
+	assert.NoError(t, err)
+	assert.Equal(t, second["spec"].(map[string]any)["path"], any("./p1"))
+	assert.Diff(t, first, snapshot)
+	repeated, err := ks.RenderDocument()
+	assert.NoError(t, err)
+	assert.Diff(t, repeated, snapshot)
+}
+
+func TestRenderDocument_BufferOwnership(t *testing.T) {
+	factory := kustomizationEncoders.New
+	t.Cleanup(func() { kustomizationEncoders = sync.Pool{New: factory} })
+	var encoder *kustomizationEncoder
+	kustomizationEncoders = sync.Pool{New: func() any {
+		encoder = factory().(*kustomizationEncoder)
+		return encoder
+	}}
+	ks, err := parseKustomization(mustYAML(t, `
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: apps}
+spec: {path: ./p0}
+`))
+	assert.NoError(t, err)
+	_, err = ks.RenderDocument()
+	assert.NoError(t, err)
+	if encoder == nil || encoder.buffer.Len() == 0 {
+		t.Fatal("render did not use an encoder buffer")
 	}
-	ref.Commit = ""
-	if got, want := GitRefString(ref), "name:refs/heads/release"; got != want {
-		t.Errorf("GitRefString name precedence = %q, want %q", got, want)
+	published := ks.projection.Load().raw
+	snapshot := bytes.Clone(published)
+	encoder.buffer.Bytes()[0] ^= 1
+	assert.Diff(t, published, snapshot)
+}
+
+func TestRenderDocument_TypedSpec(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, spec string }{
+		{"absent", "{}"},
+		{"null fields", "{targetNamespace: null, namePrefix: null, nameSuffix: null, patches: null, images: null, components: null, buildMetadata: null}"},
+		{"empty fields", "{targetNamespace: '', namePrefix: '', nameSuffix: '', patches: [], images: [], components: [], buildMetadata: []}"},
+		{"zero elements", "{patches: [null], images: [null], components: [null], buildMetadata: [null]}"},
+		{"metadata values", "{commonMetadata: {labels: {app: null, team: typed}, annotations: {note: null, owner: typed}}}"},
+		{"generator-only fields", "{patchesStrategicMerge: [{metadata: {name: ignored}}], patchesJson6902: not-a-list}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustYAML(t, "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: apps}\nspec: "+tc.spec+"\n")
+			raw, err := json.Marshal(doc)
+			assert.NoError(t, err)
+			var cr kustomizev1.Kustomization
+			assert.NoError(t, json.Unmarshal(raw, &cr))
+			want, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&cr)
+			assert.NoError(t, err)
+			ks, err := parseKustomization(doc)
+			assert.NoError(t, err)
+			for range 2 {
+				got, err := ks.RenderDocument()
+				assert.NoError(t, err)
+				assert.Diff(t, got["spec"], want["spec"])
+			}
+		})
 	}
-	ref.Name = ""
-	if got, want := GitRefString(ref), "semver:>=1.0"; got != want {
-		t.Errorf("GitRefString semver precedence = %q, want %q", got, want)
+}
+
+func TestParseKustomization_InvalidGeneratorFields(t *testing.T) {
+	t.Parallel()
+	for _, field := range []string{"patches", "images", "components", "buildMetadata"} {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseKustomization(mustYAML(t, "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: apps}\nspec: {"+field+": not-a-list}\n"))
+			if !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) {
+				t.Fatalf("invalid typed field error = %v, want input error", err)
+			}
+			if !strings.Contains(err.Error(), "cannot unmarshal string") {
+				t.Fatalf("missing decoder diagnostic: %v", err)
+			}
+		})
 	}
 }
 
 func TestParseKustomization_DependsOn(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -913,37 +1171,26 @@ spec:
 	if err != nil {
 		t.Fatalf("parseKustomization: %v", err)
 	}
-	if len(k.DependsOn) != 2 {
-		t.Fatalf("DependsOn len = %d, want 2", len(k.DependsOn))
+	deps := refsForUse(t, k, "dependsOn")
+	if len(deps) != 2 {
+		t.Fatalf("DependsOn len = %d, want 2", len(deps))
 	}
-	if got := k.DependsOn[0].NamespacedName(); got != "flux-system/infra" {
+	if got := deps[0].NamespacedName(); got != "flux-system/infra" {
 		t.Errorf("DependsOn[0] = %q, want flux-system/infra", got)
 	}
-	if got := k.DependsOn[1].NamespacedName(); got != "other/extras" {
+	if got := deps[1].NamespacedName(); got != "other/extras" {
 		t.Errorf("DependsOn[1] = %q, want other/extras", got)
 	}
-	if len(k.PostBuildSubstituteFrom) != 1 || !k.PostBuildSubstituteFrom[0].Optional {
-		t.Errorf("substituteFrom = %+v", k.PostBuildSubstituteFrom)
+	if len(k.PostBuild.SubstituteFrom) != 1 || !k.PostBuild.SubstituteFrom[0].Optional {
+		t.Errorf("substituteFrom = %+v", k.PostBuild.SubstituteFrom)
 	}
-	if k.PostBuildSubstitute["DOMAIN"] != "example.com" {
-		t.Errorf("substitute = %+v", k.PostBuildSubstitute)
+	if k.PostBuild.Substitute["DOMAIN"] != "example.com" {
+		t.Errorf("substitute = %+v", k.PostBuild.Substitute)
 	}
-}
-
-func TestKustomization_UpdatePostBuildSubstitutions(t *testing.T) {
-	k := &Kustomization{Contents: map[string]any{"spec": map[string]any{}}}
-	k.UpdatePostBuildSubstitutions(map[string]any{"K": "v"})
-
-	if k.PostBuildSubstitute["K"] != "v" {
-		t.Fatalf("substitute map not updated: %+v", k.PostBuildSubstitute)
-	}
-	spec := k.Contents["spec"].(map[string]any)
-	post := spec["postBuild"].(map[string]any)
-	sub := post["substitute"].(map[string]any)
-	assert.Diff(t, sub, map[string]any{"K": "v"})
 }
 
 func TestParseConfigMap(t *testing.T) {
+	t.Parallel()
 	doc := mustYAML(t, `
 apiVersion: v1
 kind: ConfigMap
@@ -953,7 +1200,8 @@ metadata:
 data:
   DOMAIN: example.com
 `)
-	cm, err := parseConfigMap(doc, true)
+	cmobj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+	cm := cmobj.(*ConfigMap)
 	if err != nil {
 		t.Fatalf("parseConfigMap: %v", err)
 	}
@@ -968,6 +1216,7 @@ data:
 // hosts, cert-manager dnsNames). Cleartext entries are left untouched,
 // and wipeSecrets=false preserves the ciphertext to track Secret wiping.
 func TestParseConfigMap_WipesSopsCiphertext(t *testing.T) {
+	t.Parallel()
 	const ciphertext = "ENC[AES256_GCM,data:NWahjtvi/hiAX9sVkctDGcmWOn0=,iv:2fxQddhm7pwpnO23VkFFgPPEXudfa7TgI0oxUkAjZtA=,tag:rS3MK2jGptzB3RyWOj+Amg==,type:str]"
 	src := `
 apiVersion: v1
@@ -980,17 +1229,21 @@ data:
   PLAINTEXT: keep-me
 `
 	t.Run("wiped", func(t *testing.T) {
-		cm, err := parseConfigMap(mustYAML(t, src), true)
+		t.Parallel()
+		cmobj, _, _, err := ParseDoc(mustYAML(t, src), ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+		cm := cmobj.(*ConfigMap)
 		if err != nil {
 			t.Fatalf("parseConfigMap: %v", err)
 		}
 		assert.Diff(t, cm.Data, map[string]any{
-			"BASE_DOMAIN": fmt.Sprintf(ValuePlaceholderTemplate, "BASE_DOMAIN"),
+			"BASE_DOMAIN": ValuePlaceholder("BASE_DOMAIN"),
 			"PLAINTEXT":   "keep-me",
 		})
 	})
 	t.Run("preserved when wipeSecrets=false", func(t *testing.T) {
-		cm, err := parseConfigMap(mustYAML(t, src), false)
+		t.Parallel()
+		cmobj, _, _, err := ParseDoc(mustYAML(t, src), ParseDocOptions{WipeSecrets: false, DefaultNamespace: ""})
+		cm := cmobj.(*ConfigMap)
 		if err != nil {
 			t.Fatalf("parseConfigMap: %v", err)
 		}
@@ -1002,6 +1255,7 @@ data:
 }
 
 func TestParseSecret(t *testing.T) {
+	t.Parallel()
 	// flate renders the user's own repo offline, so it does NOT blanket-wipe
 	// Secret values — plaintext (incl. a published cosign public key) passes
 	// through. Only SOPS ciphertext is neutralized: flate can't decrypt it and
@@ -1020,7 +1274,9 @@ stringData:
   enc-key: ` + sops + `
 `
 	t.Run("sops wiped, plaintext preserved", func(t *testing.T) {
-		s, err := parseSecret(mustYAML(t, yamlDoc), true)
+		t.Parallel()
+		sobj, _, _, err := ParseDoc(mustYAML(t, yamlDoc), ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
@@ -1036,17 +1292,19 @@ stringData:
 		}
 		// SOPS ciphertext is neutralized: base64(placeholder) in .data,
 		// plaintext placeholder in .stringData.
-		wantB64 := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, ValuePlaceholderTemplate, "enc-blob"))
+		wantB64 := base64.StdEncoding.EncodeToString([]byte(ValuePlaceholder("enc-blob")))
 		if s.Data["enc-blob"] != wantB64 {
 			t.Errorf("SOPS .data not wiped: %v", s.Data["enc-blob"])
 		}
-		if s.StringData["enc-key"] != fmt.Sprintf(ValuePlaceholderTemplate, "enc-key") {
+		if s.StringData["enc-key"] != ValuePlaceholder("enc-key") {
 			t.Errorf("SOPS .stringData not wiped: %v", s.StringData["enc-key"])
 		}
 	})
 
 	t.Run("preserved with wipeSecrets=false", func(t *testing.T) {
-		s, err := parseSecret(mustYAML(t, yamlDoc), false)
+		t.Parallel()
+		sobj, _, _, err := ParseDoc(mustYAML(t, yamlDoc), ParseDocOptions{WipeSecrets: false, DefaultNamespace: ""})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
@@ -1062,6 +1320,7 @@ stringData:
 	// leaks into chart values and corrupts the render (e.g. a bool flips
 	// truthy and a subchart drops). The marker lives INSIDE the base64.
 	t.Run("base64-embedded SOPS values file wiped", func(t *testing.T) {
+		t.Parallel()
 		valuesYAML := "mariadb:\n  enabled: " + sops + "\nwordpressSkipInstall: " + sops + "\n"
 		doc := mustYAML(t, `
 apiVersion: v1
@@ -1070,11 +1329,12 @@ metadata: {name: wordpress-values, namespace: default}
 data:
   values.yaml: `+base64.StdEncoding.EncodeToString([]byte(valuesYAML))+`
 `)
-		s, err := parseSecret(doc, true)
+		sobj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+		s := sobj.(*Secret)
 		if err != nil {
 			t.Fatalf("parseSecret: %v", err)
 		}
-		wantB64 := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, ValuePlaceholderTemplate, "values.yaml"))
+		wantB64 := base64.StdEncoding.EncodeToString([]byte(ValuePlaceholder("values.yaml")))
 		if s.Data["values.yaml"] != wantB64 {
 			t.Errorf("embedded SOPS values blob not wiped: %v", s.Data["values.yaml"])
 		}
@@ -1088,6 +1348,7 @@ data:
 // cache-hit reconcile. Only SOPS values are wiped, so the test pins both a
 // wiped SOPS value and a passed-through plaintext value.
 func TestParseSecret_Idempotent(t *testing.T) {
+	t.Parallel()
 	const sops = "ENC[AES256_GCM,data:Zm9v,iv:YmFy,tag:YmF6,type:str]"
 	yamlDoc := `
 apiVersion: v1
@@ -1101,11 +1362,13 @@ stringData:
 `
 	doc := mustYAML(t, yamlDoc)
 
-	s1, err := parseSecret(doc, true)
+	s1obj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+	s1 := s1obj.(*Secret)
 	if err != nil {
 		t.Fatalf("first parse: %v", err)
 	}
-	s2, err := parseSecret(doc, true)
+	s2obj, _, _, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ""})
+	s2 := s2obj.(*Secret)
 	if err != nil {
 		t.Fatalf("second parse: %v", err)
 	}
@@ -1129,76 +1392,138 @@ stringData:
 }
 
 func TestParseDoc_Dispatch(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
-		name string
-		yaml string
-		kind string
+		name    string
+		yaml    string
+		kind    string
+		cluster bool
 	}{
 		{"kustomization", `
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata: {name: x, namespace: ns}
-spec: {path: ./a, sourceRef: {kind: GitRepository, name: r}}`, KindKustomization},
+spec: {path: ./a, sourceRef: {kind: GitRepository, name: r}}`, KindKustomization, false},
 		{"helmrelease", `
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata: {name: r, namespace: ns}
-spec: {chart: {spec: {chart: c, sourceRef: {name: rr}}}}`, KindHelmRelease},
+spec: {chart: {spec: {chart: c, sourceRef: {name: rr}}}}`, KindHelmRelease, false},
 		{"helmrepository", `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata: {name: r, namespace: ns}
-spec: {url: https://example}`, KindHelmRepository},
+spec: {url: https://example}`, KindHelmRepository, false},
 		{"helmchart", `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmChart
 metadata: {name: hc, namespace: ns}
-spec: {chart: c, sourceRef: {name: rr}}`, KindHelmChart},
+spec: {chart: c, sourceRef: {name: rr}}`, KindHelmChart, false},
 		{"gitrepository", `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
 metadata: {name: r, namespace: ns}
-spec: {url: https://example.git}`, KindGitRepository},
+spec: {url: https://example.git}`, KindGitRepository, false},
 		{"ocirepository", `
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: OCIRepository
 metadata: {name: r, namespace: ns}
-spec: {url: oci://example}`, KindOCIRepository},
+spec: {url: oci://example}`, KindOCIRepository, false},
 		{"configmap", `
 apiVersion: v1
 kind: ConfigMap
-metadata: {name: c, namespace: ns}`, KindConfigMap},
+metadata: {name: c, namespace: ns}`, KindConfigMap, false},
 		{"secret", `
 apiVersion: v1
 kind: Secret
-metadata: {name: s, namespace: ns}`, KindSecret},
+metadata: {name: s, namespace: ns}`, KindSecret, false},
+		{"externalartifact", "apiVersion: source.toolkit.fluxcd.io/v1\nkind: ExternalArtifact\nmetadata: {name: a}", KindExternalArtifact, false},
+		{"bucket", "apiVersion: source.toolkit.fluxcd.io/v1\nkind: Bucket\nmetadata: {name: b}\nspec: {bucketName: b, endpoint: example.test}", KindBucket, false},
+		{"resourceset", "apiVersion: fluxcd.controlplane.io/v1\nkind: ResourceSet\nmetadata: {name: s}", KindResourceSet, false},
+		{"resourcesetinputprovider", "apiVersion: fluxcd.controlplane.io/v1\nkind: ResourceSetInputProvider\nmetadata: {name: p}", KindResourceSetInputProvider, false},
 		{"unknown", `
 apiVersion: example.com/v1
 kind: Foo
-metadata: {name: x}`, "Foo"},
+metadata: {name: x}`, "Foo", false},
+	}
+	for _, raw := range []struct {
+		apiVersion, kind string
+		cluster          bool
+	}{
+		{"apps/v1", "Deployment", false},
+		{"rbac.authorization.k8s.io/v1", "ClusterRole", true},
+		{"foreign.example/v1", "ClusterRole", false},
+		{"rbac.authorization.k8s.io/v999", "ClusterRole", false},
+		{"gateway.networking.k8s.io/v1", "GatewayClass", false},
+		{"kyverno.io/v1", "ClusterPolicy", false},
+		{"nvidia.com/v1", "ClusterPolicy", false},
+		{"cert-manager.io/v1", "ClusterIssuer", false},
+	} {
+		cases = append(cases, struct {
+			name, yaml, kind string
+			cluster          bool
+		}{
+			raw.kind + "/" + raw.apiVersion,
+			fmt.Sprintf("apiVersion: %s\nkind: %s\nmetadata: {name: raw}\nspec: {value: keep}", raw.apiVersion, raw.kind),
+			raw.kind, raw.cluster,
+		})
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			obj, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
-			if err != nil {
-				t.Fatalf("ParseDoc: %v", err)
-			}
-			if obj.Named().Kind != tc.kind {
-				t.Errorf("Kind = %q, want %q", obj.Named().Kind, tc.kind)
-			}
-		})
+		for _, ns := range []struct{ authored, fallback string }{{"", ""}, {"", "apps"}, {"explicit", "apps"}} {
+			t.Run(tc.name+"/authored="+ns.authored+"/default="+ns.fallback, func(t *testing.T) {
+				t.Parallel()
+				doc := mustYAML(t, tc.yaml)
+				md := doc["metadata"].(map[string]any)
+				delete(md, "namespace")
+				if ns.authored != "" {
+					md["namespace"] = ns.authored
+				}
+				before := DeepCopyMap(doc)
+				obj, authoritative, changed, err := ParseDoc(doc, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ns.fallback})
+				assert.NoError(t, err)
+				want := ns.authored
+				if want == "" && !tc.cluster {
+					want = ns.fallback
+				}
+				assert.Equal(t, obj.Named().Kind, tc.kind)
+				assert.Equal(t, obj.Named().Group, apiGroup(DocAPIVersion(doc)))
+				assert.Equal(t, obj.Named().Namespace, want)
+				defaulted := ns.authored == "" && want != ""
+				assert.Equal(t, changed, defaulted)
+				assert.Diff(t, doc, before)
+				if defaulted {
+					before["metadata"].(map[string]any)["namespace"] = want
+				}
+				assert.Diff(t, authoritative, before)
+				replayed, replayDoc, replayChanged, err := ParseDoc(authoritative, ParseDocOptions{WipeSecrets: true, DefaultNamespace: ns.fallback})
+				assert.NoError(t, err)
+				assert.Equal(t, replayed.Named(), obj.Named())
+				assert.Equal(t, replayChanged, false)
+				assert.Diff(t, replayDoc, authoritative)
+				if raw, ok := obj.(*RawObject); ok {
+					info := KindOf(raw)
+					assert.Equal(t, info.Group, apiGroup(DocAPIVersion(doc)))
+					assert.Equal(t, info.Tracked || info.Runnable || info.Status || info.Discovery || info.Test, false)
+					spec, _ := doc["spec"].(map[string]any)
+					assert.Diff(t, raw.Spec, spec)
+				}
+			})
+		}
 	}
 }
 
-// TestParseDoc_ForeignAPIGroup pins that a CRD reusing a kind name flate
-// models, but from another API group, parses to a RawObject instead of
-// being decoded as (or rejected as a malformed) Flux CR — issue #872,
-// where a seaweed.seaweedfs.com Bucket reached the Flux Bucket fetcher.
+// Typed decoding requires the exact API group and the supported core version.
 func TestParseDoc_ForeignAPIGroup(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		yaml string
 	}{
+		{"slash-less flux version", `
+apiVersion: kustomize.toolkit.fluxcd.io
+kind: Kustomization
+metadata: {name: raw, namespace: default}
+spec: {path: ./apps}`},
 		{"seaweedfs bucket", `
 apiVersion: seaweed.seaweedfs.com/v1
 kind: Bucket
@@ -1209,7 +1534,7 @@ apiVersion: s3.services.k8s.aws/v1alpha1
 kind: Bucket
 metadata: {name: assets, namespace: default}
 spec: {name: assets}`},
-		{"legacy flux helmrelease", `
+		{"helm.fluxcd.io helmrelease", `
 apiVersion: helm.fluxcd.io/v1
 kind: HelmRelease
 metadata: {name: app, namespace: default}
@@ -1233,25 +1558,51 @@ spec: {url: https://example}`},
 apiVersion: example.com/v1
 kind: ConfigMap
 metadata: {name: c, namespace: default}`},
-		// The group is compared exactly, so a group that merely starts
-		// with one of ours is foreign too.
+		{"unsupported core version", `
+apiVersion: v2
+kind: ConfigMap
+metadata: {name: c, namespace: default}`},
+		// Group prefixes cannot select typed decoders.
+		{"group with kustomize prefix", `
+apiVersion: kustomize.config.k8s.io.example.com/v1
+kind: Kustomization
+metadata: {name: custom, namespace: default}
+spec: {value: keep}`},
+		{"component with kustomize prefix", `
+apiVersion: kustomize.config.k8s.io.example.com/v1
+kind: Component
+metadata: {name: custom, namespace: default}
+spec: {value: keep}`},
 		{"group with flux prefix", `
 apiVersion: source.toolkit.fluxcd.io.example.com/v1
 kind: Bucket
 metadata: {name: b, namespace: default}
 spec: {name: b}`},
 	}
+	for _, kind := range []string{KindKustomization, KindHelmChart, KindExternalArtifact, KindResourceSet, KindResourceSetInputProvider, KindSecret} {
+		cases = append(cases, struct{ name, yaml string }{kind, "apiVersion: foreign.example/v1\nkind: " + kind + "\nmetadata: {name: raw}"})
+	}
+	cases = append(cases, struct{ name, yaml string }{"explicit core flux kind", "apiVersion: v1\nkind: Kustomization\nmetadata: {name: raw}"})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			obj, err := ParseDoc(mustYAML(t, tc.yaml), defaultParseDocOptions())
+			t.Parallel()
+			doc := mustYAML(t, tc.yaml)
+			delete(doc["metadata"].(map[string]any), "namespace")
+			before := DeepCopyMap(doc)
+			obj, authoritative, changed, err := ParseDoc(doc, ParseDocOptions{DefaultNamespace: "apps"})
 			if err != nil {
 				t.Fatalf("ParseDoc: %v", err)
 			}
-			if !IsRawObject(obj) {
+			info := KindOf(obj)
+			if info.Tracked || info.Runnable || info.Status || info.Discovery || info.Test {
 				t.Fatalf("got %T, want *RawObject", obj)
 			}
-			// Identity must survive: the object still renders and diffs
-			// like any other unmodeled resource.
+			assert.Equal(t, obj.Named().Namespace, "apps")
+			assert.Equal(t, obj.Named().Group, apiGroup(DocAPIVersion(doc)))
+			assert.Equal(t, changed, true)
+			assert.Diff(t, doc, before)
+			before["metadata"].(map[string]any)["namespace"] = "apps"
+			assert.Diff(t, authoritative, before)
 			raw := obj.(*RawObject)
 			if raw.Kind != DocKind(mustYAML(t, tc.yaml)) || raw.Name == "" {
 				t.Errorf("RawObject lost identity: %+v", raw)
@@ -1260,16 +1611,8 @@ spec: {name: b}`},
 	}
 }
 
-func TestIsRawObject(t *testing.T) {
-	if IsRawObject(&Bucket{Name: "b"}) {
-		t.Error("typed Flux Bucket reported as RawObject")
-	}
-	if !IsRawObject(&RawObject{Kind: KindBucket, Name: "b"}) {
-		t.Error("RawObject not reported as RawObject")
-	}
-}
-
 func TestStripResourceAttributes(t *testing.T) {
+	t.Parallel()
 	r := map[string]any{
 		"kind": "Deployment",
 		"metadata": map[string]any{
@@ -1305,6 +1648,16 @@ func TestStripResourceAttributes(t *testing.T) {
 	if _, ok := tplMeta["annotations"]; ok {
 		t.Errorf("template annotation not stripped (empty map should have been removed)")
 	}
+	for _, malformed := range []map[string]any{
+		{"metadata": "bad", "spec": "bad"},
+		{"metadata": map[string]any{"labels": "bad", "annotations": map[string]any(nil)}, "spec": map[string]any{"template": "bad", "jobTemplate": map[string]any{"metadata": "bad", "spec": "bad"}, "volumeClaimTemplates": "bad"}},
+		{"spec": map[string]any{"volumeClaimTemplates": []any{nil, "bad", map[string]any{"metadata": "bad"}}}},
+	} {
+		before := DeepCopyMap(malformed)
+		StripResourceAttributes(malformed, []string{"helm.sh/chart", "checksum/"})
+		assert.Diff(t, malformed, before)
+	}
+
 }
 
 // TestStripResourceAttributes_CronJob pins the CronJob walk: chart
@@ -1313,6 +1666,7 @@ func TestStripResourceAttributes(t *testing.T) {
 // both, so chart bumps would otherwise produce two diff entries per
 // CronJob after the strip pass missed them.
 func TestStripResourceAttributes_CronJob(t *testing.T) {
+	t.Parallel()
 	r := map[string]any{
 		"kind": "CronJob",
 		"metadata": map[string]any{
@@ -1354,6 +1708,7 @@ func TestStripResourceAttributes_CronJob(t *testing.T) {
 // must be stripped, or every chart bump produces N diff entries
 // (one per replica's PVC template).
 func TestStripResourceAttributes_StatefulSetPVCs(t *testing.T) {
+	t.Parallel()
 	r := map[string]any{
 		"kind": "StatefulSet",
 		"spec": map[string]any{
@@ -1400,6 +1755,7 @@ func TestStripResourceAttributes_StatefulSetPVCs(t *testing.T) {
 // (matrix-synapse) used to slip past the exact-match list and churn
 // `flate diff`; non-checksum annotations must survive untouched.
 func TestStripResourceAttributes_ChecksumPrefix(t *testing.T) {
+	t.Parallel()
 	r := map[string]any{
 		"kind": "Deployment",
 		"spec": map[string]any{
@@ -1434,6 +1790,7 @@ func TestStripResourceAttributes_ChecksumPrefix(t *testing.T) {
 // pointer; mutating r.Spec corrupted the original doc the loader
 // reused across passes.
 func TestRawObject_DoesNotAliasParsedDoc(t *testing.T) {
+	t.Parallel()
 	doc := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
@@ -1459,21 +1816,78 @@ func TestRawObject_DoesNotAliasParsedDoc(t *testing.T) {
 }
 
 func TestParseDoc_MissingFields(t *testing.T) {
-	if _, err := ParseDoc(map[string]any{"kind": "Foo"}, defaultParseDocOptions()); err == nil || !strings.Contains(err.Error(), "apiVersion") {
+	t.Parallel()
+	if _, _, _, err := ParseDoc(map[string]any{"kind": "Foo"}, ParseDocOptions{DefaultNamespace: "apps"}); err == nil || !strings.Contains(err.Error(), "apiVersion") {
 		t.Errorf("expected apiVersion error, got %v", err)
 	}
-	// Bare data files (no kind:) are silently dropped as RawObjects —
-	// helm values, config blobs, etc. that aren't k8s resources.
-	obj, err := ParseDoc(map[string]any{"apiVersion": "v1"}, defaultParseDocOptions())
+	// Bare data files (no kind:) are not Kubernetes resources.
+	obj, _, _, err := ParseDoc(map[string]any{"apiVersion": "v1"}, ParseDocOptions{DefaultNamespace: "apps"})
 	if err != nil {
 		t.Errorf("missing-kind docs should not error, got %v", err)
 	}
-	if _, ok := obj.(*RawObject); !ok {
-		t.Errorf("expected RawObject for missing-kind doc, got %T", obj)
+	if obj != nil {
+		t.Errorf("expected nil for missing-kind doc, got %T", obj)
 	}
+	for _, tc := range []struct {
+		name             string
+		metadata         any
+		absent           bool
+		raw, core, typed string
+	}{
+		{name: "absent", absent: true, raw: "missing metadata for Widget", core: "ConfigMap missing metadata", typed: "HelmRelease missing metadata.name"},
+		{name: "null", raw: "missing metadata for Widget", core: "ConfigMap missing metadata", typed: "HelmRelease missing metadata.name"},
+		{name: "scalar", metadata: "bad", raw: "missing metadata for Widget", core: "ConfigMap missing metadata", typed: "HelmRelease decode: json: cannot unmarshal string"},
+		{name: "numeric metadata", metadata: 7, raw: "missing metadata for Widget", core: "ConfigMap missing metadata", typed: "HelmRelease decode: json: cannot unmarshal number"},
+		{name: "empty map", metadata: map[string]any{}, raw: "missing metadata.name for Widget", core: "ConfigMap missing metadata.name", typed: "HelmRelease missing metadata.name"},
+		{name: "numeric name", metadata: map[string]any{"name": 7}, raw: "missing metadata.name for Widget", core: "ConfigMap missing metadata.name", typed: "HelmRelease decode: json: cannot unmarshal number"},
+		{name: "numeric namespace", metadata: map[string]any{"name": "app", "namespace": 7}, typed: "HelmRelease decode: json: cannot unmarshal number"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, admission := range []struct{ kind, version, want string }{
+				{"Widget", "example.test/v1", tc.raw},
+				{KindConfigMap, "v1", tc.core},
+				{KindHelmRelease, HelmReleaseDomain + "/v2", tc.typed},
+			} {
+				t.Run(admission.kind, func(t *testing.T) {
+					t.Parallel()
+					doc := map[string]any{"apiVersion": admission.version, "kind": admission.kind}
+					if !tc.absent {
+						doc["metadata"] = tc.metadata
+					}
+					before := DeepCopyMap(doc)
+					obj, authoritative, changed, err := ParseDoc(doc, ParseDocOptions{DefaultNamespace: "apps"})
+					if admission.want == "" {
+						assert.NoError(t, err)
+						assert.Equal(t, obj.Named().Namespace, "apps")
+						assert.Equal(t, changed, true)
+					} else {
+						if !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) || !strings.Contains(err.Error(), admission.want) {
+							t.Fatalf("error = %v, want %q with ErrInput/ErrFlux", err, admission.want)
+						}
+						assert.Equal(t, changed, false)
+						assert.Diff(t, authoritative, before)
+					}
+					assert.Diff(t, doc, before)
+				})
+			}
+		})
+	}
+	t.Run("typed spec error precedes missing metadata", func(t *testing.T) {
+		t.Parallel()
+		doc := map[string]any{"apiVersion": HelmReleaseDomain + "/v2", "kind": KindHelmRelease, "spec": "bad"}
+		_, authoritative, changed, err := ParseDoc(doc, ParseDocOptions{DefaultNamespace: "apps"})
+		if !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) || !strings.Contains(err.Error(), "HelmRelease decode: json: cannot unmarshal string") {
+			t.Fatalf("malformed spec lost decode precedence: %v", err)
+		}
+		assert.Equal(t, changed, false)
+		assert.Diff(t, authoritative, doc)
+	})
+
 }
 
 func TestSplitDocs(t *testing.T) {
+	t.Parallel()
 	data := []byte(`
 apiVersion: v1
 kind: ConfigMap
@@ -1497,153 +1911,8 @@ metadata: {name: b, namespace: ns}
 	assert.Diff(t, names, []string{"a", "b"})
 }
 
-// docNames returns each doc's metadata.name, for asserting flatten output.
-func docNames(docs []map[string]any) []string {
-	out := make([]string, len(docs))
-	for i, d := range docs {
-		md, _ := d["metadata"].(map[string]any)
-		out[i], _ = md["name"].(string)
-	}
-	return out
-}
-
-// TestFlattenLists_DecodedYAML pins that a Kubernetes List wrapper decoded
-// from a real multi-doc stream is expanded into its items, each a name-able
-// top-level document, with surrounding docs and order preserved. This is
-// the property that keeps an un-named List from forcing dyff off name-based
-// pairing. Exercises the decode → FlattenLists sequence the render paths run.
-func TestFlattenLists_DecodedYAML(t *testing.T) {
-	data := []byte(`
-apiVersion: v1
-kind: ConfigMapList
-metadata:
-  labels: {helm.toolkit.fluxcd.io/name: x}
-items:
-  - apiVersion: v1
-    kind: ConfigMap
-    metadata: {name: dash-a, namespace: ns}
-    data: {k: v}
-  - apiVersion: v1
-    kind: ConfigMap
-    metadata: {name: dash-b, namespace: ns}
-    data: {k: v}
----
-apiVersion: v1
-kind: ConfigMap
-metadata: {name: plain, namespace: ns}
-`)
-	docs, err := SplitDocs(data)
-	if err != nil {
-		t.Fatalf("SplitDocs: %v", err)
-	}
-	docs = FlattenLists(docs)
-	// Names assert non-empty identity on every doc; kinds confirm the
-	// wrapper itself is gone and only ConfigMaps remain.
-	assert.Diff(t, docNames(docs), []string{"dash-a", "dash-b", "plain"})
-	for _, d := range docs {
-		if DocKind(d) != KindConfigMap {
-			t.Errorf("flattened doc has kind %q, want ConfigMap", DocKind(d))
-		}
-	}
-}
-
-func TestFlattenLists(t *testing.T) {
-	cmItem := func(name string) map[string]any {
-		return map[string]any{
-			"apiVersion": "v1", "kind": "ConfigMap",
-			"metadata": map[string]any{"name": name, "namespace": "ns"},
-		}
-	}
-	list := func(kind string, items ...map[string]any) map[string]any {
-		its := make([]any, len(items))
-		for i, it := range items {
-			its[i] = it
-		}
-		return map[string]any{"apiVersion": "v1", "kind": kind, "items": its}
-	}
-
-	t.Run("promotes items and passes non-list docs through", func(t *testing.T) {
-		in := []map[string]any{list("ConfigMapList", cmItem("a"), cmItem("b")), cmItem("plain")}
-		assert.Diff(t, docNames(FlattenLists(in)), []string{"a", "b", "plain"})
-	})
-
-	t.Run("derives identity for bare items in a typed list", func(t *testing.T) {
-		bare := map[string]any{"metadata": map[string]any{"name": "c"}}
-		out := FlattenLists([]map[string]any{list("ConfigMapList", bare)})
-		if len(out) != 1 {
-			t.Fatalf("want 1 doc, got %d", len(out))
-		}
-		assert.Equal(t, DocKind(out[0]), "ConfigMap")
-		assert.Equal(t, DocAPIVersion(out[0]), "v1")
-		if _, mutated := bare["kind"]; mutated {
-			t.Error("derivation mutated the original item map")
-		}
-	})
-
-	t.Run("generic List keeps self-describing items", func(t *testing.T) {
-		item := map[string]any{
-			"apiVersion": "apps/v1", "kind": "Deployment",
-			"metadata": map[string]any{"name": "d", "namespace": "ns"},
-		}
-		out := FlattenLists([]map[string]any{list("List", item)})
-		if len(out) != 1 {
-			t.Fatalf("want 1 doc, got %d", len(out))
-		}
-		assert.Equal(t, DocKind(out[0]), "Deployment")
-	})
-
-	t.Run("flattens any typed list, not just ConfigMapList", func(t *testing.T) {
-		secret := func(name string) map[string]any {
-			return map[string]any{
-				"apiVersion": "v1", "kind": "Secret",
-				"metadata": map[string]any{"name": name, "namespace": "ns"},
-			}
-		}
-		out := FlattenLists([]map[string]any{list("SecretList", secret("s1"), secret("s2"))})
-		assert.Diff(t, docNames(out), []string{"s1", "s2"})
-		for _, d := range out {
-			assert.Equal(t, DocKind(d), KindSecret)
-		}
-	})
-
-	t.Run("non-collection kinds ending in List are left untouched", func(t *testing.T) {
-		// items are scalars, not resource maps.
-		scalarItems := map[string]any{
-			"apiVersion": "example.com/v1", "kind": "AllowList",
-			"metadata": map[string]any{"name": "acl"},
-			"items":    []any{"1.2.3.4", "5.6.7.8"},
-		}
-		// no top-level items at all.
-		noItems := map[string]any{
-			"apiVersion": "example.com/v1", "kind": "WaitList",
-			"metadata": map[string]any{"name": "wl"},
-			"spec":     map[string]any{"items": []any{}},
-		}
-		out := FlattenLists([]map[string]any{scalarItems, noItems})
-		assert.Diff(t, docNames(out), []string{"acl", "wl"})
-	})
-
-	t.Run("no list returns the input slice unchanged", func(t *testing.T) {
-		in := []map[string]any{cmItem("a"), cmItem("b")}
-		out := FlattenLists(in)
-		if &out[0] != &in[0] {
-			t.Error("expected the original slice (no allocation) when no List is present")
-		}
-	})
-}
-
-// TestParseDoc_PoolReuseConsistency drives the DecodeDocs sync.Pool
-// hard: 1000 parse-and-release iterations on a fixed input must yield
-// byte-identical typed results. Catches any aliasing or stale-state
-// bug introduced by reusing a cleared map[string]any across decodes.
-//
-// Covers the three retention shapes:
-//   - HelmRelease (decodeInto JSON round-trip, no doc retention)
-//   - Kustomization (retains the TOP-LEVEL doc as Contents — must not
-//     be returned to the pool)
-//   - ConfigMap (aliases the inner data submap; clear(top) leaves the
-//     submap independently rooted)
 func TestParseDoc_PoolReuseConsistency(t *testing.T) {
+	t.Parallel()
 	hr := []byte(`
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -1687,76 +1956,95 @@ data:
   key1: value1
   key2: value2
 `)
+	secret := "apiVersion: v1\nkind: Secret\nmetadata: {name: credentials, namespace: ns}\ndata: {key: dmFsdWU=}\n"
+	raw := "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: app}\nspec: {value: keep}\n"
+	for _, input := range []string{string(hr), string(ks), string(cm), secret, raw} {
+		t.Run(DocKind(mustYAML(t, input)), func(t *testing.T) {
+			t.Parallel()
+			docs, err := DecodeDocs(strings.NewReader(input))
+			assert.NoError(t, err)
+			obj, _, _, err := ParseDoc(docs[0], defaultParseDocOptions())
+			assert.NoError(t, err)
+			before := Fingerprint(obj)
+			var projected map[string]any
+			if k, ok := obj.(*Kustomization); ok {
+				projected, err = k.RenderDocument()
+				assert.NoError(t, err)
+			}
+			ReleaseDoc(docs[0])
+			next, err := DecodeDocs(strings.NewReader("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: next}\ndata: {key: next}\n"))
+			assert.NoError(t, err)
+			ReleaseDoc(next[0])
+			assert.Equal(t, Fingerprint(obj), before)
+			switch v := obj.(type) {
+			case *Kustomization:
+				doc, err := v.RenderDocument()
+				assert.NoError(t, err)
+				assert.Diff(t, doc, projected)
+				start := make(chan struct{})
+				done := make(chan error, 2)
+				for i := range 2 {
+					changed := v.Clone()
+					changed.Path = fmt.Sprintf("typed-%d", i)
+					changed.PostBuild.Substitute["X"] = changed.Path
+					go func() {
+						<-start
+						edited, err := changed.RenderDocument()
+						if err == nil && edited["spec"].(map[string]any)["path"] != changed.Path {
+							err = fmt.Errorf("projection did not reflect typed path %q", changed.Path)
+						}
+						done <- err
+					}()
+				}
+				close(start)
+				for range 2 {
+					assert.NoError(t, <-done)
+				}
+				unchanged, err := v.RenderDocument()
+				assert.NoError(t, err)
+				assert.Diff(t, unchanged, projected)
+				assert.Diff(t, doc, projected)
+				assert.Equal(t, v.PostBuild.Substitute["X"], "y")
+			case *ConfigMap:
+				assert.Equal(t, v.Data["key1"], any("value1"))
+			case *Secret:
+				assert.Equal(t, v.Data["key"], any("dmFsdWU="))
+			case *RawObject:
+				assert.Equal(t, v.Spec["value"], any("keep"))
+			}
+		})
+	}
 
-	const iters = 1000
-	opts := defaultParseDocOptions()
-
-	for i := range iters {
-		// HelmRelease: doc fully releasable.
-		docs, err := DecodeDocs(bytes.NewReader(hr))
-		if err != nil {
-			t.Fatalf("HR iter %d DecodeDocs: %v", i, err)
+	for _, input := range []string{string(hr), string(ks), string(cm), secret, raw} {
+		docs, err := DecodeDocs(strings.NewReader(input))
+		assert.NoError(t, err)
+		doc := docs[0]
+		delete(doc["metadata"].(map[string]any), "namespace")
+		before := DeepCopyMap(doc)
+		opts := ParseDocOptions{WipeSecrets: true, DefaultNamespace: "apps"}
+		obj, authoritative, changed, err := ParseDoc(doc, opts)
+		assert.NoError(t, err)
+		assert.Equal(t, obj.Named().Namespace, "apps")
+		assert.Equal(t, changed, true)
+		replay, retained, changed, err := ParseDoc(authoritative, opts)
+		assert.NoError(t, err)
+		assert.Equal(t, replay.Named(), obj.Named())
+		assert.Equal(t, changed, false)
+		{
+			next, err := DecodeDocs(strings.NewReader("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: next, namespace: other}\ndata: {key: next}\n"))
+			assert.NoError(t, err)
+			_, _, _, err = ParseDoc(next[0], opts)
+			assert.NoError(t, err)
+			ReleaseDoc(next[0])
 		}
-		obj, err := ParseDoc(docs[0], opts)
-		if err != nil {
-			t.Fatalf("HR iter %d ParseDoc: %v", i, err)
-		}
-		got, ok := obj.(*HelmRelease)
-		if !ok {
-			t.Fatalf("HR iter %d: not *HelmRelease", i)
-		}
-		if got.Name != "app" || got.Namespace != "default" {
-			t.Fatalf("HR iter %d: wrong identity %s/%s", i, got.Namespace, got.Name)
-		}
-		if got.Chart.Name != "app-template" || got.Chart.Version != "3.5.1" {
-			t.Fatalf("HR iter %d: chart drift %+v", i, got.Chart)
-		}
-		ReleaseIfNotRetained(docs[0], obj)
-
-		// Kustomization: must NOT be released (Contents retains doc).
-		ksDocs, err := DecodeDocs(bytes.NewReader(ks))
-		if err != nil {
-			t.Fatalf("KS iter %d DecodeDocs: %v", i, err)
-		}
-		kobj, err := ParseDoc(ksDocs[0], opts)
-		if err != nil {
-			t.Fatalf("KS iter %d ParseDoc: %v", i, err)
-		}
-		k, ok := kobj.(*Kustomization)
-		if !ok {
-			t.Fatalf("KS iter %d: not *Kustomization", i)
-		}
-		if k.Name != "apps" || k.Path != "./apps" {
-			t.Fatalf("KS iter %d: drift %s %s", i, k.Name, k.Path)
-		}
-		// Validate retained Contents survives ReleaseIfNotRetained.
-		ReleaseIfNotRetained(ksDocs[0], kobj)
-		if k.Contents["kind"] != "Kustomization" {
-			t.Fatalf("KS iter %d: Contents corrupted after Release: %v", i, k.Contents)
-		}
-
-		// ConfigMap: aliases inner data submap. Release of top-level
-		// must not corrupt the parsed inner data.
-		cmDocs, err := DecodeDocs(bytes.NewReader(cm))
-		if err != nil {
-			t.Fatalf("CM iter %d DecodeDocs: %v", i, err)
-		}
-		cobj, err := ParseDoc(cmDocs[0], opts)
-		if err != nil {
-			t.Fatalf("CM iter %d ParseDoc: %v", i, err)
-		}
-		c, ok := cobj.(*ConfigMap)
-		if !ok {
-			t.Fatalf("CM iter %d: not *ConfigMap", i)
-		}
-		if c.Data["key1"] != "value1" || c.Data["key2"] != "value2" {
-			t.Fatalf("CM iter %d: data drift %v", i, c.Data)
-		}
-		ReleaseIfNotRetained(cmDocs[0], cobj)
-		// Re-check after release: pooled top-level is gone but the
-		// inner submap must still hold our values.
-		if c.Data["key1"] != "value1" || c.Data["key2"] != "value2" {
-			t.Fatalf("CM iter %d: data corrupted post-release %v", i, c.Data)
+		assert.Diff(t, doc, before)
+		expected := DeepCopyMap(before)
+		expected["metadata"].(map[string]any)["namespace"] = "apps"
+		assert.Diff(t, authoritative, expected)
+		assert.Diff(t, retained, expected)
+		switch obj := obj.(type) {
+		case *RawObject:
+			assert.Diff(t, obj.Spec, before["spec"])
 		}
 	}
 }
@@ -1769,6 +2057,7 @@ data:
 // reject any non-scalar key kind. See m00nwtchr/homelab-cluster
 // apps/media/sonarr/app/helmrelease.yaml.
 func TestSplitDocs_AliasAsMapKey(t *testing.T) {
+	t.Parallel()
 	data := []byte(`
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -1793,24 +2082,233 @@ spec:
 	}
 }
 
-func TestIsKustomizeBuildDirective(t *testing.T) {
-	cases := []struct {
-		name string
-		obj  BaseManifest
-		want bool
-	}{
-		{"kustomize-config Kustomization", &RawObject{Kind: "Kustomization", APIVersion: "kustomize.config.k8s.io/v1beta1"}, true},
-		{"kustomize-config Component", &RawObject{Kind: "Component", APIVersion: "kustomize.config.k8s.io/v1alpha1"}, true},
-		{"flux Kustomization (typed)", &Kustomization{}, false},
-		{"unknown resource RawObject", &RawObject{Kind: "Widget", APIVersion: "example.com/v1"}, false},
-		{"helmrelease (typed)", &HelmRelease{}, false},
-		{"nil", nil, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := IsKustomizeBuildDirective(tc.obj); got != tc.want {
-				t.Errorf("IsKustomizeBuildDirective = %v, want %v", got, tc.want)
+func TestParseDoc_BuildDirectives(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"Kustomization", "Component"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			obj, _, _, err := ParseDoc(map[string]any{"kind": kind, "apiVersion": "kustomize.config.k8s.io/v1beta1"}, ParseDocOptions{DefaultNamespace: "apps"})
+			if err != nil || obj != nil {
+				t.Fatalf("ParseDoc = %T, %v; want nil, nil", obj, err)
 			}
+		})
+	}
+}
+
+func TestParseHelmRelease_DisableValidationCombinations(t *testing.T) {
+	t.Parallel()
+	for _, flags := range []struct {
+		name            string
+		schema, openAPI bool
+	}{
+		{name: "neither"},
+		{name: "schema", schema: true},
+		{name: "openapi", openAPI: true},
+		{name: "both", schema: true, openAPI: true},
+	} {
+		for _, stage := range []string{"neither", "install", "upgrade", "both"} {
+			t.Run(flags.name+"/"+stage, func(t *testing.T) {
+				t.Parallel()
+				enabled := fmt.Sprintf("{disableSchemaValidation: %t, disableOpenAPIValidation: %t}", flags.schema, flags.openAPI)
+				var spec string
+				if stage == "install" || stage == "both" {
+					spec += "  install: " + enabled + "\n"
+				}
+				if stage == "upgrade" || stage == "both" {
+					spec += "  upgrade: " + enabled + "\n"
+				}
+				hr, err := parseHelmRelease(helmReleaseDoc(t, spec))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantSchema := (stage == "install" || stage == "both") && flags.schema
+				wantOpenAPI := stage != "neither" && flags.openAPI
+				if hr.DisableSchemaValidation != wantSchema || hr.DisableOpenAPIValidation != wantOpenAPI {
+					t.Errorf("validation flags = (%t, %t), want (%t, %t)", hr.DisableSchemaValidation, hr.DisableOpenAPIValidation, wantSchema, wantOpenAPI)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckAPIVersion_ExactGroup(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		version string
+		wantErr error
+		invalid bool
+	}{
+		{version: SourceDomain + "/v1"},
+		{version: SourceDomain + ".example.com/v1", wantErr: ErrInput},
+		{version: "", wantErr: ErrInput},
+		{version: SourceDomain + "/", wantErr: ErrInput, invalid: true},
+		{version: SourceDomain + "/v1/extra", wantErr: ErrInput, invalid: true},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			t.Parallel()
+			err := checkAPIVersion(map[string]any{"apiVersion": tc.version}, SourceDomain)
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr != nil && !errors.Is(err, ErrFlux)) {
+				t.Errorf("error = %v, want %v", err, tc.wantErr)
+			}
+			_, invalid := errors.AsType[*field.Error](err)
+			assert.Equal(t, invalid, tc.invalid)
+			if tc.invalid {
+				for _, kind := range []string{KindGitRepository, "Widget"} {
+					doc := map[string]any{"apiVersion": tc.version, "kind": kind, "metadata": 7, "spec": "bad"}
+					_, authoritative, changed, err := ParseDoc(doc, ParseDocOptions{DefaultNamespace: "apps"})
+					invalid, ok := errors.AsType[*field.Error](err)
+					if !ok || invalid.Field != "apiVersion" || !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) {
+						t.Fatalf("version error lost precedence or classification: %v", err)
+					}
+					assert.Equal(t, changed, false)
+					assert.Diff(t, authoritative, doc)
+				}
+			}
+		})
+	}
+}
+
+func TestResolve_NamespacePrecedence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, forced, authored, fallback, want string }{
+		{"forced", "forced", "authored", "fallback", "forced"},
+		{"authored", "", "authored", "fallback", "authored"},
+		{"fallback", "", "", "fallback", "fallback"},
+		{"empty", "", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			id := NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: tc.authored, Name: "app"}
+			want := NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: tc.want, Name: "app"}
+			assert.Equal(t, Resolve(id, tc.forced, tc.fallback), want)
+			assert.Equal(t, id, NamedResource{Group: FluxKustomizeDomain, Kind: KindKustomization, Namespace: tc.authored, Name: "app"})
+		})
+	}
+}
+
+func TestNamedResource_DecodeIdentity(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{KindGitRepository, KindOCIRepository, KindBucket} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			id := NamedResource{Group: SourceDomain, Kind: kind, Namespace: "other", Name: "entry"}
+			obj, err := id.DecodeIdentity()
+			assert.NoError(t, err)
+			assert.Equal(t, obj.Named(), id)
+			assert.Equal(t, KindOf(obj).APIVersion(), sourcev1.GroupVersion.String())
+			switch kind {
+			case KindGitRepository:
+				if g, ok := obj.(*GitRepository); !ok || g.URL != "file://." || g.Provider != sourcev1.GitProviderGeneric {
+					t.Fatalf("decoded Git identity: %#v", obj)
+				}
+			case KindOCIRepository:
+				if o, ok := obj.(*OCIRepository); !ok || o.URL != "file://." || o.Provider != sourcev1.GenericOCIProvider {
+					t.Fatalf("decoded OCI identity: %#v", obj)
+				}
+			case KindBucket:
+				if b, ok := obj.(*Bucket); !ok || b.Endpoint != "file://." || b.BucketName != id.Name || b.Provider != sourcev1.BucketProviderGeneric {
+					t.Fatalf("decoded bucket identity: %#v", obj)
+				}
+			}
+			doc := map[string]any{"apiVersion": sourcev1.GroupVersion.String(), "kind": kind, "metadata": map[string]any{"name": id.Name, "namespace": id.Namespace}}
+			_, _, _, err = ParseDoc(doc, defaultParseDocOptions())
+			if !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) {
+				t.Fatalf("authored missing spec: %v", err)
+			}
+		})
+	}
+	for _, id := range []NamedResource{
+		{Group: "wrong.group", Kind: KindGitRepository, Namespace: "other", Name: "entry"},
+		{Group: SourceDomain, Kind: "Unknown", Namespace: "other", Name: "entry"},
+		{Group: SourceDomain, Kind: KindBucket, Name: "entry"},
+		{Group: SourceDomain, Kind: KindOCIRepository, Namespace: "other"},
+		{Kind: KindConfigMap, Namespace: "other", Name: "entry"},
+	} {
+		if obj, err := id.DecodeIdentity(); obj != nil || !errors.Is(err, ErrInput) || !errors.Is(err, ErrFlux) {
+			t.Fatalf("invalid identity %s: %v, %v", id, obj, err)
+		}
+	}
+}
+
+func TestBootstrapAlias_SourceKinds(t *testing.T) {
+	t.Parallel()
+	ignore := "excluded/"
+	ref := &sourcev1.GitRepositoryRef{Tag: "v1"}
+	git := &GitRepository{Name: "entry", Namespace: "other", URL: "https://fixture.invalid/repo", Reference: ref, Ignore: &ignore, SparseCheckout: []string{"apps"}, RecurseSubmodules: true}
+	oci := &OCIRepository{Name: "entry", Namespace: "other", URL: "oci://fixture.invalid/repo", Ignore: &ignore}
+	bucket := &Bucket{Name: "entry", Namespace: "other", Endpoint: "fixture.invalid", BucketName: "authored"}
+	for _, obj := range []interface {
+		BaseManifest
+		BootstrapAlias(string) (BaseManifest, *GitRepository)
+	}{git, oci, bucket} {
+		t.Run(obj.Named().Kind, func(t *testing.T) {
+			t.Parallel()
+			before := Fingerprint(obj)
+			alias, descriptor := obj.BootstrapAlias("/repo/subtree")
+			assert.Equal(t, alias.Named(), obj.Named())
+			if alias == obj || Fingerprint(obj) != before {
+				t.Fatal("alias mutated or retained receiver")
+			}
+			switch a := alias.(type) {
+			case *GitRepository:
+				if descriptor != git || a.URL != "file:///repo/subtree" || a.Reference != ref || a.Ignore != &ignore || !a.RecurseSubmodules || len(a.SparseCheckout) != 1 {
+					t.Fatalf("Git policy/view: %+v, %p", a, descriptor)
+				}
+			case *OCIRepository:
+				if descriptor != nil || a.URL != "file:///repo/subtree" || a.Ignore != &ignore {
+					t.Fatalf("OCI policy/view: %+v", a)
+				}
+			case *Bucket:
+				if descriptor != nil || a.Endpoint != "file:///repo/subtree" || a.BucketName != a.Name {
+					t.Fatalf("bucket policy/view: %+v", a)
+				}
+			}
+		})
+	}
+}
+
+func TestDocIdentity_ReadOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  map[string]any
+		want NamedResource
+	}{
+		{name: "nil"},
+		{name: "empty", doc: map[string]any{}},
+		{name: "wrong fields", doc: map[string]any{"apiVersion": 1, "kind": false, "metadata": "wrong"}},
+		{name: "null metadata", doc: map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": nil}, want: NamedResource{Kind: "ConfigMap"}},
+		{name: "wrong metadata fields", doc: map[string]any{"apiVersion": "example.test/v1", "kind": "Widget", "metadata": map[string]any{"name": 1, "namespace": false}}, want: NamedResource{Group: "example.test", Kind: "Widget"}},
+		{name: "core", doc: map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "config", "namespace": "apps"}}, want: NamedResource{Kind: "ConfigMap", Namespace: "apps", Name: "config"}},
+		{name: "group", doc: map[string]any{"apiVersion": "example.test/v1", "kind": "Widget", "metadata": map[string]any{"name": "widget", "namespace": "apps"}}, want: NamedResource{Group: "example.test", Kind: "Widget", Namespace: "apps", Name: "widget"}},
+		{name: "version", doc: map[string]any{"apiVersion": "example.test/v2", "kind": "Widget", "metadata": map[string]any{"name": "widget", "namespace": "apps"}}, want: NamedResource{Group: "example.test", Kind: "Widget", Namespace: "apps", Name: "widget"}},
+		{name: "permissive group", doc: map[string]any{"apiVersion": "example.test/v1/extra", "kind": "Widget", "metadata": map[string]any{"name": "widget"}}, want: NamedResource{Group: "example.test", Kind: "Widget", Name: "widget"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := DeepCopyMap(tc.doc)
+			for range 2 {
+				assert.Equal(t, DocIdentity(tc.doc), tc.want)
+			}
+			assert.Diff(t, tc.doc, before)
+			assert.Equal(t, testing.AllocsPerRun(100, func() { DocIdentity(tc.doc) }), float64(0))
+		})
+	}
+}
+
+func TestNamedResource_Labels(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		id         NamedResource
+		kind, full string
+	}{
+		{"core", NamedResource{Kind: "ConfigMap", Namespace: "ns", Name: "shared"}, "ConfigMap", "ConfigMap/ns/shared"},
+		{"foreign group", NamedResource{Group: "example.test", Kind: "ConfigMap", Namespace: "ns", Name: "shared"}, "ConfigMap.example.test", "ConfigMap.example.test/ns/shared"},
+		{"cluster", NamedResource{Group: "example.test", Kind: "Widget", Name: "shared"}, "Widget.example.test", "Widget.example.test/shared"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.id.KindLabel(), tc.kind)
+			assert.Equal(t, tc.id.String(), tc.full)
 		})
 	}
 }

@@ -1,40 +1,50 @@
 package change
 
 import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"maps"
 	"os"
-	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/fstest"
+	"testing/synctest"
 	"time"
+
+	"github.com/home-operations/flate/internal/assert"
+	"github.com/home-operations/flate/internal/testutil"
+
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/gittree"
+	"github.com/home-operations/flate/pkg/store"
 )
 
-func writeFile(t *testing.T, dir, rel, body string) {
-	t.Helper()
-	p := filepath.Join(dir, rel)
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-		t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
-	}
-	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-		t.Fatalf("write %s: %v", p, err)
-	}
-}
-
 func TestDetect_BothPathsRequired(t *testing.T) {
-	if _, err := Detect("", "/tmp/x"); err == nil {
+	t.Parallel()
+	if _, err := Detect(t.Context(), testInput(""), testInput("/tmp/x")); err == nil {
 		t.Errorf("expected error for empty before")
 	}
-	if _, err := Detect("/tmp/x", ""); err == nil {
+	if _, err := Detect(t.Context(), testInput("/tmp/x"), testInput("")); err == nil {
 		t.Errorf("expected error for empty after")
 	}
 }
 
 func TestDetect_IdenticalTreesEmpty(t *testing.T) {
+	t.Parallel()
 	before := t.TempDir()
 	after := t.TempDir()
-	writeFile(t, before, "a.yaml", "x")
-	writeFile(t, after, "a.yaml", "x")
-	got, err := Detect(before, after)
+	testutil.WriteFile(t, before, "a.yaml", "x")
+	testutil.WriteFile(t, after, "a.yaml", "x")
+	got, err := Detect(t.Context(), testInput(before), testInput(after))
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
@@ -44,24 +54,25 @@ func TestDetect_IdenticalTreesEmpty(t *testing.T) {
 }
 
 func TestDetect_AddedRemovedModified(t *testing.T) {
+	t.Parallel()
 	before := t.TempDir()
 	after := t.TempDir()
 	// unchanged: ident.yaml on both sides with same content
-	writeFile(t, before, "ident.yaml", "same")
-	writeFile(t, after, "ident.yaml", "same")
+	testutil.WriteFile(t, before, "ident.yaml", "same")
+	testutil.WriteFile(t, after, "ident.yaml", "same")
 	// added: only on after side
-	writeFile(t, after, "added.yaml", "new")
+	testutil.WriteFile(t, after, "added.yaml", "new")
 	// removed: only on before side
-	writeFile(t, before, "removed.yaml", "gone")
+	testutil.WriteFile(t, before, "removed.yaml", "gone")
 	// modified-same-size: trigger the hash path with same byte length
-	writeFile(t, before, "mod.yaml", "AAA")
-	writeFile(t, after, "mod.yaml", "BBB")
+	testutil.WriteFile(t, before, "mod.yaml", "AAA")
+	testutil.WriteFile(t, after, "mod.yaml", "BBB")
 	// Bump mtime so the mtime equality bypass doesn't short-circuit.
 	if err := os.Chtimes(filepath.Join(after, "mod.yaml"), time.Now(), time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	got, err := Detect(before, after)
+	got, err := Detect(t.Context(), testInput(before), testInput(after))
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
@@ -72,12 +83,13 @@ func TestDetect_AddedRemovedModified(t *testing.T) {
 }
 
 func TestDetect_SizeDifferAlwaysChanged(t *testing.T) {
+	t.Parallel()
 	// Different sizes: detector should flag without hashing.
 	before := t.TempDir()
 	after := t.TempDir()
-	writeFile(t, before, "f.yaml", "small")
-	writeFile(t, after, "f.yaml", "this is a larger payload")
-	got, err := Detect(before, after)
+	testutil.WriteFile(t, before, "f.yaml", "small")
+	testutil.WriteFile(t, after, "f.yaml", "this is a larger payload")
+	got, err := Detect(t.Context(), testInput(before), testInput(after))
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
@@ -86,43 +98,19 @@ func TestDetect_SizeDifferAlwaysChanged(t *testing.T) {
 	}
 }
 
-func TestDetect_SkipsDotDirsAndVendor(t *testing.T) {
-	before := t.TempDir()
-	after := t.TempDir()
-	// Modifications inside dot-prefixed and well-known noise dirs are
-	// ignored by the walk.
-	writeFile(t, before, ".git/HEAD", "a")
-	writeFile(t, after, ".git/HEAD", "b")
-	writeFile(t, before, "node_modules/foo/index.js", "a")
-	writeFile(t, after, "node_modules/foo/index.js", "b")
-	writeFile(t, before, "vendor/dep/file.go", "a")
-	writeFile(t, after, "vendor/dep/file.go", "b")
-	// Sanity check: a real file change still surfaces. Use
-	// different-sized content so the detector flags via size diff and
-	// keeps the test focused on directory filtering.
-	writeFile(t, before, "real.yaml", "short")
-	writeFile(t, after, "real.yaml", "a longer payload")
-	got, err := Detect(before, after)
-	if err != nil {
-		t.Fatalf("Detect: %v", err)
-	}
-	if paths := got.Paths(); len(paths) != 1 || paths[0] != "real.yaml" {
-		t.Errorf("expected just real.yaml, got %v", paths)
-	}
-}
-
-func TestDetectViaWalker_DoesNotSkipHiddenScanRoot(t *testing.T) {
+func TestDetect_HiddenScanRoot(t *testing.T) {
+	t.Parallel()
 	parent := t.TempDir()
 	before := filepath.Join(parent, ".before")
 	after := filepath.Join(parent, ".after")
-	writeFile(t, before, "same.yaml", "x")
-	writeFile(t, after, "same.yaml", "x")
-	writeFile(t, before, "mod.yaml", "old")
-	writeFile(t, after, "mod.yaml", "new")
+	testutil.WriteFile(t, before, "same.yaml", "x")
+	testutil.WriteFile(t, after, "same.yaml", "x")
+	testutil.WriteFile(t, before, "mod.yaml", "old")
+	testutil.WriteFile(t, after, "mod.yaml", "new")
 
-	got, err := detectViaWalker(before, after)
+	got, err := Detect(t.Context(), testInput(before), testInput(after))
 	if err != nil {
-		t.Fatalf("detectViaWalker: %v", err)
+		t.Fatalf("Detect: %v", err)
 	}
 	if paths := got.Paths(); !slices.Equal(paths, []string{"mod.yaml"}) {
 		t.Errorf("hidden scan root paths = %v, want [mod.yaml]", paths)
@@ -138,10 +126,11 @@ func TestDetectViaWalker_DoesNotSkipHiddenScanRoot(t *testing.T) {
 // reported. We simulate the worst case by explicitly stamping
 // identical mtimes on both files post-write.
 func TestDetect_SameSizeSameMtime_StillDetected(t *testing.T) {
+	t.Parallel()
 	before := t.TempDir()
 	after := t.TempDir()
-	writeFile(t, before, "mod.yaml", "OLD")
-	writeFile(t, after, "mod.yaml", "NEW")
+	testutil.WriteFile(t, before, "mod.yaml", "OLD")
+	testutil.WriteFile(t, after, "mod.yaml", "NEW")
 	// Exact same mtime — what the mtime-fast-path used to short-circuit on.
 	stamp := time.Now()
 	if err := os.Chtimes(filepath.Join(before, "mod.yaml"), stamp, stamp); err != nil {
@@ -151,7 +140,7 @@ func TestDetect_SameSizeSameMtime_StillDetected(t *testing.T) {
 		t.Fatalf("chtimes after: %v", err)
 	}
 
-	got, err := Detect(before, after)
+	got, err := Detect(t.Context(), testInput(before), testInput(after))
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
@@ -160,140 +149,775 @@ func TestDetect_SameSizeSameMtime_StillDetected(t *testing.T) {
 	}
 }
 
-// TestDetectViaGit_BehavesLikeWalker pins the contract that the git
-// fast path and the Go walker fallback produce identical sets for
-// the same input — modulo the directory-prefix filter both share.
-// Skip when git isn't on PATH (minimal CI containers); the Detect
-// fallback path is what runs there.
-func TestDetectViaGit_BehavesLikeWalker(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not on PATH — fallback path is exercised by other tests")
-	}
-	before := t.TempDir()
-	after := t.TempDir()
-	writeFile(t, before, "same.yaml", "x")
-	writeFile(t, after, "same.yaml", "x")
-	writeFile(t, before, "removed.yaml", "gone")
-	writeFile(t, after, "added.yaml", "new")
-	writeFile(t, before, "mod.yaml", "AAA")
-	writeFile(t, after, "mod.yaml", "BBB")
-	// .git/ contents must NOT appear in the set — git diff --no-index
-	// happily reports them; the isFilteredPath post-filter drops them.
-	writeFile(t, before, ".git/HEAD", "a")
-	writeFile(t, after, ".git/HEAD", "b")
-
-	gotGit, err := detectViaGit(before, after)
-	if err != nil {
-		t.Fatalf("detectViaGit: %v", err)
-	}
-	gotWalker, err := detectViaWalker(before, after)
-	if err != nil {
-		t.Fatalf("detectViaWalker: %v", err)
-	}
-	want := []string{"added.yaml", "mod.yaml", "removed.yaml"}
-	if got := gotGit.Paths(); !slices.Equal(got, want) {
-		t.Errorf("git path: %v, want %v", got, want)
-	}
-	if got := gotWalker.Paths(); !slices.Equal(got, want) {
-		t.Errorf("walker path: %v, want %v (must agree with git path)", got, want)
-	}
-}
-
-func TestShouldSkipDir(t *testing.T) {
-	yes := []string{".git", ".cache", "node_modules", "vendor"}
-	no := []string{"src", "kubernetes", "apps", "tests"}
-	for _, n := range yes {
-		if !shouldSkipDir(n) {
-			t.Errorf("shouldSkipDir(%q) = false, want true", n)
-		}
-	}
-	for _, n := range no {
-		if shouldSkipDir(n) {
-			t.Errorf("shouldSkipDir(%q) = true, want false", n)
-		}
-	}
-}
-
 func TestHashFile(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "a", "hello")
-	writeFile(t, dir, "b", "hello")
-	writeFile(t, dir, "c", "different")
-	ha, err := hashFile(filepath.Join(dir, "a"))
-	if err != nil {
-		t.Fatalf("hashFile a: %v", err)
-	}
-	hb, err := hashFile(filepath.Join(dir, "b"))
-	if err != nil {
-		t.Fatalf("hashFile b: %v", err)
-	}
-	hc, err := hashFile(filepath.Join(dir, "c"))
-	if err != nil {
-		t.Fatalf("hashFile c: %v", err)
-	}
-	if ha != hb {
-		t.Errorf("identical content should hash equal: %q vs %q", ha, hb)
-	}
-	if ha == hc {
-		t.Errorf("different content should hash differently: %q vs %q", ha, hc)
-	}
-}
-
-func TestSet_RerootPrependsPrefix(t *testing.T) {
-	s := NewSet([]string{"app/foo.yaml", "bar.yaml"})
-	r := s.Reroot("kubernetes")
-	if !r.Contains("kubernetes/app/foo.yaml") || !r.Contains("kubernetes/bar.yaml") {
-		t.Errorf("Reroot did not prepend: %v", r.Paths())
-	}
-	// Empty / "." prefix is a no-op (returns same set).
-	if got := s.Reroot(""); got != s {
-		t.Errorf("Reroot(\"\") returned a new set, want same")
-	}
-	if got := s.Reroot("."); got != s {
-		t.Errorf("Reroot(\".\") returned a new set, want same")
+	t.Parallel()
+	prefix := strings.Repeat("x", 32*1024)
+	for _, tc := range []struct {
+		name, same, different string
+		dataEOF               bool
+	}{
+		{name: "small", same: "hello", different: "different"},
+		{name: "data_eof", same: "hello", different: "different", dataEOF: true},
+		{name: "multi_chunk", same: prefix + "first", different: prefix + "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, content := range []string{tc.same, tc.same, tc.different} {
+				data := []byte(content)
+				input := &cancellingInput{FS: fstest.MapFS{"file.yaml": {Data: data}}, dataEOF: tc.dataEOF}
+				got, err := hashFile(t.Context(), input, "file.yaml")
+				if err != nil {
+					t.Fatalf("hashFile: %v", err)
+				}
+				if want := sha256.Sum256(data); got != want {
+					t.Errorf("hash = %x, want %x", got, want)
+				}
+			}
+		})
 	}
 }
 
-// TestDetect_SymlinkTargetRewrite pins parity with git --no-index for
-// symlink-target changes. Pre-fix, the Go walker dropped symlinks via
-// `!d.Type().IsRegular()`, so a symlink whose target was rewritten on
-// only one side produced an empty change set on systems without git
-// on PATH (where the slow path is the only path).
-func TestDetect_SymlinkTargetRewrite(t *testing.T) {
-	before := t.TempDir()
-	after := t.TempDir()
-	// Both sides have a "link" pointing somewhere; only after's
-	// changes the target.
-	if err := os.Symlink("target-A", filepath.Join(before, "link")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+func testInput(root string) *store.SourceArtifact {
+	if root == "" {
+		return nil
 	}
-	if err := os.Symlink("target-B", filepath.Join(after, "link")); err != nil {
-		t.Fatal(err)
-	}
-	set, err := detectViaWalker(before, after)
-	if err != nil {
-		t.Fatalf("detectViaWalker: %v", err)
-	}
-	if !set.Contains("link") {
-		t.Errorf("walker missed symlink-target rewrite: %v", set.Paths())
+	return &store.SourceArtifact{LocalPath: root, FS: os.DirFS(root)}
+}
+
+func TestDetect_MissingInputsWrapInput(t *testing.T) {
+	t.Parallel()
+	for _, input := range []*store.SourceArtifact{nil, {}} {
+		_, err := Detect(t.Context(), input, &store.SourceArtifact{FS: fstest.MapFS{}})
+		if !errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) {
+			t.Fatalf("missing input error=%v", err)
+		}
 	}
 }
 
-// TestDetect_SymlinkVsRegular pins type-swap detection — a symlink on
-// one side and a regular file on the other are different "things" in
-// git's --no-index view and the walker must agree.
-func TestDetect_SymlinkVsRegular(t *testing.T) {
-	before := t.TempDir()
-	after := t.TempDir()
-	if err := os.Symlink("some-target", filepath.Join(before, "x")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+func TestDetect_LastBodyCancellation(t *testing.T) {
+	t.Parallel()
+	for _, side := range []string{"before", "after"} {
+		t.Run(side, func(t *testing.T) {
+			t.Parallel()
+			for _, shape := range []string{"data_eof", "multi_chunk"} {
+				t.Run(shape, func(t *testing.T) {
+					t.Parallel()
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					data := "same"
+					if shape == "multi_chunk" {
+						data = strings.Repeat(data, 16*1024)
+					}
+					input := fstest.MapFS{"file.yaml": {Data: []byte(data)}}
+					cancelled := func() bool { return ctx.Err() != nil }
+					before := &cancellingInput{FS: input, cancelled: cancelled, dataEOF: shape == "data_eof"}
+					after := &cancellingInput{FS: input, cancelled: cancelled, dataEOF: shape == "data_eof"}
+					if side == "before" {
+						before.cancel = cancel
+					} else {
+						after.cancel = cancel
+					}
+					set, err := Detect(ctx, &store.SourceArtifact{FS: before}, &store.SourceArtifact{FS: after})
+					t.Logf("before: opened=%d closed=%d reads after cancel=%d; after: opened=%d closed=%d reads after cancel=%d", before.opened.Load(), before.closed.Load(), before.postCancel.Load(), after.opened.Load(), after.closed.Load(), after.postCancel.Load())
+					if !errors.Is(err, context.Canceled) || set != nil {
+						t.Errorf("cancelled last body=%v,%v", set, err)
+					}
+					if before.postCancel.Load() != 0 || after.postCancel.Load() != 0 {
+						t.Error("content read started after cancellation")
+					}
+					if side == "before" && after.opened.Load() != 0 {
+						t.Error("after-side hash opened after cancellation")
+					}
+					if before.opened.Load() != before.closed.Load() || after.opened.Load() != after.closed.Load() {
+						t.Error("hash files not closed")
+					}
+				})
+			}
+		})
 	}
-	writeFile(t, after, "x", "some-target") // same byte content as target text
-	set, err := detectViaWalker(before, after)
-	if err != nil {
-		t.Fatalf("detectViaWalker: %v", err)
+}
+
+type cancellingInput struct {
+	fs.FS
+	cancel                     context.CancelFunc
+	cancelled                  func() bool
+	dataEOF                    bool
+	opened, closed, postCancel atomic.Int32
+}
+
+func (c *cancellingInput) Open(name string) (fs.File, error) {
+	f, err := c.FS.Open(name)
+	if err != nil || name != "file.yaml" {
+		return f, err
 	}
-	if !set.Contains("x") {
-		t.Errorf("walker missed symlink↔regular type swap: %v", set.Paths())
+	c.opened.Add(1)
+	return &cancellingFile{File: f, input: c}, nil
+}
+
+type cancellingFile struct {
+	fs.File
+	input *cancellingInput
+}
+
+func (c *cancellingFile) Read(p []byte) (int, error) {
+	if c.input.cancelled != nil && c.input.cancelled() {
+		c.input.postCancel.Add(1)
+	}
+	n, err := c.File.Read(p)
+	if n > 0 {
+		if c.input.cancel != nil {
+			c.input.cancel()
+		}
+		if c.input.dataEOF {
+			err = io.EOF
+		}
+	}
+	return n, err
+}
+
+func (c *cancellingFile) Close() error {
+	c.input.closed.Add(1)
+	return c.File.Close()
+}
+
+func TestDetect_HashLimit(t *testing.T) {
+	t.Parallel()
+	for _, scenario := range []string{"changed", "canceled", "read error"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				reads := &hashReads{release: make(chan struct{}), cancelled: func() bool { return ctx.Err() != nil }}
+				released := false
+				defer func() {
+					if !released {
+						close(reads.release)
+					}
+				}()
+				readErr := errors.New("hash read failed")
+				if scenario == "read error" {
+					reads.err = readErr
+				}
+				before, after := fstest.MapFS{}, fstest.MapFS{}
+				var want []string
+				for i := range 17 {
+					name := fmt.Sprintf("file-%02d.yaml", i)
+					before[name] = &fstest.MapFile{Data: []byte("old")}
+					after[name] = &fstest.MapFile{Data: []byte("new")}
+					want = append(want, name)
+				}
+				type result struct {
+					set *Set
+					err error
+				}
+				done := make(chan result, 1)
+				go func() {
+					set, err := Detect(ctx, &store.SourceArtifact{FS: &hashInput{FS: before, reads: reads, before: true}}, &store.SourceArtifact{FS: &hashInput{FS: after, reads: reads}})
+					done <- result{set, err}
+				}()
+				synctest.Wait()
+				if reads.active.Load() != 8 || reads.maximum.Load() != 8 || reads.before.Load() != 8 || reads.started.Load() != 8 {
+					t.Fatalf("blocked jobs: active=%d peak=%d before=%d reads=%d, want eight overlapping jobs", reads.active.Load(), reads.maximum.Load(), reads.before.Load(), reads.started.Load())
+				}
+				switch scenario {
+				case "canceled":
+					cancel()
+				case "read error":
+					reads.release <- struct{}{}
+				}
+				synctest.Wait()
+				select {
+				case got := <-done:
+					t.Fatalf("Detect returned before blocked readers drained: %+v", got)
+				default:
+				}
+				if scenario == "read error" && (reads.active.Load() != 7 || reads.before.Load() != 8) {
+					t.Fatalf("failed submission started extra jobs: active=%d before=%d", reads.active.Load(), reads.before.Load())
+				}
+				close(reads.release)
+				released = true
+				got := <-done
+				if scenario == "canceled" {
+					t.Logf("read starts=%d reads after cancel=%d before opens=%d after opens=%d closes=%d", reads.started.Load(), reads.postCancel.Load(), reads.before.Load(), reads.opened.Load()-reads.before.Load(), reads.closed.Load())
+					if reads.postCancel.Load() != 0 || reads.opened.Load() != reads.before.Load() {
+						t.Error("hash work started after cancellation")
+					}
+				}
+				if reads.active.Load() != 0 || reads.opened.Load() != reads.closed.Load() || reads.maximum.Load() > 8 {
+					t.Fatalf("readers not drained: active=%d opened=%d closed=%d peak=%d", reads.active.Load(), reads.opened.Load(), reads.closed.Load(), reads.maximum.Load())
+				}
+				if scenario == "changed" {
+					if got.err != nil || got.set == nil || !slices.Equal(got.set.Paths(), want) || reads.before.Load() != 17 || reads.opened.Load() != 34 {
+						t.Fatalf("hash results: set=%v error=%v before=%d opened=%d", got.set, got.err, reads.before.Load(), reads.opened.Load())
+					}
+				} else {
+					cause := readErr
+					if scenario == "canceled" {
+						cause = context.Canceled
+					}
+					if !errors.Is(got.err, cause) || got.set != nil || reads.before.Load() != 8 {
+						t.Fatalf("failed hash results: set=%v error=%v before=%d", got.set, got.err, reads.before.Load())
+					}
+				}
+			})
+		})
+	}
+}
+
+type hashReads struct {
+	release                                 chan struct{}
+	cancelled                               func() bool
+	err                                     error
+	failed                                  atomic.Bool
+	active, maximum, opened, closed, before atomic.Int32
+	started, postCancel                     atomic.Int32
+}
+
+type hashInput struct {
+	fs.FS
+	reads  *hashReads
+	before bool
+}
+
+func (f *hashInput) Open(name string) (fs.File, error) {
+	file, err := f.FS.Open(name)
+	if err != nil || filepath.Ext(name) != ".yaml" {
+		return file, err
+	}
+	if f.before {
+		f.reads.before.Add(1)
+	}
+	f.reads.opened.Add(1)
+	active := f.reads.active.Add(1)
+	for maximum := f.reads.maximum.Load(); active > maximum; maximum = f.reads.maximum.Load() {
+		if f.reads.maximum.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	return &hashReadFile{File: file, reads: f.reads, block: f.before}, nil
+}
+
+type hashReadFile struct {
+	fs.File
+	reads   *hashReads
+	started bool
+	block   bool
+}
+
+func (f *hashReadFile) Read(p []byte) (int, error) {
+	f.reads.started.Add(1)
+	if f.reads.cancelled() {
+		f.reads.postCancel.Add(1)
+	}
+	if !f.started {
+		f.started = true
+		if f.block {
+			<-f.reads.release
+			if f.reads.err != nil && f.reads.failed.CompareAndSwap(false, true) {
+				return 0, f.reads.err
+			}
+		}
+	}
+	return f.File.Read(p)
+}
+
+func (f *hashReadFile) Close() error {
+	f.reads.closed.Add(1)
+	f.reads.active.Add(-1)
+	return f.File.Close()
+}
+
+func TestDetect_OneSidedInputEvidence(t *testing.T) {
+	t.Parallel()
+	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: optional, namespace: apps}\n"
+	secret := "apiVersion: v1\nkind: Secret\nmetadata: {name: credentials, namespace: apps}\n"
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "apps", Name: "optional"}
+	secretID := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "apps", Name: "credentials"}
+	for _, tc := range []struct {
+		name, file, body string
+		after            bool
+		want             []manifest.NamedResource
+	}{
+		{"before", "input.yaml", cm, false, []manifest.NamedResource{cmID}},
+		{"after", "input.yaml", cm, true, []manifest.NamedResource{cmID}},
+		{"multiple documents", "input.YML", cm + "---\n- noise\n---\n" + secret, false, []manifest.NamedResource{cmID, secretID}},
+		{"json", "input.JSON", `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"optional","namespace":"apps"}}`, false, []manifest.NamedResource{cmID}},
+		{"wrong suffix", "input.txt", cm, false, nil},
+		{"foreign group", "input.yaml", strings.Replace(cm, "apiVersion: v1", "apiVersion: foreign.test/v1", 1), false, nil},
+		{"noncanonical core", "input.yaml", strings.Replace(cm, "apiVersion: v1", "apiVersion: v2", 1), false, nil},
+		{"nondata", "input.yaml", strings.Replace(cm, "kind: ConfigMap", "kind: Pod", 1), false, nil},
+		{"empty name", "input.yaml", strings.Replace(cm, "name: optional", "name: ''", 1), false, nil},
+		{"template name", "input.yaml", strings.Replace(cm, "name: optional", "name: '${NAME}'", 1), false, nil},
+		{"template namespace", "input.yaml", strings.Replace(cm, "namespace: apps", "namespace: '${NAMESPACE}'", 1), false, nil},
+		{"empty namespace exact", "input.yaml", strings.Replace(cm, "namespace: apps", "namespace: ''", 1), false, []manifest.NamedResource{{Kind: manifest.KindConfigMap, Name: "optional"}}},
+		{"malformed", "input.yaml", cm + "---\nmalformed: [", false, nil},
+		{"empty", "input.yaml", "", false, nil},
+		{"incomplete", "input.yaml", "hello: world\n", false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			before, after := fstest.MapFS{}, fstest.MapFS{}
+			if tc.after {
+				after[tc.file] = &fstest.MapFile{Data: []byte(tc.body)}
+			} else {
+				before[tc.file] = &fstest.MapFile{Data: []byte(tc.body)}
+			}
+			set, err := Detect(t.Context(), &store.SourceArtifact{FS: before}, &store.SourceArtifact{FS: after})
+			assert.NoError(t, err)
+			assert.Diff(t, set.Paths(), []string{tc.file})
+			var want map[manifest.NamedResource]string
+			if len(tc.want) > 0 {
+				want = make(map[manifest.NamedResource]string)
+				for _, id := range tc.want {
+					want[id] = tc.file
+				}
+			}
+			assert.Diff(t, set.inputs, want)
+		})
+	}
+}
+
+func TestSet_WithReaders(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, file, body string
+		before           bool
+	}{
+		{"before", "templates/cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: data}\n", true},
+		{"after", "templates/cm.yaml", "{{ template }}", false},
+		{"binary", "charts/child.tgz", "archive", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			before, after := fstest.MapFS{}, fstest.MapFS{}
+			present := after
+			if tc.before {
+				present = before
+			}
+			present[tc.file] = &fstest.MapFile{Data: []byte(tc.body)}
+			set, err := Detect(t.Context(), &store.SourceArtifact{FS: before}, &store.SourceArtifact{FS: after})
+			assert.NoError(t, err)
+			original := maps.Clone(set.inputs)
+			reader := testutil.KustomizationID("apps", "reader")
+			wrongSide := testutil.KustomizationID("apps", "opposite")
+			unrelated := testutil.KustomizationID("apps", "unrelated")
+			admitted := &manifest.DiscoveryIndex{Readers: map[string][]manifest.FileReader{
+				tc.file:                      {{Reader: reader, Source: manifest.BootstrapSourceID}},
+				path.Dir(tc.file) + "/other": {{Reader: unrelated, Source: manifest.BootstrapSourceID}},
+			}}
+			opposite := &manifest.DiscoveryIndex{Readers: map[string][]manifest.FileReader{
+				tc.file: {{Reader: wrongSide, Source: manifest.BootstrapSourceID}},
+			}}
+			indexes := [2]*manifest.DiscoveryIndex{opposite, admitted}
+			if tc.before {
+				indexes = [2]*manifest.DiscoveryIndex{admitted, opposite}
+			}
+			want := map[manifest.NamedResource]string{reader: tc.file}
+			maps.Copy(want, original)
+			resolved := set.WithReaders(indexes[0], indexes[1])
+			assert.Diff(t, resolved.inputs, want)
+			assert.Diff(t, set.inputs, original)
+			assert.Diff(t, set.WithReaders(indexes[0], indexes[1]).inputs, want)
+		})
+	}
+}
+
+func TestSet_WithReadersSelectedSource(t *testing.T) {
+	t.Parallel()
+	changes, stores, roots, source := optionalSupplierPair(t, "apps")
+	reader := testutil.HelmReleaseID("apps", "reader")
+	foreign := testutil.HelmReleaseID("apps", "foreign")
+	opposite := testutil.HelmReleaseID("apps", "opposite")
+	var indexes [2]*manifest.DiscoveryIndex
+	for side := range indexes {
+		indexes[side] = &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}, Readers: map[string][]manifest.FileReader{}}
+		for _, id := range []manifest.NamedResource{reader, foreign, opposite} {
+			indexes[side].Records[id] = manifest.DiscoveryRecord{File: "flux/" + id.Name + ".yaml", Refs: []manifest.NamedResource{source.Named()}}
+		}
+	}
+	file := ".supplier/inputs/optional.yaml"
+	indexes[0].Readers[file] = []manifest.FileReader{{Reader: reader, Source: source.Named(), Exact: true}, {Reader: foreign, Source: manifest.BootstrapSourceID, Exact: true}}
+	indexes[1].Readers[file] = []manifest.FileReader{{Reader: opposite, Source: source.Named(), Exact: true}}
+	original := maps.Clone(changes.sources[source.Named()].changes.inputs)
+	resolved := changes.WithReaders(indexes[0], indexes[1])
+	assert.Equal(t, len(resolved.inputs), 0)
+	assert.Equal(t, resolved.sources[source.Named()].changes.inputs[reader], "inputs/optional.yaml")
+	assert.Equal(t, resolved.sources[source.Named()].changes.inputs[foreign], "")
+	assert.Equal(t, resolved.sources[source.Named()].changes.inputs[opposite], "")
+	assert.Diff(t, changes.sources[source.Named()].changes.inputs, original)
+	for side, st := range stores {
+		filter := NewFilter(resolved, indexes[side], st, roots[side])
+		assert.Equal(t, filter.ShouldReconcile(reader), true)
+		assert.Equal(t, filter.ShouldReconcile(foreign), false)
+		assert.Equal(t, filter.ShouldReconcile(opposite), side == 1)
+	}
+}
+
+func TestDetect_OneSidedInputIgnorePolicies(t *testing.T) {
+	t.Parallel()
+	for _, ignored := range []string{"before", "after", "both"} {
+		t.Run(ignored, func(t *testing.T) {
+			t.Parallel()
+			body := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: %s, namespace: apps}\n"
+			before := fstest.MapFS{"input.yaml": {Data: fmt.Appendf(nil, body, "before")}}
+			after := fstest.MapFS{"input.yaml": {Data: fmt.Appendf(nil, body, "after")}}
+			if ignored != "after" {
+				before[".sourceignore"] = &fstest.MapFile{Data: []byte("input.yaml\n")}
+			}
+			if ignored != "before" {
+				after[".sourceignore"] = &fstest.MapFile{Data: []byte("input.yaml\n")}
+			}
+			set, err := Detect(t.Context(), &store.SourceArtifact{FS: before}, &store.SourceArtifact{FS: after})
+			assert.NoError(t, err)
+			assert.Equal(t, set.Contains("input.yaml"), ignored != "both")
+			var want map[manifest.NamedResource]string
+			if ignored != "both" {
+				name := "after"
+				if ignored == "after" {
+					name = "before"
+				}
+				want = map[manifest.NamedResource]string{{Kind: manifest.KindConfigMap, Namespace: "apps", Name: name}: "input.yaml"}
+			}
+			assert.Diff(t, set.inputs, want)
+		})
+	}
+}
+
+func TestDetect_OneSidedInputReadFailure(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []string{"open", "read"} {
+		t.Run(operation, func(t *testing.T) {
+			t.Parallel()
+			cause := errors.New("evidence unavailable")
+			input := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: optional}\n")}}, operation: operation, cause: cause}
+			set, err := Detect(t.Context(), &store.SourceArtifact{FS: input}, &store.SourceArtifact{FS: fstest.MapFS{}})
+			if set != nil || !errors.Is(err, cause) || !errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) || !strings.Contains(err.Error(), "input.yaml") {
+				t.Fatalf("read failure set=%v err=%v", set, err)
+			}
+			if operation == "read" {
+				assert.Equal(t, input.closed.Load(), int32(1))
+			}
+		})
+	}
+}
+
+type evidenceFailureFS struct {
+	fs.FS
+	operation string
+	cause     error
+	read      func([]byte) (int, error)
+	opened    atomic.Int32
+	closed    atomic.Int32
+}
+
+func (f *evidenceFailureFS) Open(name string) (fs.File, error) {
+	if name == "input.yaml" && f.operation == "open" {
+		return nil, f.cause
+	}
+	file, err := f.FS.Open(name)
+	if err != nil || name != "input.yaml" {
+		return file, err
+	}
+	f.opened.Add(1)
+	return &evidenceFailureFile{File: file, input: f}, nil
+}
+
+type evidenceFailureFile struct {
+	fs.File
+	input *evidenceFailureFS
+}
+
+func (f *evidenceFailureFile) Read(p []byte) (int, error) {
+	if f.input.read != nil {
+		return f.input.read(p)
+	}
+	return 0, f.input.cause
+}
+
+func (f *evidenceFailureFile) Close() error { f.input.closed.Add(1); return f.File.Close() }
+
+func TestDetect_OneSidedInputCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	input := &cancellingInput{FS: fstest.MapFS{"file.yaml": {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: optional}\n")}}, cancel: cancel, cancelled: func() bool { return ctx.Err() != nil }, dataEOF: true}
+	set, err := Detect(ctx, &store.SourceArtifact{FS: input}, &store.SourceArtifact{FS: fstest.MapFS{}})
+	if set != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation set=%v err=%v", set, err)
+	}
+	assert.Equal(t, input.opened.Load(), int32(1))
+	assert.Equal(t, input.closed.Load(), input.opened.Load())
+	assert.Equal(t, input.postCancel.Load(), int32(0))
+}
+
+func TestDetect_ExistingInputHasNoOneSidedEvidence(t *testing.T) {
+	t.Parallel()
+	body := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: optional, namespace: apps}\n"
+	before := fstest.MapFS{"input.yaml": {Data: []byte(body)}}
+	after := fstest.MapFS{"input.yaml": {Data: []byte(body + "data: {VALUE: after}\n")}}
+	set, err := Detect(t.Context(), &store.SourceArtifact{FS: before}, &store.SourceArtifact{FS: after})
+	assert.NoError(t, err)
+	assert.Equal(t, set.Contains("input.yaml"), true)
+	assert.Diff(t, set.inputs, map[manifest.NamedResource]string(nil))
+}
+
+func TestCollectInputs_CancelBeforeOpen(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	input := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {}}}
+	var set Set
+	err := set.CollectInputs(ctx, input, "input.yaml", false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error=%v", err)
+	}
+	assert.Equal(t, input.opened.Load(), int32(0))
+}
+
+type inputCheckContext func() context.Context
+
+func (c inputCheckContext) Deadline() (time.Time, bool) { return c().Deadline() }
+func (c inputCheckContext) Done() <-chan struct{}       { return c().Done() }
+func (c inputCheckContext) Err() error                  { return c().Err() }
+func (c inputCheckContext) Value(key any) any           { return c().Value(key) }
+
+func TestCollectInputs_CancelAfterOpen(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reads := 0
+	input := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {}}}
+	input.read = func([]byte) (int, error) {
+		reads++
+		return 0, io.EOF
+	}
+	checked := inputCheckContext(func() context.Context {
+		if input.opened.Load() != 0 {
+			cancel()
+		}
+		return ctx
+	})
+	var set Set
+	err := set.CollectInputs(checked, input, "input.yaml", false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error=%v", err)
+	}
+	assert.Equal(t, reads, 0)
+	assert.Equal(t, input.opened.Load(), int32(1))
+	assert.Equal(t, input.closed.Load(), int32(1))
+	assert.Equal(t, len(set.inputs), 0)
+}
+
+func TestCollectInputs_ReadResults(t *testing.T) {
+	t.Parallel()
+	body := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: optional, namespace: apps}\n"
+	cause := errors.New("input read failed")
+	wrappedEOF := fmt.Errorf("unexpected EOF: %w", io.EOF)
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		cancel  bool
+		wantErr error
+		reads   int
+	}{
+		{name: "bytes then EOF", reads: 2},
+		{name: "bytes with EOF", readErr: io.EOF, reads: 1},
+		{name: "bytes with error", readErr: cause, wantErr: cause, reads: 1},
+		{name: "wrapped EOF", readErr: wrappedEOF, wantErr: wrappedEOF, reads: 1},
+		{name: "cancel with bytes", cancel: true, wantErr: context.Canceled, reads: 1},
+		{name: "cancel with EOF", readErr: io.EOF, cancel: true, wantErr: context.Canceled, reads: 1},
+		{name: "cancel with error", readErr: cause, cancel: true, wantErr: context.Canceled, reads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			cancellationChecks := 0
+			checked := inputCheckContext(func() context.Context {
+				if ctx.Err() != nil {
+					cancellationChecks++
+				}
+				return ctx
+			})
+			reads := 0
+			input := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {}}}
+			input.read = func(p []byte) (int, error) {
+				reads++
+				if reads > 1 {
+					return 0, io.EOF
+				}
+				if tc.cancel {
+					cancel()
+				}
+				return copy(p, body), tc.readErr
+			}
+			var set Set
+			err := set.CollectInputs(checked, input, "input.yaml", false)
+			if tc.wantErr == nil {
+				assert.NoError(t, err)
+				assert.Diff(t, set.inputs, map[manifest.NamedResource]string{{Kind: manifest.KindConfigMap, Namespace: "apps", Name: "optional"}: "input.yaml"})
+			} else {
+				if !errors.Is(err, tc.wantErr) || len(set.inputs) != 0 {
+					t.Fatalf("collected inputs=%v error=%v", set.inputs, err)
+				}
+				if !tc.cancel && (!errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) || !strings.Contains(err.Error(), "input.yaml")) {
+					t.Fatalf("read failure classification=%v", err)
+				}
+			}
+			assert.Equal(t, reads, tc.reads)
+			assert.Equal(t, input.closed.Load(), int32(1))
+			if tc.cancel {
+				// Final cancellation resolution must not mask a missing read-boundary check.
+				assert.Equal(t, cancellationChecks, 2)
+			}
+		})
+	}
+}
+
+func TestCollectInputs_ParseFailureDrain(t *testing.T) {
+	t.Parallel()
+	const malformed = "\x00invalid\n"
+	cause := errors.New("later read failed")
+	probeReads := 0
+	probe := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {}}}
+	probe.read = func(p []byte) (int, error) {
+		probeReads++
+		if probeReads == 1 {
+			return copy(p, malformed), nil
+		}
+		return 0, cause
+	}
+	f, err := probe.Open("input.yaml")
+	assert.NoError(t, err)
+	_, err = manifest.DecodeDocs(f)
+	assert.NoError(t, f.Close())
+	if err == nil || probeReads != 1 {
+		t.Fatalf("malformed fixture must stop before the later read: reads=%d error=%v", probeReads, err)
+	}
+	t.Logf("pinned decoder rejects malformed prefix after %d read; later read remains pending", probeReads)
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		cancel  bool
+		wantErr error
+	}{
+		{name: "malformed ending at EOF", readErr: io.EOF},
+		{name: "later read error", readErr: cause, wantErr: cause},
+		{name: "later cancellation", cancel: true, wantErr: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			reads := 0
+			input := &evidenceFailureFS{FS: fstest.MapFS{"input.yaml": {}}}
+			input.read = func(p []byte) (int, error) {
+				reads++
+				if reads == 1 {
+					return copy(p, malformed), nil
+				}
+				if tc.cancel {
+					cancel()
+				}
+				return copy(p, "later content"), tc.readErr
+			}
+			var set Set
+			err := set.CollectInputs(ctx, input, "input.yaml", false)
+			if tc.wantErr == nil {
+				assert.NoError(t, err)
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("drained error=%v, want %v", err, tc.wantErr)
+			} else if !tc.cancel && (!errors.Is(err, manifest.ErrInput) || !errors.Is(err, manifest.ErrFlux) || !strings.Contains(err.Error(), "input.yaml")) {
+				t.Fatalf("drained failure classification=%v", err)
+			}
+			assert.Equal(t, len(set.inputs), 0)
+			assert.Equal(t, reads, 2)
+			assert.Equal(t, input.closed.Load(), int32(1))
+		})
+	}
+}
+
+type digestReadFS struct {
+	fs.FS
+	opens, lists atomic.Int64
+}
+
+func (f *digestReadFS) Open(name string) (fs.File, error) {
+	f.opens.Add(1)
+	return f.FS.Open(name)
+}
+
+func (f *digestReadFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	f.lists.Add(1)
+	return fs.ReadDir(f.FS, name)
+}
+
+func TestDetect_SelectedFileEvidence(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"both", "before", "after", "neither", "empty", "nested", "nested_file", "canceled"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			files := [2]fstest.MapFS{
+				{"same": {Data: []byte("same")}, "changed": {Data: []byte("old")}, "gone": {Data: []byte("gone")}, ".sourceignore": {Data: []byte("ignored\n")}, "ignored": {Data: []byte("old")}},
+				{"same": {Data: []byte("same")}, "changed": {Data: []byte("new")}, "added": {Data: []byte("new")}, ".sourceignore": {Data: []byte("ignored\n")}, "ignored": {Data: []byte("new")}},
+			}
+			want := []string{"added", "changed", "gone"}
+			roots := [2]string{"/before", "/after"}
+			if mode == "empty" {
+				files = [2]fstest.MapFS{{}, {"added": {Data: []byte("new")}}}
+				want = []string{"added"}
+			}
+			if mode == "nested" || mode == "nested_file" {
+				files = [2]fstest.MapFS{{"same": {Data: []byte("same")}, "peer/hidden": {Data: []byte("excluded")}}, {"same": {Data: []byte("same")}}}
+				if mode == "nested_file" {
+					files[0] = fstest.MapFS{"same": {Data: []byte("same")}, "peer": {Data: []byte("excluded")}}
+				}
+				roots[1] = roots[0] + "/peer"
+				want = nil
+			}
+			var inputs [2]*store.SourceArtifact
+			var readers [2]*digestReadFS
+			for i := range inputs {
+				readers[i] = &digestReadFS{FS: files[i]}
+				input, _, err := gittree.New(t.Context(), nil, plumbing.ZeroHash, gittree.ViewOptions{Mode: gittree.Direct, Current: readers[i]})
+				if err != nil {
+					t.Fatal(err)
+				}
+				inputs[i] = &store.SourceArtifact{FS: input, LocalPath: roots[i], ContentFingerprint: gittree.ContentFingerprint}
+				if mode != "neither" && (mode != "before" || i != 1) && (mode != "after" || i != 0) {
+					if _, err := gittree.ContentFingerprint(t.Context(), input); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			opens := readers[0].opens.Load() + readers[1].opens.Load()
+			lists := readers[0].lists.Load() + readers[1].lists.Load()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if mode == "canceled" {
+				cancel()
+			}
+			got, err := Detect(ctx, inputs[0], inputs[1])
+			if mode == "canceled" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Detect error = %v, want canceled", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got.Paths(), want) {
+				t.Fatalf("paths = %v, want %v", got.Paths(), want)
+			}
+			if mode == "before" || mode == "after" || mode == "neither" {
+				if readers[0].opens.Load()+readers[1].opens.Load() == opens {
+					t.Fatal("missing pair evidence skipped byte comparison")
+				}
+			} else if readers[0].opens.Load()+readers[1].opens.Load() != opens || readers[0].lists.Load()+readers[1].lists.Load() != lists {
+				t.Fatal("completed evidence was read or walked again")
+			}
+		})
 	}
 }

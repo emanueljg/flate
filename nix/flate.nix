@@ -23,7 +23,7 @@
     ) ../.;
   };
 
-  vendorHash = "sha256-N2BuuBSBzLf87g98FlTdWDFpeegsNmXLaxHPJHXRHQQ=";
+  vendorHash = "sha256-tGRP10etlwf9ogMRCxpTqi4heHjZBlFSyST+BiDEm3M=";
 
   nativeBuildInputs = [
     installShellFiles
